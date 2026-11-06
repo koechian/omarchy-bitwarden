@@ -14,8 +14,13 @@ Rectangle {
   property color hoverBackground: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.08)
   property string tooltip: ""
   property string fontFamily: ""
+  readonly property real disabledOpacity: 0.4
 
   signal clicked()
+
+  // A disabled button (for example "open" on a URI that may not be opened)
+  // stays visible but dimmed, and its MouseArea is disabled with it.
+  opacity: enabled ? 1 : disabledOpacity
 
   implicitWidth: 22
   implicitHeight: 22
@@ -23,6 +28,7 @@ Rectangle {
   color: mouseArea.containsMouse ? hoverBackground : "transparent"
 
   Text {
+    textFormat: Text.PlainText
     anchors.centerIn: parent
     text: ghostBtnRoot.iconText
     color: ghostBtnRoot.iconColor
@@ -36,7 +42,7 @@ Rectangle {
     id: mouseArea
     anchors.fill: parent
     hoverEnabled: true
-    cursorShape: Qt.PointingHandCursor
+    cursorShape: ghostBtnRoot.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
     onClicked: ghostBtnRoot.clicked()
   }
 }

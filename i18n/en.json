@@ -1,0 +1,32 @@
+{
+  "error.release_limit_exceeded": "Too many secrets were requested in a short time, so the vault was locked as a precaution. Unlock it to continue.",
+  "error.vault_locked": "The vault is locked. Unlock it to continue.",
+  "error.item_not_found": "This item is no longer in the vault. Sync the vault and try again.",
+  "error.field_empty": "This item has no value for that field.",
+  "error.unknown_field": "The installed omawarden engine does not support this field. Update omawarden and try again.",
+  "error.field_not_copyable": "This field can be shown but not copied.",
+  "error.clipboard_failed": "Could not copy to the clipboard. Check that wl-clipboard is installed.",
+  "error.invalid_request": "The omawarden engine rejected the request.",
+  "error.release_failed": "The omawarden engine could not release this value.",
+  "error.release_timed_out": "The omawarden engine did not respond in time.",
+  "error.release_mismatched": "The omawarden engine answered a different request. Try again.",
+  "error.engine_not_redacting": "The installed omawarden engine sent secrets with the vault list, so the list was discarded. Install the hardened omawarden %1 or later and unlock again.",
+  "status.secret_copied": "Copied %1 to the clipboard (clears in %2 s).",
+  "status.no_openable_uri": "This item has no http or https link to open.",
+  "status.no_password_history": "No password history is recorded for this item.",
+  "inspector.retrieving": "Retrieving…",
+  "inspector.label.ssn": "Social Security Number",
+  "inspector.label.passport_number": "Passport Number",
+  "inspector.label.license_number": "License Number",
+  "inspector.label.uri": "URI",
+  "inspector.totp_period_remaining": "%1 s",
+  "inspector.password_history_count": {
+    "one": "%1 previous password",
+    "other": "%1 previous passwords"
+  },
+  "history.retrieving": "Retrieving password history…",
+  "history.entry_count": {
+    "one": "%1 past password recorded",
+    "other": "%1 past passwords recorded"
+  }
+}

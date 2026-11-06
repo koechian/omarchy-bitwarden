@@ -3,11 +3,12 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import qs.Commons
 import qs.Commons as Commons
+import "./VaultSearch.js" as VaultSearch
 
 RowLayout {
   id: tabRoot
 
-  property var categoryList: ["all", "login", "card", "identity", "note", "ssh_key"]
+  property var categoryList: ["all", "login", "card", "identity", "note"]
   property string activeCategory: "all"
   property var rawVaultItems: []
   property color foreground: Commons.Color.foreground
@@ -29,35 +30,16 @@ RowLayout {
       case "card": return "Cards"
       case "identity": return "Identities"
       case "note": return "Secure Note"
-      case "ssh_key": return "SSH Keys"
       default: return cat
     }
   }
 
+  // Items of the category inside the active vault and folder scopes, by the
+  // same scope rules as the item list.
   function getCategoryCount(cat) {
-    if (!rawVaultItems || rawVaultItems.length === 0) return 0
-    var vs = activeVaultScope || "all"
-    var fs = activeFolderScope || "all"
-
-    var scopedItems = rawVaultItems.filter(function(i) {
-      if (vs === "personal") {
-        if (i.organization_id) return false
-      } else if (vs !== "all") {
-        if (i.organization_id !== vs && i.organization_name !== vs) return false
-      }
-
-      if (fs === "none") {
-        if (i.folder_id || i.folder_name) return false
-      } else if (fs !== "all") {
-        if (i.folder_id !== fs && i.folder_name !== fs) return false
-      }
-
-      return true
-    })
-
-    if (cat === "all") return scopedItems.length
-    return scopedItems.filter(function(i) {
-      return (i.type_name === cat) || (cat === "ssh_key" && (i.type_name === "ssh_key" || i.category === "ssh_key"))
+    var filters = { vaultScope: tabRoot.activeVaultScope, folderScope: tabRoot.activeFolderScope, category: cat }
+    return (tabRoot.rawVaultItems || []).filter(function(item) {
+      return VaultSearch.matchesFilters(item, filters)
     }).length
   }
 
@@ -82,6 +64,7 @@ RowLayout {
         spacing: 4
 
         Text {
+          textFormat: Text.PlainText
           text: tabRoot.getCategoryLabel(cat)
           color: isSelected ? tabRoot.accent : (tabMouse.containsMouse ? tabRoot.foreground : tabRoot.muted)
           font.pixelSize: Style.font.bodySmall
@@ -89,6 +72,7 @@ RowLayout {
         }
 
         Text {
+          textFormat: Text.PlainText
           property int count: tabRoot.getCategoryCount(cat)
           visible: count > 0
           text: count

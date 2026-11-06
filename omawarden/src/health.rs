@@ -46,7 +46,7 @@ pub fn check_system_health(server_url: &str) -> HealthStatus {
                     server_url: server_url.to_string(),
                     server_reachable: false,
                     keyring_available: which::which("secret-tool").is_ok(),
-                    clipboard_available: which::which("wl-copy").is_ok(),
+                    clipboard_available: crate::clipboard::resolve_trusted_wl_copy().is_some(),
                     error: Some(format!("Client mTLS certificate error: {}", e)),
                 };
             }
@@ -88,7 +88,7 @@ pub fn check_system_health(server_url: &str) -> HealthStatus {
     let keyring_available = which::which("secret-tool").is_ok();
 
     // 3. Check Wayland clipboard (wl-copy)
-    let clipboard_available = which::which("wl-copy").is_ok();
+    let clipboard_available = crate::clipboard::resolve_trusted_wl_copy().is_some();
 
     let all_ok = server_reachable && keyring_available && clipboard_available;
 

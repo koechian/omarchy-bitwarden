@@ -95,6 +95,7 @@ Item {
       spacing: 5
 
       Text {
+        textFormat: Text.PlainText
         text: dropdownRoot.currentItem ? (dropdownRoot.currentItem.icon || "\uf009") : "\uf009"
         font.family: dropdownRoot.fontFamily
         font.pixelSize: Style.font.bodySmall
@@ -102,6 +103,7 @@ Item {
       }
 
       Text {
+        textFormat: Text.PlainText
         text: dropdownRoot.currentItem ? dropdownRoot.currentItem.name : dropdownRoot.title
         font.family: "sans-serif"
         font.pixelSize: Style.font.bodySmall
@@ -113,6 +115,7 @@ Item {
 
       // Caret Down
       Text {
+        textFormat: Text.PlainText
         text: "\uf0d7"
         font.family: dropdownRoot.fontFamily
         font.pixelSize: Style.fontPx(0.75)
@@ -128,6 +131,7 @@ Item {
         color: resetMouse.containsMouse ? Qt.rgba(dropdownRoot.foreground.r, dropdownRoot.foreground.g, dropdownRoot.foreground.b, 0.2) : "transparent"
 
         Text {
+          textFormat: Text.PlainText
           anchors.centerIn: parent
           text: "\uf00d"
           font.family: dropdownRoot.fontFamily
@@ -249,6 +253,7 @@ Item {
           spacing: 6
 
           Text {
+            textFormat: Text.PlainText
             text: modelData.icon || "\uf009"
             font.family: dropdownRoot.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -256,6 +261,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             text: modelData.name || ""
             color: isSelected ? dropdownRoot.accent : dropdownRoot.foreground
             font.pixelSize: Style.font.bodySmall
@@ -266,6 +272,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: modelData.count !== undefined && modelData.count !== null
             text: String(modelData.count)
             color: isSelected ? dropdownRoot.accent : dropdownRoot.muted
@@ -273,6 +280,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: isSelected
             text: "\uf00c"
             font.family: dropdownRoot.fontFamily

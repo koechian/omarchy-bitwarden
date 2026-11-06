@@ -5,7 +5,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use crate::crypto::{derive_master_key, EncString, KdfType, SymmetricCryptoKey};
+use crate::crypto::{
+    derive_master_key_with_parameters, EncString, KdfParameters, SymmetricCryptoKey,
+};
 
 pub const DEFAULT_STORAGE_FILENAME: &str = "data.json";
 
@@ -141,21 +143,19 @@ impl StorageManager {
             crate::crypto::CryptoError::InvalidEncString("Missing user key".to_string())
         })?;
 
-        let kdf_type = KdfType::from(storage.kdf.unwrap_or(0));
-        let iterations = storage.kdf_iterations.unwrap_or(600_000);
-
-        let master_key = derive_master_key(
-            &storage.user_email,
-            password,
-            kdf_type,
-            iterations,
+        let kdf_parameters = KdfParameters::from_server_values(
+            storage.kdf,
+            storage.kdf_iterations,
             storage.kdf_memory,
             storage.kdf_parallelism,
         )?;
+        let master_key =
+            derive_master_key_with_parameters(&storage.user_email, password, &kdf_parameters)?;
 
         let parsed_enc_key = EncString::parse(enc_user_key)?;
-        let decrypted_raw_user_key =
-            SymmetricCryptoKey::decrypt_with_master_key(&parsed_enc_key, &master_key)?;
+        let decrypted_raw_user_key = zeroize::Zeroizing::new(
+            SymmetricCryptoKey::decrypt_with_master_key(&parsed_enc_key, &master_key)?,
+        );
 
         SymmetricCryptoKey::from_raw_bytes(&decrypted_raw_user_key)
     }
@@ -333,5 +333,29 @@ mod tests {
         assert!(target_file.exists(), "Target file must be preserved");
         let content = fs::read_to_string(&target_file).unwrap();
         assert_eq!(content, "{\"new\":true}");
+    }
+
+    #[test]
+    fn test_unlock_refuses_out_of_range_stored_kdf_parameters() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = StorageManager::new(dir.path().join("data.json"));
+        let storage = VaultStorage {
+            user_email: "user@example.com".to_string(),
+            kdf: Some(1),
+            kdf_iterations: Some(3),
+            kdf_memory: Some(4096),
+            kdf_parallelism: Some(4),
+            enc_user_key: Some("2.AAAAAAAAAAAAAAAAAAAAAA==|AAAAAAAAAAAAAAAAAAAAAA==|AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
+            ..Default::default()
+        };
+
+        let err = mgr.unlock_user_key("password", &storage).unwrap_err();
+        assert!(
+            matches!(err, crate::crypto::CryptoError::KdfParametersRejected(_)),
+            "{err:?}"
+        );
+        assert!(err
+            .to_string()
+            .contains("Argon2id memory MiB 4096 is outside the accepted range 16-1024"));
     }
 }

@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import "../components"
+import "../components/SecretFieldCatalog.js" as SecretFieldCatalog
 
 Item {
   id: testRunner
@@ -30,29 +31,30 @@ Item {
 
   readonly property var selectedItem: (filteredItems && filteredItems.length > selectedIndex && selectedIndex >= 0) ? filteredItems[selectedIndex] : null
 
-  property bool showPasswordRevealed: false
   property bool showActionPalette: false
   property var currentAvailableActions: []
-  property var currentTotp: ({ code: "", ttl: 30, period: 30 })
-  property int totpFetchCount: 0
+  property var releaseCommands: []
 
-  function updateTotpForSelected() {
-    var it = selectedItem
-    if (it && it.login && (it.login.totp || it.login.has_totp)) {
-      totpFetchCount++
-      currentTotp = ({ code: "987654", ttl: 28, period: 30 })
-    } else {
-      currentTotp = ({ code: "", ttl: 30, period: 30 })
-    }
+  // Bound the way OmarchyBitwarden.qml binds it: revealed values live only
+  // here and are dropped when the overlay hides or the selection changes.
+  SecretReleaseController {
+    id: secretRelease
+    active: testRunner.opened && Boolean(testRunner.authState && testRunner.authState.status === "unlocked")
+    itemId: testRunner.selectedItem ? String(testRunner.selectedItem.id || "") : ""
+    onCommandRequested: function(argv) { testRunner.releaseCommands = testRunner.releaseCommands.concat([argv]) }
+  }
+
+  function revealReply(field, value) {
+    secretRelease.handleCommandOutput(JSON.stringify({ ok: true, id: String(selectedItem.id), field: field, value: value, seconds_remaining: 28, period: 30 }))
+    secretRelease.handleCommandExit(0)
   }
 
   function updateAvailableActions() {
     currentAvailableActions = [{ label: "Copy Password" }]
   }
 
+  // Selecting an item releases nothing (task: no automatic release).
   function handleSelectedItemChanged() {
-    showPasswordRevealed = false
-    updateTotpForSelected()
     updateAvailableActions()
   }
 
@@ -63,10 +65,9 @@ Item {
     activeCategory = "all"
     activeVaultScope = "all"
     activeFolderScope = "all"
-    showPasswordRevealed = false
+    secretRelease.reset()
     showActionPalette = false
     currentAvailableActions = []
-    currentTotp = ({ code: "", ttl: 30, period: 30 })
   }
 
   function simulateOpen() {
@@ -87,9 +88,8 @@ Item {
       clearSensitiveState()
     } else {
       showActionPalette = false
-      showPasswordRevealed = false
       currentAvailableActions = []
-      currentTotp = ({ code: "", ttl: 30, period: 30 })
+      secretRelease.reset()
     }
 
     if (authState && authState.status === "unlocked" && selectedItem) {
@@ -100,21 +100,11 @@ Item {
   function simulateClose() {
     opened = false
     showActionPalette = false
-    showPasswordRevealed = false
     currentAvailableActions = []
-    currentTotp = ({ code: "", ttl: 30, period: 30 })
     var canRemember = Boolean(config && config.remember_last_search === true && authState && authState.status === "unlocked")
     if (!canRemember) {
       searchQuery = ""
       selectedIndex = 0
-    }
-  }
-
-  function simulateTotpTimerTick() {
-    if (currentTotp && currentTotp.code && currentTotp.ttl > 1) {
-      currentTotp = ({ code: currentTotp.code, ttl: currentTotp.ttl - 1, period: currentTotp.period })
-    } else {
-      updateTotpForSelected()
     }
   }
 
@@ -141,7 +131,6 @@ Item {
     authState = ({ status: "unlocked", has_session: true })
     searchQuery = "github"
     selectedIndex = 2
-    showPasswordRevealed = true
     simulateClose()
     check(searchQuery === "", "disabled remember_last_search clears searchQuery on close")
     check(selectedIndex === 0, "disabled remember_last_search resets selectedIndex on close")
@@ -157,33 +146,29 @@ Item {
     searchQuery = "gitlab"
     selectedIndex = 1
     activeCategory = "login"
-    showPasswordRevealed = true
+    opened = true
     showActionPalette = true
+    releaseCommands = []
+    secretRelease.reveal(SecretFieldCatalog.LOGIN_PASSWORD)
+    revealReply(SecretFieldCatalog.LOGIN_PASSWORD, "Remembered-Password-1")
+    secretRelease.reveal(SecretFieldCatalog.LOGIN_TOTP)
+    revealReply(SecretFieldCatalog.LOGIN_TOTP, "987654")
+    check(secretRelease.isRevealed(SecretFieldCatalog.LOGIN_PASSWORD) && secretRelease.totpCode === "987654", "explicit reveals hold the password and TOTP code")
 
-    totpFetchCount = 0
     simulateClose()
     check(searchQuery === "gitlab", "enabled remember_last_search preserves searchQuery on close")
     check(selectedIndex === 1, "enabled remember_last_search preserves selectedIndex on close")
-    check(showPasswordRevealed === false, "sensitive revealed password is reset on close")
+    check(Object.keys(secretRelease.revealedValues).length === 0, "revealed password and TOTP are dropped on close")
     check(showActionPalette === false, "action palette is dismissed on close")
-    check(currentTotp.code === "", "currentTotp reset to empty on close")
 
     // Reopen overlay with item retaining selection
+    releaseCommands = []
     simulateOpen()
     check(searchQuery === "gitlab", "enabled remember_last_search preserves searchQuery on open")
     check(selectedIndex === 1, "enabled remember_last_search preserves selectedIndex on open")
-    check(totpFetchCount === 1, "reopening invokes updateTotpForSelected() immediately")
-    check(currentTotp.code === "987654", "currentTotp code populated on reopen without getting stuck in generating")
+    check(releaseCommands.length === 0, "reopening with a remembered selection releases nothing")
+    check(secretRelease.totpCode === "" && !secretRelease.isRevealed(SecretFieldCatalog.LOGIN_PASSWORD), "reopening shows the remembered item masked")
     check(currentAvailableActions.length > 0, "currentAvailableActions populated on reopen")
-
-    // Test TOTP timer behavior when code is already present vs empty
-    simulateTotpTimerTick()
-    check(currentTotp.ttl === 27, "totp timer decrements TTL when code is present")
-
-    currentTotp = ({ code: "", ttl: 30, period: 30 })
-    totpFetchCount = 0
-    simulateTotpTimerTick()
-    check(totpFetchCount === 1, "totp timer immediately calls updateTotpForSelected if code is empty instead of counting down 30s")
 
     // Clamping of selectedIndex if filteredItems shrank
     filteredItems = [{ id: "1", name: "Single Item", login: {} }]

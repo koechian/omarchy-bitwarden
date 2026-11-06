@@ -13,15 +13,6 @@ Item {
     else console.log("PASS: " + msg)
   }
 
-  // Simulation harness verifying signal-driven reveal toggle in ItemInspector
-  property bool showCardNumberRevealed: false
-  property bool showCardCodeRevealed: false
-  signal toggleCardNumberRevealed()
-  signal toggleCardCodeRevealed()
-
-  onToggleCardNumberRevealed: { showCardNumberRevealed = !showCardNumberRevealed }
-  onToggleCardCodeRevealed: { showCardCodeRevealed = !showCardCodeRevealed }
-
   Component.onCompleted: {
     console.log("Running Card Number Formatting & Sanitization Tests...")
 
@@ -71,39 +62,15 @@ Item {
     check(CardFormatter.formatMaskedCardNumber("123", "") === "•••", "3-digit card displays 3 bullets")
     check(CardFormatter.formatMaskedCardNumber("", "") === "•••• •••• •••• ••••", "Empty card defaults to standard 16-digit mask placeholder")
 
-    // 4. Signal-driven toggle verification
-    check(showCardNumberRevealed === false, "Initial showCardNumberRevealed is false")
-    toggleCardNumberRevealed()
-    check(showCardNumberRevealed === true, "toggleCardNumberRevealed flips state to true")
-    toggleCardNumberRevealed()
-    check(showCardNumberRevealed === false, "toggleCardNumberRevealed flips state to false")
-
-    check(showCardCodeRevealed === false, "Initial showCardCodeRevealed is false")
-    toggleCardCodeRevealed()
-    check(showCardCodeRevealed === true, "toggleCardCodeRevealed flips state to true")
-    toggleCardCodeRevealed()
-    check(showCardCodeRevealed === false, "toggleCardCodeRevealed flips state to false")
-
-    // 5. Parent-Child Binding preservation under item selection changes
-    var parentScope = {
-      rootShowCardNumberRevealed: false,
-      handleSelectedItemChanged: function() {
-        this.rootShowCardNumberRevealed = false
-      }
-    }
-    var childInspector = {
-      item: null,
-      get showCardNumberRevealed() { return parentScope.rootShowCardNumberRevealed }
-    }
-    check(childInspector.showCardNumberRevealed === false, "Inspector initial state false")
-    childInspector.item = { name: "Card 1", card: { number: "4111111111111111" } }
-    parentScope.rootShowCardNumberRevealed = true
-    check(childInspector.showCardNumberRevealed === true, "Inspector reflects reveal toggle after item populated")
-    parentScope.handleSelectedItemChanged()
-    childInspector.item = { name: "Card 2", card: { number: "378282246310005" } }
-    check(childInspector.showCardNumberRevealed === false, "Inspector resets to masked on item selection switch")
-    parentScope.rootShowCardNumberRevealed = true
-    check(childInspector.showCardNumberRevealed === true, "Inspector reflects reveal toggle on subsequent item")
+    // 4. Masked number of a redacted card (contracts.md 3.2): only
+    // number_last_four is available, and it is null for short numbers.
+    // Revealing and its reset on selection change are covered by
+    // tst_secret_release_controller.qml and tst_redacted_item_inspector.qml.
+    check(CardFormatter.formatMaskedLastFour("4444") === "•••• •••• •••• 4444", "Redacted card mask ends with number_last_four")
+    check(CardFormatter.formatMaskedLastFour(null) === "•••• •••• •••• ••••", "Null number_last_four keeps the full mask")
+    check(CardFormatter.formatMaskedLastFour("") === "•••• •••• •••• ••••", "Empty number_last_four keeps the full mask")
+    check(CardFormatter.formatMaskedLastFour("44") === "•••• •••• •••• ••••", "A malformed number_last_four is not displayed")
+    check(CardFormatter.formatMaskedLastFour("<b>1</b>") === "•••• •••• •••• ••••", "A markup-shaped number_last_four is not displayed")
 
     console.log("Card Formatting Tests Completed: " + (failures === 0 ? "ALL PASSED" : failures + " FAILURES"))
     Qt.exit(failures === 0 ? 0 : 1)

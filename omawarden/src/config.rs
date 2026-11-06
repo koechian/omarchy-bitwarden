@@ -6,16 +6,12 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_CONFIG_FILENAME: &str = "config.json";
 pub const DEFAULT_SERVER_URL: &str = "https://vault.bitwarden.com";
-pub const DEFAULT_DOWNLOAD_DIR: &str = "~/Downloads";
 pub const DEFAULT_AUTO_LOCK_MINUTES: i64 = 15;
 pub const DEFAULT_CLIPBOARD_CLEAR_SECONDS: i64 = 30;
 pub const DEFAULT_EMAIL: &str = "";
 pub const DEFAULT_REMEMBER_EMAIL: bool = true;
-pub const DEFAULT_CHECK_UPDATES: bool = true;
 pub const DEFAULT_LOG_LEVEL: &str = "error";
-pub const DEFAULT_SHOW_WEBSITE_ICONS: bool = true;
 pub const DEFAULT_REMEMBER_LAST_SEARCH: bool = false;
-pub const DEFAULT_MAX_ATTACHMENT_SIZE_MB: u64 = 500;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
@@ -23,8 +19,6 @@ pub struct Config {
     pub server_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_url: Option<String>,
-    #[serde(default = "default_download_dir")]
-    pub download_dir: String,
     #[serde(default = "default_auto_lock_minutes")]
     pub auto_lock_minutes: i64,
     #[serde(default = "default_clipboard_clear_seconds")]
@@ -33,28 +27,16 @@ pub struct Config {
     pub email: String,
     #[serde(default = "default_remember_email")]
     pub remember_email: bool,
-    #[serde(default = "default_check_updates")]
-    pub check_updates: bool,
     #[serde(default = "default_log_level")]
     pub log_level: String,
-    #[serde(default = "default_show_website_icons")]
-    pub show_website_icons: bool,
     #[serde(default = "default_remember_last_search")]
     pub remember_last_search: bool,
-    #[serde(default = "default_max_attachment_size_mb")]
-    pub max_attachment_size_mb: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_cert_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_key_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_cert_server: Option<String>,
-    /// Serve the vault's SSH keys on $XDG_RUNTIME_DIR/omawarden-ssh-agent.sock.
-    #[serde(default)]
-    pub ssh_agent_enabled: bool,
-    /// When to confirm signatures: "always", "first-use" (until logout) or "never".
-    #[serde(default = "default_ssh_agent_confirm")]
-    pub ssh_agent_confirm: String,
     /// ADR-0025: retain the user key across soft locks and require a polkit
     /// check (system password / fingerprint) instead of the master password.
     #[serde(default)]
@@ -63,9 +45,6 @@ pub struct Config {
 
 fn default_server_url() -> String {
     DEFAULT_SERVER_URL.to_string()
-}
-fn default_download_dir() -> String {
-    DEFAULT_DOWNLOAD_DIR.to_string()
 }
 fn default_auto_lock_minutes() -> i64 {
     DEFAULT_AUTO_LOCK_MINUTES
@@ -79,23 +58,11 @@ fn default_email() -> String {
 fn default_remember_email() -> bool {
     DEFAULT_REMEMBER_EMAIL
 }
-fn default_check_updates() -> bool {
-    DEFAULT_CHECK_UPDATES
-}
 fn default_log_level() -> String {
     DEFAULT_LOG_LEVEL.to_string()
 }
-fn default_show_website_icons() -> bool {
-    DEFAULT_SHOW_WEBSITE_ICONS
-}
 fn default_remember_last_search() -> bool {
     DEFAULT_REMEMBER_LAST_SEARCH
-}
-fn default_ssh_agent_confirm() -> String {
-    "first-use".to_string()
-}
-fn default_max_attachment_size_mb() -> u64 {
-    DEFAULT_MAX_ATTACHMENT_SIZE_MB
 }
 
 impl Default for Config {
@@ -103,21 +70,15 @@ impl Default for Config {
         Self {
             server_url: default_server_url(),
             identity_url: None,
-            download_dir: default_download_dir(),
             auto_lock_minutes: default_auto_lock_minutes(),
             clipboard_clear_seconds: default_clipboard_clear_seconds(),
             email: default_email(),
             remember_email: default_remember_email(),
-            check_updates: default_check_updates(),
             log_level: default_log_level(),
-            show_website_icons: default_show_website_icons(),
             remember_last_search: default_remember_last_search(),
-            max_attachment_size_mb: default_max_attachment_size_mb(),
             client_cert_path: None,
             client_key_path: None,
             client_cert_server: None,
-            ssh_agent_enabled: false,
-            ssh_agent_confirm: default_ssh_agent_confirm(),
             quick_unlock: false,
         }
     }
@@ -196,14 +157,42 @@ impl ConfigManager {
         Self { config_path }
     }
 
+    /// Reads the configuration. A missing file yields the defaults; a file
+    /// that exists but cannot be read or parsed is an error, so a damaged
+    /// file never silently sends credentials to the default server.
+    pub fn try_load(&self) -> std::io::Result<Config> {
+        let content = match fs::read_to_string(&self.config_path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Cannot read configuration file {}: {}",
+                        self.config_path.display(),
+                        e
+                    ),
+                ))
+            }
+        };
+        serde_json::from_str(&content).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Configuration file {} is invalid ({}). Fix or remove it; the default server will not be used in its place.",
+                    self.config_path.display(),
+                    e
+                ),
+            )
+        })
+    }
+
+    /// Lenient read for in-process lookups of non-network settings (log
+    /// level, timeouts). It falls back to the defaults on any error and must
+    /// not log, because the logger itself calls it. The process entry point
+    /// and every path that saves the configuration use [Self::try_load].
     pub fn load(&self) -> Config {
-        if !self.config_path.exists() {
-            return Config::default();
-        }
-        match fs::read_to_string(&self.config_path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => Config::default(),
-        }
+        self.try_load().unwrap_or_default()
     }
 
     pub fn save(&self, config: &Config) -> std::io::Result<()> {
@@ -248,7 +237,7 @@ impl ConfigManager {
         storage_mgr: &crate::storage::StorageManager,
         keyring_mgr: &crate::keyring::KeyringManager,
     ) -> std::io::Result<(Config, bool)> {
-        let mut cfg = self.load();
+        let mut cfg = self.try_load()?;
         let mut quick_unlock_flip: Option<bool> = None;
 
         if let Some(ref v) = options.server_url {
@@ -256,16 +245,6 @@ impl ConfigManager {
         }
         if let Some(ref v) = options.identity_url {
             Self::validate_url_scheme_security(v, "identity_url")?;
-        }
-        // Checked before anything is purged for a server change, so a bad
-        // value can't leave the settings half applied.
-        if let Some(ref v) = options.ssh_agent_confirm {
-            if !matches!(v.as_str(), "always" | "first-use" | "never") {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("ssh_agent_confirm must be always, first-use or never (got {v:?})"),
-                ));
-            }
         }
 
         let old_server_norm = cfg.server_url.trim().trim_end_matches('/');
@@ -283,7 +262,7 @@ impl ConfigManager {
         if server_changed {
             // Server address changed: purge identity_url (if not explicitly provided),
             // vault cache (data.json), keyring credentials (api_secret, access_token, refresh_token, session),
-            // in-memory daemon state, and temporary preview attachments.
+            // and in-memory daemon state.
             // Note: Remembered login email (cfg.email) is preserved for user convenience.
             if options.identity_url.is_none() {
                 cfg.identity_url = None;
@@ -304,7 +283,6 @@ impl ConfigManager {
                 "action": "wipe_quick_unlock"
             }));
             let _ = crate::daemon::send_daemon_request(&serde_json::json!({ "action": "stop" }));
-            crate::attachment::clear_preview_attachments(None);
 
             crate::log_info!(
                 "omawarden:config",
@@ -321,9 +299,6 @@ impl ConfigManager {
                 cfg.identity_url = Some(trimmed.to_string());
             }
         }
-        if let Some(v) = options.download_dir {
-            cfg.download_dir = v;
-        }
         if let Some(v) = options.auto_lock_minutes {
             cfg.auto_lock_minutes = v;
         }
@@ -336,23 +311,11 @@ impl ConfigManager {
         if let Some(v) = options.remember_email {
             cfg.remember_email = v;
         }
-        if let Some(v) = options.check_updates {
-            cfg.check_updates = v;
-        }
         if let Some(v) = options.log_level {
             cfg.log_level = v.to_lowercase();
         }
-        if let Some(v) = options.show_website_icons {
-            cfg.show_website_icons = v;
-        }
         if let Some(v) = options.remember_last_search {
             cfg.remember_last_search = v;
-        }
-        if let Some(v) = options.ssh_agent_enabled {
-            cfg.ssh_agent_enabled = v;
-        }
-        if let Some(v) = options.ssh_agent_confirm {
-            cfg.ssh_agent_confirm = v;
         }
         if let Some(v) = options.quick_unlock {
             cfg.quick_unlock = v;
@@ -360,9 +323,6 @@ impl ConfigManager {
             // only once the new value is on disk, so a daemon restart in
             // between cannot resurrect the old setting from the file.
             quick_unlock_flip = Some(v);
-        }
-        if let Some(v) = options.max_attachment_size_mb {
-            cfg.max_attachment_size_mb = v;
         }
 
         if let Some(ref cert_path) = options.client_cert_path {
@@ -418,20 +378,14 @@ impl ConfigManager {
 pub struct ConfigUpdateOptions {
     pub server_url: Option<String>,
     pub identity_url: Option<String>,
-    pub download_dir: Option<String>,
     pub auto_lock_minutes: Option<i64>,
     pub clipboard_clear_seconds: Option<i64>,
     pub email: Option<String>,
     pub remember_email: Option<bool>,
-    pub check_updates: Option<bool>,
     pub log_level: Option<String>,
-    pub show_website_icons: Option<bool>,
     pub remember_last_search: Option<bool>,
-    pub max_attachment_size_mb: Option<u64>,
     pub client_cert_path: Option<String>,
     pub client_key_path: Option<String>,
-    pub ssh_agent_enabled: Option<bool>,
-    pub ssh_agent_confirm: Option<String>,
     pub quick_unlock: Option<bool>,
 }
 
@@ -445,14 +399,12 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
         assert_eq!(cfg.identity_url, None);
-        assert_eq!(cfg.download_dir, DEFAULT_DOWNLOAD_DIR);
         assert_eq!(cfg.auto_lock_minutes, 15);
         assert_eq!(cfg.clipboard_clear_seconds, 30);
         assert_eq!(cfg.email, "");
         assert!(cfg.remember_email);
         assert_eq!(cfg.log_level, "error");
         assert!(!cfg.remember_last_search);
-        assert_eq!(cfg.max_attachment_size_mb, 500);
     }
 
     #[test]
@@ -493,7 +445,54 @@ mod tests {
         assert_eq!(loaded.server_url, DEFAULT_SERVER_URL);
         assert_eq!(loaded.identity_url, None);
         assert!(loaded.remember_email);
-        assert_eq!(loaded.max_attachment_size_mb, 500);
+    }
+
+    #[test]
+    fn test_load_config_with_fields_of_removed_features() {
+        // A config.json written by an earlier release still carries settings
+        // for features this fork removed. It must load with every remaining
+        // setting intact rather than fall back to the defaults.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(
+            &path,
+            r#"{
+                "server_url": "https://vault.example.com",
+                "email": "legacy@example.com",
+                "auto_lock_minutes": 7,
+                "quick_unlock": true,
+                "download_dir": "~/Downloads",
+                "check_updates": false,
+                "show_website_icons": true,
+                "max_attachment_size_mb": 250,
+                "ssh_agent_enabled": true,
+                "ssh_agent_confirm": "always"
+            }"#,
+        )
+        .unwrap();
+
+        let mgr = ConfigManager::new(Some(&path));
+        let loaded = mgr.load();
+        assert_ne!(loaded, Config::default());
+        assert_eq!(loaded.server_url, "https://vault.example.com");
+        assert_eq!(loaded.email, "legacy@example.com");
+        assert_eq!(loaded.auto_lock_minutes, 7);
+        assert!(loaded.quick_unlock);
+
+        // Saving rewrites the file without the obsolete settings.
+        mgr.save(&loaded).unwrap();
+        let rewritten = fs::read_to_string(&path).unwrap();
+        for obsolete in [
+            "download_dir",
+            "check_updates",
+            "show_website_icons",
+            "max_attachment_size_mb",
+            "ssh_agent_enabled",
+            "ssh_agent_confirm",
+        ] {
+            assert!(!rewritten.contains(obsolete), "{obsolete} was written back");
+        }
+        assert_eq!(mgr.load(), loaded);
     }
 
     #[test]
@@ -505,6 +504,52 @@ mod tests {
         let mgr = ConfigManager::new(Some(&path));
         let loaded = mgr.load();
         assert_eq!(loaded, Config::default());
+    }
+
+    #[test]
+    fn test_try_load_rejects_invalid_config_and_defaults_only_when_missing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mgr = ConfigManager::new(Some(&path));
+
+        assert_eq!(mgr.try_load().unwrap(), Config::default());
+
+        for invalid in [
+            "{ invalid json ",
+            "",
+            r#"{"server_url": 42}"#,
+            r#"{"auto_lock_minutes": "never"}"#,
+        ] {
+            fs::write(&path, invalid).unwrap();
+            let err = mgr.try_load().unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{invalid:?}");
+            assert!(err.to_string().contains("is invalid"), "{err}");
+        }
+
+        fs::write(&path, r#"{"server_url": "https://vault.example.com"}"#).unwrap();
+        assert_eq!(
+            mgr.try_load().unwrap().server_url,
+            "https://vault.example.com"
+        );
+    }
+
+    #[test]
+    fn test_update_config_refuses_to_overwrite_invalid_config() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(&path, "{ invalid json ").unwrap();
+        let mgr = ConfigManager::new(Some(&path));
+        let storage_mgr = crate::storage::StorageManager::new(dir.path().join("data.json"));
+        let keyring_mgr = crate::keyring::KeyringManager::new("/nonexistent/secret-tool");
+
+        let options = ConfigUpdateOptions {
+            log_level: Some("debug".to_string()),
+            ..Default::default()
+        };
+        assert!(mgr
+            .update_config(options, &storage_mgr, &keyring_mgr)
+            .is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{ invalid json ");
     }
 
     #[test]
@@ -696,13 +741,13 @@ esac
 
         let _lock = crate::env_lock();
         let dir = tempdir().unwrap();
-        let runtime = tempdir().unwrap();
+        let runtime = crate::private_runtime_dir();
         let old_runtime = std::env::var_os("XDG_RUNTIME_DIR");
         std::env::set_var("XDG_RUNTIME_DIR", runtime.path());
 
         // Mock daemon socket: records the actions the purge flow sends. The
         // real daemon exits on "stop", so the mock stops serving after it.
-        let sock_path = crate::daemon::get_socket_path();
+        let sock_path = crate::daemon::get_socket_path().unwrap();
         let _ = std::fs::remove_file(&sock_path);
         let listener = UnixListener::bind(&sock_path).expect("bind mock daemon socket");
         let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -844,75 +889,6 @@ esac
     }
 
     #[test]
-    fn test_check_updates_default_and_update() {
-        assert!(Config::default().check_updates);
-
-        let dir = tempdir().unwrap();
-        let config_path = dir.path().join("config.json");
-        let mock_script = create_mock_secret_tool(dir.path());
-
-        let config_mgr = ConfigManager::new(Some(&config_path));
-        let storage_mgr = crate::storage::StorageManager::new(dir.path().join("data.json"));
-        let keyring_mgr = crate::keyring::KeyringManager::new(&mock_script);
-
-        let (updated_cfg, _server_changed) = config_mgr
-            .update_config(
-                ConfigUpdateOptions {
-                    check_updates: Some(false),
-                    ..Default::default()
-                },
-                &storage_mgr,
-                &keyring_mgr,
-            )
-            .unwrap();
-        assert!(!updated_cfg.check_updates);
-
-        // Round-trips through config.json
-        assert!(!ConfigManager::new(Some(&config_path)).load().check_updates);
-
-        // Existing configs written before this key existed keep the default
-        let legacy_path = dir.path().join("legacy.json");
-        fs::write(&legacy_path, r#"{"email": "legacy@test.com"}"#).unwrap();
-        assert!(ConfigManager::new(Some(&legacy_path)).load().check_updates);
-    }
-
-    #[test]
-    fn test_show_website_icons_default_and_update() {
-        let dir = tempdir().unwrap();
-        let config_path = dir.path().join("config.json");
-        let storage_path = dir.path().join("data.json");
-        let mock_script = create_mock_secret_tool(dir.path());
-
-        assert!(Config::default().show_website_icons);
-
-        let config_mgr = ConfigManager::new(Some(&config_path));
-        let storage_mgr = crate::storage::StorageManager::new(storage_path);
-        let keyring_mgr = crate::keyring::KeyringManager::new(&mock_script);
-
-        let (updated_cfg, _) = config_mgr
-            .update_config(
-                ConfigUpdateOptions {
-                    show_website_icons: Some(false),
-                    ..Default::default()
-                },
-                &storage_mgr,
-                &keyring_mgr,
-            )
-            .unwrap();
-        assert!(!updated_cfg.show_website_icons);
-
-        // Persisted to disk
-        let reloaded = ConfigManager::new(Some(&config_path)).load();
-        assert!(!reloaded.show_website_icons);
-
-        // Upgrade path: config written before the key existed must default to true
-        let legacy_path = dir.path().join("legacy.json");
-        fs::write(&legacy_path, r#"{"email": "legacy@test.com"}"#).unwrap();
-        let legacy = ConfigManager::new(Some(&legacy_path)).load();
-        assert!(legacy.show_website_icons);
-    }
-
-    #[test]
     fn test_remember_last_search_default_and_update() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("config.json");
@@ -946,42 +922,6 @@ esac
         fs::write(&legacy_path, r#"{"email": "legacy@test.com"}"#).unwrap();
         let legacy = ConfigManager::new(Some(&legacy_path)).load();
         assert!(!legacy.remember_last_search);
-    }
-
-    #[test]
-    fn test_max_attachment_size_mb_default_and_update() {
-        let dir = tempdir().unwrap();
-        let config_path = dir.path().join("config.json");
-        let storage_path = dir.path().join("data.json");
-        let mock_script = create_mock_secret_tool(dir.path());
-
-        assert_eq!(Config::default().max_attachment_size_mb, 500);
-
-        let config_mgr = ConfigManager::new(Some(&config_path));
-        let storage_mgr = crate::storage::StorageManager::new(storage_path);
-        let keyring_mgr = crate::keyring::KeyringManager::new(&mock_script);
-
-        let (updated_cfg, _) = config_mgr
-            .update_config(
-                ConfigUpdateOptions {
-                    max_attachment_size_mb: Some(100),
-                    ..Default::default()
-                },
-                &storage_mgr,
-                &keyring_mgr,
-            )
-            .unwrap();
-        assert_eq!(updated_cfg.max_attachment_size_mb, 100);
-
-        // Persisted to disk
-        let reloaded = ConfigManager::new(Some(&config_path)).load();
-        assert_eq!(reloaded.max_attachment_size_mb, 100);
-
-        // Upgrade path: config written before the key existed must default to 500
-        let legacy_path = dir.path().join("legacy.json");
-        fs::write(&legacy_path, r#"{"email": "legacy@test.com"}"#).unwrap();
-        let legacy = ConfigManager::new(Some(&legacy_path)).load();
-        assert_eq!(legacy.max_attachment_size_mb, 500);
     }
 
     #[test]
@@ -1060,95 +1000,6 @@ esac
         let err = res.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("Remote servers must use HTTPS"));
-    }
-
-    #[test]
-    fn test_update_config_ssh_agent_settings() {
-        let dir = tempdir().unwrap();
-        let config_path = dir.path().join("config.json");
-        let storage_path = dir.path().join("data.json");
-        let mock_script = create_mock_secret_tool(dir.path());
-
-        let config_mgr = ConfigManager::new(Some(&config_path));
-        let storage_mgr = crate::storage::StorageManager::new(storage_path.clone());
-        let keyring_mgr = crate::keyring::KeyringManager::new(&mock_script);
-
-        let (cfg, _) = config_mgr
-            .update_config(
-                ConfigUpdateOptions {
-                    log_level: Some("DEBUG".to_string()),
-                    ..Default::default()
-                },
-                &storage_mgr,
-                &keyring_mgr,
-            )
-            .unwrap();
-        assert_eq!(cfg.log_level, "debug", "log levels are normalised");
-
-        let defaults = config_mgr.load();
-        assert!(!defaults.ssh_agent_enabled);
-        assert_eq!(defaults.ssh_agent_confirm, "first-use");
-
-        for confirm in ["always", "first-use", "never"] {
-            let (cfg, _) = config_mgr
-                .update_config(
-                    ConfigUpdateOptions {
-                        ssh_agent_enabled: Some(true),
-                        ssh_agent_confirm: Some(confirm.to_string()),
-                        ..Default::default()
-                    },
-                    &storage_mgr,
-                    &keyring_mgr,
-                )
-                .unwrap();
-            assert!(cfg.ssh_agent_enabled);
-            assert_eq!(cfg.ssh_agent_confirm, confirm);
-            assert_eq!(config_mgr.load().ssh_agent_confirm, confirm);
-        }
-
-        let (cfg, _) = config_mgr
-            .update_config(
-                ConfigUpdateOptions {
-                    ssh_agent_enabled: Some(false),
-                    ..Default::default()
-                },
-                &storage_mgr,
-                &keyring_mgr,
-            )
-            .unwrap();
-        assert!(!cfg.ssh_agent_enabled);
-        assert_eq!(cfg.ssh_agent_confirm, "never", "left alone when not given");
-    }
-
-    #[test]
-    fn test_update_config_rejects_unknown_ssh_agent_confirm_before_any_purge() {
-        let dir = tempdir().unwrap();
-        let config_path = dir.path().join("config.json");
-        let storage_path = dir.path().join("data.json");
-        let mock_script = create_mock_secret_tool(dir.path());
-
-        let config_mgr = ConfigManager::new(Some(&config_path));
-        let storage_mgr = crate::storage::StorageManager::new(storage_path.clone());
-        let keyring_mgr = crate::keyring::KeyringManager::new(&mock_script);
-        fs::write(&storage_path, "{}").unwrap();
-
-        // Also changes the server, which would purge the vault cache.
-        let err = config_mgr
-            .update_config(
-                ConfigUpdateOptions {
-                    server_url: Some("https://vault.example.org".to_string()),
-                    ssh_agent_confirm: Some("Always".to_string()),
-                    ..Default::default()
-                },
-                &storage_mgr,
-                &keyring_mgr,
-            )
-            .unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(err.to_string().contains("ssh_agent_confirm"));
-        assert!(storage_path.exists(), "the vault cache was not purged");
-        assert_eq!(config_mgr.load().ssh_agent_confirm, "first-use");
-        assert_eq!(config_mgr.load().server_url, default_server_url());
     }
 
     #[test]

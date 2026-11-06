@@ -7,6 +7,7 @@ use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use std::ops::RangeInclusive;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -18,9 +19,11 @@ type HmacSha256 = Hmac<Sha256>;
 #[derive(Debug, PartialEq, Eq)]
 pub enum CryptoError {
     InvalidKdfParams,
+    KdfParametersRejected(String),
     InvalidEncString(String),
     UnsupportedCipherType(u32),
     MacMismatch,
+    MacRequired,
     DecryptionFailed(String),
     InvalidKeyLength,
     Utf8Error,
@@ -30,9 +33,11 @@ impl std::fmt::Display for CryptoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CryptoError::InvalidKdfParams => write!(f, "Invalid KDF parameters"),
+            CryptoError::KdfParametersRejected(s) => write!(f, "KDF parameters rejected: {}", s),
             CryptoError::InvalidEncString(s) => write!(f, "Invalid EncString format: {}", s),
             CryptoError::UnsupportedCipherType(t) => write!(f, "Unsupported cipher type: {}", t),
             CryptoError::MacMismatch => write!(f, "MAC verification failed"),
+            CryptoError::MacRequired => write!(f, "MAC required"),
             CryptoError::DecryptionFailed(s) => write!(f, "Decryption failed: {}", s),
             CryptoError::InvalidKeyLength => write!(f, "Invalid key length"),
             CryptoError::Utf8Error => write!(f, "UTF-8 decoding error"),
@@ -42,19 +47,128 @@ impl std::fmt::Display for CryptoError {
 
 impl std::error::Error for CryptoError {}
 
+/// Length in bytes of a Bitwarden AES-256-CBC-HMAC-SHA256 key: a 32-byte
+/// encryption key followed by a 32-byte MAC key.
+pub const AUTHENTICATED_SYMMETRIC_KEY_LENGTH: usize = 64;
+
+/// PBKDF2-SHA256 iteration bounds. 100,000 is the lowest historical
+/// Bitwarden default that existing accounts may still use.
+pub const PBKDF2_ITERATIONS_RANGE: RangeInclusive<u32> = 100_000..=2_000_000;
+pub const PBKDF2_DEFAULT_ITERATIONS: u32 = 600_000;
+
+/// Argon2id bounds documented by Bitwarden.
+pub const ARGON2_MEMORY_MIB_RANGE: RangeInclusive<u32> = 16..=1024;
+pub const ARGON2_ITERATIONS_RANGE: RangeInclusive<u32> = 2..=10;
+pub const ARGON2_PARALLELISM_RANGE: RangeInclusive<u32> = 1..=16;
+pub const ARGON2_DEFAULT_MEMORY_MIB: u32 = 64;
+pub const ARGON2_DEFAULT_ITERATIONS: u32 = 3;
+pub const ARGON2_DEFAULT_PARALLELISM: u32 = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KdfType {
     Pbkdf2Sha256 = 0,
     Argon2id = 1,
 }
 
-impl From<u32> for KdfType {
-    fn from(val: u32) -> Self {
-        match val {
-            1 => KdfType::Argon2id,
-            _ => KdfType::Pbkdf2Sha256,
+impl KdfType {
+    /// Interprets the KDF type reported by the server. An omitted value means
+    /// PBKDF2-SHA256; an unknown value is refused rather than substituted.
+    pub fn from_server_value(value: Option<u32>) -> Result<Self, CryptoError> {
+        match value.unwrap_or(0) {
+            0 => Ok(KdfType::Pbkdf2Sha256),
+            1 => Ok(KdfType::Argon2id),
+            other => Err(CryptoError::KdfParametersRejected(format!(
+                "unsupported KDF type {}",
+                other
+            ))),
         }
     }
+}
+
+/// Key derivation parameters after server-omitted values are replaced by
+/// their defaults. Values the server did send are never altered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KdfParameters {
+    Pbkdf2Sha256 {
+        iterations: u32,
+    },
+    Argon2id {
+        iterations: u32,
+        memory_mib: u32,
+        parallelism: u32,
+    },
+}
+
+impl KdfParameters {
+    /// Builds the parameters from optional server values, applying defaults
+    /// only to omitted values.
+    pub fn resolve(
+        kdf_type: KdfType,
+        iterations: Option<u32>,
+        memory_mib: Option<u32>,
+        parallelism: Option<u32>,
+    ) -> Self {
+        match kdf_type {
+            KdfType::Pbkdf2Sha256 => KdfParameters::Pbkdf2Sha256 {
+                iterations: iterations.unwrap_or(PBKDF2_DEFAULT_ITERATIONS),
+            },
+            KdfType::Argon2id => KdfParameters::Argon2id {
+                iterations: iterations.unwrap_or(ARGON2_DEFAULT_ITERATIONS),
+                memory_mib: memory_mib.unwrap_or(ARGON2_DEFAULT_MEMORY_MIB),
+                parallelism: parallelism.unwrap_or(ARGON2_DEFAULT_PARALLELISM),
+            },
+        }
+    }
+
+    /// Builds the parameters from the raw prelogin, token or storage fields.
+    pub fn from_server_values(
+        kdf: Option<u32>,
+        iterations: Option<u32>,
+        memory_mib: Option<u32>,
+        parallelism: Option<u32>,
+    ) -> Result<Self, CryptoError> {
+        let kdf_type = KdfType::from_server_value(kdf)?;
+        Ok(Self::resolve(kdf_type, iterations, memory_mib, parallelism))
+    }
+
+    /// Refuses parameters outside the accepted bounds instead of adjusting them.
+    pub fn validate(&self) -> Result<(), CryptoError> {
+        match *self {
+            KdfParameters::Pbkdf2Sha256 { iterations } => {
+                require_within_range("PBKDF2 iterations", iterations, &PBKDF2_ITERATIONS_RANGE)
+            }
+            KdfParameters::Argon2id {
+                iterations,
+                memory_mib,
+                parallelism,
+            } => {
+                require_within_range("Argon2id memory MiB", memory_mib, &ARGON2_MEMORY_MIB_RANGE)?;
+                require_within_range("Argon2id iterations", iterations, &ARGON2_ITERATIONS_RANGE)?;
+                require_within_range(
+                    "Argon2id parallelism",
+                    parallelism,
+                    &ARGON2_PARALLELISM_RANGE,
+                )
+            }
+        }
+    }
+}
+
+fn require_within_range(
+    parameter_name: &str,
+    value: u32,
+    accepted_range: &RangeInclusive<u32>,
+) -> Result<(), CryptoError> {
+    if accepted_range.contains(&value) {
+        return Ok(());
+    }
+    Err(CryptoError::KdfParametersRejected(format!(
+        "{} {} is outside the accepted range {}-{}",
+        parameter_name,
+        value,
+        accepted_range.start(),
+        accepted_range.end()
+    )))
 }
 
 pub fn derive_master_key(
@@ -65,39 +179,73 @@ pub fn derive_master_key(
     memory_mb: Option<u32>,
     parallelism: Option<u32>,
 ) -> Result<LockedKey32, CryptoError> {
+    let parameters = KdfParameters::resolve(kdf_type, Some(iterations), memory_mb, parallelism);
+    derive_master_key_with_parameters(email, password, &parameters)
+}
+
+/// Derives the master key, refusing out-of-range parameters.
+pub fn derive_master_key_with_parameters(
+    email: &str,
+    password: &str,
+    parameters: &KdfParameters,
+) -> Result<LockedKey32, CryptoError> {
+    parameters.validate()?;
     let email_normalized = email.trim().to_lowercase();
-    let mut master_key = LockedKey32::new_zeroed();
 
-    match kdf_type {
-        KdfType::Pbkdf2Sha256 => {
-            let iter = if iterations < 100_000 {
-                600_000
-            } else {
-                iterations
-            };
-            pbkdf2::pbkdf2_hmac::<Sha256>(
-                password.as_bytes(),
-                email_normalized.as_bytes(),
-                iter,
-                master_key.as_mut_slice(),
-            );
-        }
-        KdfType::Argon2id => {
-            let memory = memory_mb.unwrap_or(64) * 1024; // KB
-            let passes = if iterations < 3 { 3 } else { iterations };
-            let lanes = parallelism.unwrap_or(4);
-
-            let params = Params::new(memory, passes, lanes, Some(32))
-                .map_err(|_| CryptoError::InvalidKdfParams)?;
-            let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-
-            let email_hash = Sha256::digest(email_normalized.as_bytes());
-            argon2
-                .hash_password_into(password.as_bytes(), &email_hash, master_key.as_mut_slice())
-                .map_err(|_| CryptoError::InvalidKdfParams)?;
-        }
+    match *parameters {
+        KdfParameters::Pbkdf2Sha256 { iterations } => Ok(derive_pbkdf2_master_key(
+            password,
+            &email_normalized,
+            iterations,
+        )),
+        KdfParameters::Argon2id {
+            iterations,
+            memory_mib,
+            parallelism,
+        } => derive_argon2id_master_key(
+            password,
+            &email_normalized,
+            iterations,
+            memory_mib,
+            parallelism,
+        ),
     }
+}
 
+fn derive_pbkdf2_master_key(
+    password: &str,
+    email_normalized: &str,
+    iterations: u32,
+) -> LockedKey32 {
+    let mut master_key = LockedKey32::new_zeroed();
+    pbkdf2::pbkdf2_hmac::<Sha256>(
+        password.as_bytes(),
+        email_normalized.as_bytes(),
+        iterations,
+        master_key.as_mut_slice(),
+    );
+    master_key
+}
+
+fn derive_argon2id_master_key(
+    password: &str,
+    email_normalized: &str,
+    iterations: u32,
+    memory_mib: u32,
+    parallelism: u32,
+) -> Result<LockedKey32, CryptoError> {
+    let memory_kib = memory_mib.checked_mul(1024).ok_or_else(|| {
+        CryptoError::KdfParametersRejected(format!("Argon2id memory MiB {} overflows", memory_mib))
+    })?;
+    let params = Params::new(memory_kib, iterations, parallelism, Some(32))
+        .map_err(|_| CryptoError::InvalidKdfParams)?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
+    let mut master_key = LockedKey32::new_zeroed();
+    let email_hash = Sha256::digest(email_normalized.as_bytes());
+    argon2
+        .hash_password_into(password.as_bytes(), &email_hash, master_key.as_mut_slice())
+        .map_err(|_| CryptoError::InvalidKdfParams)?;
     Ok(master_key)
 }
 
@@ -123,22 +271,33 @@ impl Zeroize for SymmetricCryptoKey {
 }
 
 impl SymmetricCryptoKey {
-    pub fn from_master_key(master_key: &[u8]) -> Self {
-        let hkdf = Hkdf::<Sha256>::new(Some(&[]), master_key);
+    /// Stretches a 32-byte master key into an encryption key and a MAC key with
+    /// HKDF-Expand (RFC 5869 section 2.3, the master key used as the PRK) and
+    /// the info strings "enc" and "mac", as Bitwarden clients do.
+    pub fn stretch_master_key(master_key: &[u8]) -> Result<Self, CryptoError> {
+        if master_key.len() != 32 {
+            return Err(CryptoError::InvalidKeyLength);
+        }
+        let hkdf =
+            Hkdf::<Sha256>::from_prk(master_key).map_err(|_| CryptoError::InvalidKeyLength)?;
         let mut enc_key = LockedKey32::new_zeroed();
         let mut mac_key = LockedKey32::new_zeroed();
-
         hkdf.expand(b"enc", enc_key.as_mut_slice())
-            .expect("HKDF expand enc failed");
+            .map_err(|_| CryptoError::InvalidKeyLength)?;
         hkdf.expand(b"mac", mac_key.as_mut_slice())
-            .expect("HKDF expand mac failed");
+            .map_err(|_| CryptoError::InvalidKeyLength)?;
 
-        Self {
+        Ok(Self {
             enc_key,
             mac_key: Some(mac_key),
-        }
+        })
     }
 
+    /// Decrypts the protected user key with the master key.
+    ///
+    /// Type 2 user keys are decrypted with the stretched master key. Type 0
+    /// user keys are the legacy format official clients still accept: the raw
+    /// master key is the AES key and no MAC is present.
     pub fn decrypt_with_master_key(
         enc: &EncString,
         master_key: &[u8],
@@ -146,78 +305,30 @@ impl SymmetricCryptoKey {
         if master_key.len() != 32 {
             return Err(CryptoError::InvalidKeyLength);
         }
-        let mut candidate_keys = Vec::new();
-
-        // 1. HKDF from_prk (RFC 5869 Section 2.3 directly on master key)
-        if let Ok(hkdf) = Hkdf::<Sha256>::from_prk(master_key) {
-            let mut enc_key = LockedKey32::new_zeroed();
-            let mut mac_key = LockedKey32::new_zeroed();
-            if hkdf.expand(b"enc", enc_key.as_mut_slice()).is_ok()
-                && hkdf.expand(b"mac", mac_key.as_mut_slice()).is_ok()
-            {
-                candidate_keys.push(SymmetricCryptoKey {
-                    enc_key,
-                    mac_key: Some(mac_key),
-                });
-            }
-        }
-
-        // 2. HKDF with empty salt (Node.js/WebCrypto extract+expand)
-        {
-            let hkdf = Hkdf::<Sha256>::new(Some(&[]), master_key);
-            let mut enc_key = LockedKey32::new_zeroed();
-            let mut mac_key = LockedKey32::new_zeroed();
-            if hkdf.expand(b"enc", enc_key.as_mut_slice()).is_ok()
-                && hkdf.expand(b"mac", mac_key.as_mut_slice()).is_ok()
-            {
-                candidate_keys.push(SymmetricCryptoKey {
-                    enc_key,
-                    mac_key: Some(mac_key),
-                });
-            }
-        }
-
-        // 3. Direct master key as encryption key (only for legacy unauthenticated enc_type == 0)
         if enc.enc_type == 0 {
-            if let Some(enc_k) = LockedKey32::from_slice(master_key) {
-                candidate_keys.push(SymmetricCryptoKey {
-                    enc_key: enc_k,
-                    mac_key: None,
-                });
-            }
+            let legacy_key = SymmetricCryptoKey {
+                enc_key: LockedKey32::from_slice(master_key)
+                    .ok_or(CryptoError::InvalidKeyLength)?,
+                mac_key: None,
+            };
+            return enc.decrypt(&legacy_key);
         }
-
-        let mut last_err =
-            CryptoError::DecryptionFailed("No matching candidate key found".to_string());
-        for key in &candidate_keys {
-            match enc.decrypt(key) {
-                Ok(bytes) => return Ok(bytes),
-                Err(e) => last_err = e,
-            }
-        }
-
-        Err(last_err)
+        enc.decrypt(&Self::stretch_master_key(master_key)?)
     }
 
+    /// Builds a key from a 64-byte enc+mac blob. MAC-less 32-byte keys are
+    /// refused: every user, organization, item and attachment key issued by
+    /// current Bitwarden clients is authenticated.
     pub fn from_raw_bytes(key_bytes: &[u8]) -> Result<Self, CryptoError> {
-        if key_bytes.len() == 32 {
-            let enc = LockedKey32::from_slice(key_bytes).ok_or(CryptoError::InvalidKeyLength)?;
-            Ok(Self {
-                enc_key: enc,
-                mac_key: None,
-            })
-        } else if key_bytes.len() == 64 {
-            let enc =
-                LockedKey32::from_slice(&key_bytes[..32]).ok_or(CryptoError::InvalidKeyLength)?;
-            let mac =
-                LockedKey32::from_slice(&key_bytes[32..64]).ok_or(CryptoError::InvalidKeyLength)?;
-            Ok(Self {
-                enc_key: enc,
-                mac_key: Some(mac),
-            })
-        } else {
-            Err(CryptoError::InvalidKeyLength)
+        if key_bytes.len() != AUTHENTICATED_SYMMETRIC_KEY_LENGTH {
+            return Err(CryptoError::InvalidKeyLength);
         }
+        let enc = LockedKey32::from_slice(&key_bytes[..32]).ok_or(CryptoError::InvalidKeyLength)?;
+        let mac = LockedKey32::from_slice(&key_bytes[32..]).ok_or(CryptoError::InvalidKeyLength)?;
+        Ok(Self {
+            enc_key: enc,
+            mac_key: Some(mac),
+        })
     }
 
     pub fn encrypt_string(&self, plaintext: &str) -> Result<String, CryptoError> {
@@ -348,71 +459,43 @@ impl EncString {
 
     pub fn decrypt(&self, key: &SymmetricCryptoKey) -> Result<Vec<u8>, CryptoError> {
         match self.enc_type {
-            0 => {
-                if self.iv.len() != 16 {
-                    return Err(CryptoError::DecryptionFailed(
-                        "Invalid IV length".to_string(),
-                    ));
-                }
-
-                // enc_type 0: AesCbc256_B64 (legacy unauthenticated CBC)
-                if let (Some(expected_mac), Some(mac_key)) = (&self.mac, &key.mac_key) {
-                    let mut hmac = HmacSha256::new_from_slice(mac_key).map_err(|e| {
-                        CryptoError::DecryptionFailed(format!("Invalid MAC key: {}", e))
-                    })?;
-                    hmac.update(&self.iv);
-                    hmac.update(&self.ciphertext);
-                    let calculated_mac = hmac.finalize().into_bytes();
-                    if expected_mac.ct_eq(&calculated_mac).unwrap_u8() != 1 {
-                        return Err(CryptoError::MacMismatch);
-                    }
-                }
-
-                let mut buf = self.ciphertext.clone();
-                let dec = Aes256CbcDec::new_from_slices(&key.enc_key, &self.iv)
-                    .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
-
-                let decrypted_slice = dec
-                    .decrypt_padded_mut::<Pkcs7>(&mut buf)
-                    .map_err(|e| CryptoError::DecryptionFailed(format!("{:?}", e)))?;
-
-                Ok(decrypted_slice.to_vec())
-            }
-            2 => {
-                if self.iv.len() != 16 {
-                    return Err(CryptoError::DecryptionFailed(
-                        "Invalid IV length".to_string(),
-                    ));
-                }
-
-                // enc_type 2: AesCbc256_HmacSha256_B64 (MAC is mandatory)
-                let expected_mac = self.mac.as_deref().ok_or(CryptoError::MacMismatch)?;
-                let mac_key = key.mac_key.as_ref().ok_or(CryptoError::MacMismatch)?;
-
-                let mut hmac = HmacSha256::new_from_slice(mac_key).map_err(|e| {
-                    CryptoError::DecryptionFailed(format!("Invalid MAC key: {}", e))
-                })?;
-                hmac.update(&self.iv);
-                hmac.update(&self.ciphertext);
-                let calculated_mac = hmac.finalize().into_bytes();
-
-                if expected_mac.ct_eq(&calculated_mac).unwrap_u8() != 1 {
-                    return Err(CryptoError::MacMismatch);
-                }
-
-                // Decrypt ONLY after HMAC verification passes (Encrypt-then-MAC)
-                let mut buf = self.ciphertext.clone();
-                let dec = Aes256CbcDec::new_from_slices(&key.enc_key, &self.iv)
-                    .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
-
-                let decrypted_slice = dec
-                    .decrypt_padded_mut::<Pkcs7>(&mut buf)
-                    .map_err(|e| CryptoError::DecryptionFailed(format!("{:?}", e)))?;
-
-                Ok(decrypted_slice.to_vec())
-            }
+            0 => self.decrypt_unauthenticated_aes_cbc(key),
+            2 => self.decrypt_authenticated_aes_cbc(key),
             other => Err(CryptoError::UnsupportedCipherType(other)),
         }
+    }
+
+    /// enc_type 0: AesCbc256_B64 (legacy, unauthenticated CBC).
+    ///
+    /// Refused whenever the key has a MAC key or the EncString carries a MAC,
+    /// as official Bitwarden clients do ("MAC required"). Otherwise a server
+    /// could strip the MAC from an authenticated value and present malleable
+    /// ciphertext under an authenticated key.
+    fn decrypt_unauthenticated_aes_cbc(
+        &self,
+        key: &SymmetricCryptoKey,
+    ) -> Result<Vec<u8>, CryptoError> {
+        if key.mac_key.is_some() || self.mac.is_some() {
+            return Err(CryptoError::MacRequired);
+        }
+        decrypt_aes_cbc_bytes(&self.ciphertext, &self.iv, &key.enc_key)
+    }
+
+    /// enc_type 2: AesCbc256_HmacSha256_B64. The MAC and the MAC key are
+    /// mandatory and the MAC is verified before decryption (Encrypt-then-MAC).
+    fn decrypt_authenticated_aes_cbc(
+        &self,
+        key: &SymmetricCryptoKey,
+    ) -> Result<Vec<u8>, CryptoError> {
+        if self.iv.len() != 16 {
+            return Err(CryptoError::DecryptionFailed(
+                "Invalid IV length".to_string(),
+            ));
+        }
+        let expected_mac = self.mac.as_deref().ok_or(CryptoError::MacMismatch)?;
+        let mac_key = key.mac_key.as_ref().ok_or(CryptoError::MacMismatch)?;
+        verify_hmac_sha256(mac_key, &self.iv, &self.ciphertext, expected_mac)?;
+        decrypt_aes_cbc_bytes(&self.ciphertext, &self.iv, &key.enc_key)
     }
 
     pub fn decrypt_string(&self, key: &SymmetricCryptoKey) -> Result<String, CryptoError> {
@@ -421,23 +504,44 @@ impl EncString {
     }
 }
 
-pub fn decrypt_aes_cbc_bytes(
-    ciphertext: &[u8],
+/// Verifies an HMAC-SHA256 over `iv || ciphertext` in constant time.
+fn verify_hmac_sha256(
+    mac_key: &[u8],
     iv: &[u8],
-    key: &[u8],
-) -> Result<Vec<u8>, CryptoError> {
+    ciphertext: &[u8],
+    expected_mac: &[u8],
+) -> Result<(), CryptoError> {
+    let mut hmac = HmacSha256::new_from_slice(mac_key)
+        .map_err(|e| CryptoError::DecryptionFailed(format!("Invalid MAC key: {}", e)))?;
+    hmac.update(iv);
+    hmac.update(ciphertext);
+    let calculated_mac = hmac.finalize().into_bytes();
+    if expected_mac.ct_eq(&calculated_mac).unwrap_u8() != 1 {
+        return Err(CryptoError::MacMismatch);
+    }
+    Ok(())
+}
+
+fn decrypt_aes_cbc_bytes(ciphertext: &[u8], iv: &[u8], key: &[u8]) -> Result<Vec<u8>, CryptoError> {
     if iv.len() != 16 {
         return Err(CryptoError::DecryptionFailed(
             "Invalid IV length".to_string(),
         ));
     }
-    let mut buf = ciphertext.to_vec();
     let dec = Aes256CbcDec::new_from_slices(key, iv)
         .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
-    let slice = dec
+    // Decrypted in place. The buffer is zeroized on every path out (a
+    // padding failure leaves plaintext in it), and on success it is
+    // truncated to the plaintext and handed to the caller instead of being
+    // copied, so no second plaintext copy is left behind.
+    let mut buf = Zeroizing::new(ciphertext.to_vec());
+    let plaintext_len = dec
         .decrypt_padded_mut::<Pkcs7>(&mut buf)
-        .map_err(|e| CryptoError::DecryptionFailed(format!("{:?}", e)))?;
-    Ok(slice.to_vec())
+        .map_err(|e| CryptoError::DecryptionFailed(format!("{:?}", e)))?
+        .len();
+    buf[plaintext_len..].zeroize();
+    buf.truncate(plaintext_len);
+    Ok(std::mem::take(&mut *buf))
 }
 
 pub fn parse_rsa_private_key_der(der_bytes: &[u8]) -> Result<rsa::RsaPrivateKey, CryptoError> {
@@ -477,102 +581,15 @@ pub fn parse_rsa_private_key_der(der_bytes: &[u8]) -> Result<rsa::RsaPrivateKey,
     ))
 }
 
+/// Parses a decrypted organization, item or attachment key. Only 64-byte
+/// enc+mac keys are accepted, either raw or Base64-encoded.
 pub fn parse_symmetric_key_from_decrypted_bytes(bytes: &[u8]) -> Option<SymmetricCryptoKey> {
-    if bytes.len() == 32 || bytes.len() == 64 {
-        if let Ok(k) = SymmetricCryptoKey::from_raw_bytes(bytes) {
-            return Some(k);
-        }
+    if let Ok(key) = SymmetricCryptoKey::from_raw_bytes(bytes) {
+        return Some(key);
     }
-    if let Ok(text) = std::str::from_utf8(bytes) {
-        let text_clean = text.trim();
-        if let Ok(decoded) = BASE64.decode(text_clean) {
-            if decoded.len() == 32 || decoded.len() == 64 {
-                if let Ok(k) = SymmetricCryptoKey::from_raw_bytes(&decoded) {
-                    return Some(k);
-                }
-            }
-        }
-    }
-    None
-}
-
-pub fn decrypt_attachment_blob(
-    blob: &[u8],
-    key: &SymmetricCryptoKey,
-) -> Result<Vec<u8>, CryptoError> {
-    if blob.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mac_key = key.mac_key.as_ref().ok_or(CryptoError::MacMismatch)?;
-
-    // Standard Bitwarden EncArrayBuffer format:
-    // Format 1: [1 byte encType == 2][16 bytes IV][32 bytes MAC][Ciphertext]
-    if blob.len() >= 49 && blob[0] == 2 {
-        let iv = &blob[1..17];
-        let mac = &blob[17..49];
-        let ct = &blob[49..];
-
-        if !ct.len().is_multiple_of(16) {
-            return Err(CryptoError::DecryptionFailed(
-                "Attachment ciphertext length is not a multiple of 16 (incomplete or truncated download)".to_string(),
-            ));
-        }
-
-        let mut hmac = HmacSha256::new_from_slice(mac_key)
-            .map_err(|_| CryptoError::DecryptionFailed("Invalid MAC key".to_string()))?;
-        hmac.update(iv);
-        hmac.update(ct);
-        let calculated_mac = hmac.finalize().into_bytes();
-        if mac.ct_eq(&calculated_mac).unwrap_u8() != 1 {
-            return Err(CryptoError::DecryptionFailed(
-                "Attachment HMAC integrity verification failed (corrupted or incomplete download)"
-                    .to_string(),
-            ));
-        }
-
-        return decrypt_aes_cbc_bytes(ct, iv, &key.enc_key);
-    }
-
-    // Format 2: [16 bytes IV][32 bytes MAC][Ciphertext] (headerless layout)
-    if blob.len() >= 48 {
-        let iv = &blob[0..16];
-        let mac = &blob[16..48];
-        let ct = &blob[48..];
-        if ct.len().is_multiple_of(16) {
-            if let Ok(mut hmac) = HmacSha256::new_from_slice(mac_key) {
-                hmac.update(iv);
-                hmac.update(ct);
-                let calculated_mac = hmac.finalize().into_bytes();
-                if mac.ct_eq(&calculated_mac).unwrap_u8() == 1 {
-                    return decrypt_aes_cbc_bytes(ct, iv, &key.enc_key);
-                }
-            }
-        }
-    }
-
-    // Format 3: [16 bytes IV][Ciphertext][32 bytes MAC] (trailing MAC layout)
-    if blob.len() >= 48 {
-        let iv = &blob[0..16];
-        let ct_len = blob.len() - 48;
-        if ct_len.is_multiple_of(16) {
-            let ct = &blob[16..16 + ct_len];
-            let mac = &blob[16 + ct_len..];
-            if let Ok(mut hmac) = HmacSha256::new_from_slice(mac_key) {
-                hmac.update(iv);
-                hmac.update(ct);
-                let calculated_mac = hmac.finalize().into_bytes();
-                if mac.ct_eq(&calculated_mac).unwrap_u8() == 1 {
-                    return decrypt_aes_cbc_bytes(ct, iv, &key.enc_key);
-                }
-            }
-        }
-    }
-
-    Err(CryptoError::DecryptionFailed(
-        "Attachment blob does not match any authenticated format or HMAC verification failed"
-            .to_string(),
-    ))
+    let text = std::str::from_utf8(bytes).ok()?;
+    let decoded = Zeroizing::new(BASE64.decode(text.trim()).ok()?);
+    SymmetricCryptoKey::from_raw_bytes(&decoded).ok()
 }
 
 #[cfg(test)]
@@ -734,7 +751,7 @@ mod tests {
     #[test]
     fn test_decrypt_with_master_key_rejects_tampered_mac() {
         let master_key = [23u8; 32];
-        let sym_key = SymmetricCryptoKey::from_master_key(&master_key);
+        let sym_key = SymmetricCryptoKey::stretch_master_key(&master_key).unwrap();
 
         let user_key_raw = [42u8; 64];
         let encrypted_user_key = sym_key
@@ -782,138 +799,343 @@ mod tests {
         let decrypted = parsed.decrypt_string(&key).unwrap();
         assert_eq!(decrypted, "Legacy Type 0 unauthenticated data");
     }
-}
 
-#[test]
-fn test_node_hkdf_match() {
-    let ikm_arr = [
-        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
-        0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
-        0xcd, 0xef,
-    ];
+    fn encrypt_type_0_for_test(enc_key: &[u8; 32], plaintext: &[u8]) -> EncString {
+        use cbc::cipher::BlockEncryptMut;
+        let iv = [3u8; 16];
+        let cipher = cbc::Encryptor::<Aes256>::new(enc_key.into(), (&iv).into());
+        let mut buf = vec![0u8; plaintext.len() + 16];
+        buf[..plaintext.len()].copy_from_slice(plaintext);
+        let ct_len = cipher
+            .encrypt_padded_mut::<Pkcs7>(&mut buf, plaintext.len())
+            .unwrap()
+            .len();
+        EncString {
+            enc_type: 0,
+            iv: iv.to_vec(),
+            ciphertext: buf[..ct_len].to_vec(),
+            mac: None,
+        }
+    }
 
-    let hkdf_new = Hkdf::<Sha256>::new(Some(&[]), &ikm_arr);
-    let mut enc1 = [0u8; 32];
-    let mut mac1 = [0u8; 32];
-    hkdf_new.expand(b"enc", &mut enc1).unwrap();
-    hkdf_new.expand(b"mac", &mut mac1).unwrap();
+    #[test]
+    fn test_aes_cbc_decryption_returns_the_in_place_buffer_without_a_copy() {
+        let enc_key = [17u8; 32];
+        let plaintext = b"in-place plaintext of forty-one bytes....";
+        let encrypted = encrypt_type_0_for_test(&enc_key, plaintext);
+        let decrypted =
+            decrypt_aes_cbc_bytes(&encrypted.ciphertext, &encrypted.iv, &enc_key).unwrap();
+        assert_eq!(decrypted, plaintext);
+        assert_eq!(
+            decrypted.capacity(),
+            encrypted.ciphertext.len(),
+            "the plaintext is the truncated decryption buffer, not a second copy"
+        );
+        let mut damaged = encrypted.ciphertext.clone();
+        let last = damaged.len() - 1;
+        damaged[last] ^= 0xff;
+        assert!(decrypt_aes_cbc_bytes(&damaged, &encrypted.iv, &enc_key).is_err());
+    }
 
-    let hkdf_prk = Hkdf::<Sha256>::from_prk(&ikm_arr).unwrap();
-    let mut enc2 = [0u8; 32];
-    let mut mac2 = [0u8; 32];
-    hkdf_prk.expand(b"enc", &mut enc2).unwrap();
-    hkdf_prk.expand(b"mac", &mut mac2).unwrap();
+    #[test]
+    fn test_type_0_downgrade_rejected_when_key_has_mac_key() {
+        let raw_key = [29u8; 64];
+        let key = SymmetricCryptoKey::from_raw_bytes(&raw_key).unwrap();
+        let mut enc_key = [0u8; 32];
+        enc_key.copy_from_slice(&raw_key[..32]);
 
-    let node_enc_hex = "4f2f2b0e362ca4586b7a3e9914c5542aea3c70a1a79844839f87730cac1f709f";
-    let node_mac_hex = "f6cfc3122278c43ca1dbee7cd9a7c05e32c086127d5afd8f758d99230fa37d4d";
+        // A server strips the MAC and relabels the value as type 0 under the
+        // same (authenticated) key.
+        let downgraded = encrypt_type_0_for_test(&enc_key, b"attacker controlled");
+        assert_eq!(
+            downgraded.decrypt(&key).unwrap_err(),
+            CryptoError::MacRequired
+        );
 
-    let hex_enc1: String = enc1.iter().map(|b| format!("{:02x}", b)).collect();
-    let hex_mac1: String = mac1.iter().map(|b| format!("{:02x}", b)).collect();
+        let serialized = format!(
+            "0.{}|{}",
+            BASE64.encode(&downgraded.iv),
+            BASE64.encode(&downgraded.ciphertext)
+        );
+        let reparsed = EncString::parse(&serialized).unwrap();
+        assert_eq!(
+            reparsed.decrypt_string(&key).unwrap_err(),
+            CryptoError::MacRequired
+        );
+    }
 
-    assert_eq!(hex_enc1, node_enc_hex);
-    assert_eq!(hex_mac1, node_mac_hex);
-}
+    #[test]
+    fn test_type_0_rejected_when_encstring_carries_mac() {
+        let enc_key = [37u8; 32];
+        let mut with_mac = encrypt_type_0_for_test(&enc_key, b"legacy");
+        with_mac.mac = Some(vec![0u8; 32]);
+        let mac_less_key = SymmetricCryptoKey {
+            enc_key: LockedKey32::from_array(enc_key),
+            mac_key: None,
+        };
+        assert_eq!(
+            with_mac.decrypt(&mac_less_key).unwrap_err(),
+            CryptoError::MacRequired
+        );
+    }
 
-#[test]
-fn test_decrypt_attachment_blob() {
-    use cbc::cipher::BlockEncryptMut;
+    #[test]
+    fn test_type_2_requires_mac_and_mac_key() {
+        let key = SymmetricCryptoKey::from_raw_bytes(&[41u8; 64]).unwrap();
+        let mut parsed = EncString::parse(&key.encrypt_string("value").unwrap()).unwrap();
+        let mac_less_key = SymmetricCryptoKey {
+            enc_key: key.enc_key.clone(),
+            mac_key: None,
+        };
+        assert_eq!(
+            parsed.decrypt(&mac_less_key).unwrap_err(),
+            CryptoError::MacMismatch
+        );
+        parsed.mac = None;
+        assert_eq!(parsed.decrypt(&key).unwrap_err(), CryptoError::MacMismatch);
+    }
 
-    let raw_key = [42u8; 64];
-    let key = SymmetricCryptoKey::from_raw_bytes(&raw_key).unwrap();
+    #[test]
+    fn test_mac_less_32_byte_keys_are_rejected() {
+        assert_eq!(
+            SymmetricCryptoKey::from_raw_bytes(&[1u8; 32]).unwrap_err(),
+            CryptoError::InvalidKeyLength
+        );
+        assert!(parse_symmetric_key_from_decrypted_bytes(&[1u8; 32]).is_none());
+        let encoded_short_key = BASE64.encode([1u8; 32]);
+        assert!(parse_symmetric_key_from_decrypted_bytes(encoded_short_key.as_bytes()).is_none());
 
-    let iv = [9u8; 16];
-    let plaintext = b"JFIF JPEG Image Content Data";
+        let encoded_full_key = BASE64.encode([1u8; 64]);
+        let parsed = parse_symmetric_key_from_decrypted_bytes(encoded_full_key.as_bytes()).unwrap();
+        assert!(parsed.mac_key.is_some());
+        assert!(parse_symmetric_key_from_decrypted_bytes(&[1u8; 64]).is_some());
+    }
 
-    // Encrypt AES-256-CBC
-    let cipher = cbc::Encryptor::<aes::Aes256>::new(key.enc_key.as_array().into(), (&iv).into());
-    let mut buf = vec![0u8; plaintext.len() + 16];
-    buf[..plaintext.len()].copy_from_slice(plaintext);
-    let ciphertext = cipher
-        .encrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut buf, plaintext.len())
-        .unwrap()
-        .to_vec();
+    #[test]
+    fn test_decrypt_with_master_key_uses_hkdf_expand_stretch() {
+        let master_key = [43u8; 32];
+        let stretched = SymmetricCryptoKey::stretch_master_key(&master_key).unwrap();
+        let protected_user_key =
+            EncString::parse(&stretched.encrypt(&[44u8; 64]).unwrap()).unwrap();
 
-    // Test Standard Bitwarden EncArrayBuffer Format 1: [encType=2][IV][MAC][Ciphertext]
-    let mut hmac = HmacSha256::new_from_slice(key.mac_key.as_ref().unwrap()).unwrap();
-    hmac.update(&iv);
-    hmac.update(&ciphertext);
-    let mac = hmac.finalize().into_bytes();
+        let decrypted =
+            SymmetricCryptoKey::decrypt_with_master_key(&protected_user_key, &master_key).unwrap();
+        assert_eq!(decrypted, vec![44u8; 64]);
 
-    let mut bitwarden_blob = Vec::new();
-    bitwarden_blob.push(2u8);
-    bitwarden_blob.extend_from_slice(&iv);
-    bitwarden_blob.extend_from_slice(&mac);
-    bitwarden_blob.extend_from_slice(&ciphertext);
+        // A key derived with HKDF Extract+Expand (empty salt) is not accepted.
+        let extract_then_expand = Hkdf::<Sha256>::new(Some(&[]), &master_key);
+        let mut enc_key = [0u8; 32];
+        let mut mac_key = [0u8; 32];
+        extract_then_expand.expand(b"enc", &mut enc_key).unwrap();
+        extract_then_expand.expand(b"mac", &mut mac_key).unwrap();
+        let non_standard_key = SymmetricCryptoKey {
+            enc_key: LockedKey32::from_array(enc_key),
+            mac_key: Some(LockedKey32::from_array(mac_key)),
+        };
+        let non_standard =
+            EncString::parse(&non_standard_key.encrypt(&[44u8; 64]).unwrap()).unwrap();
+        assert_eq!(
+            SymmetricCryptoKey::decrypt_with_master_key(&non_standard, &master_key).unwrap_err(),
+            CryptoError::MacMismatch
+        );
+    }
 
-    let decrypted1 = decrypt_attachment_blob(&bitwarden_blob, &key).unwrap();
-    assert_eq!(decrypted1, plaintext);
+    // Known-answer vectors below are copied from Bitwarden's SDK
+    // (github.com/bitwarden/sdk-internal, crates/bitwarden-crypto/src/keys/
+    // utils.rs `test_stretch_kdf_key` and master_key.rs tests).
 
-    // Test authenticated Format 2 (headerless [16 bytes IV][32 bytes MAC][Ciphertext])
-    let mut headerless_blob = Vec::new();
-    headerless_blob.extend_from_slice(&iv);
-    headerless_blob.extend_from_slice(&mac);
-    headerless_blob.extend_from_slice(&ciphertext);
-    let decrypted2 = decrypt_attachment_blob(&headerless_blob, &key).unwrap();
-    assert_eq!(decrypted2, plaintext);
+    #[test]
+    fn test_stretch_master_key_matches_bitwarden_known_answer() {
+        let master_key = [
+            31, 79, 104, 226, 150, 71, 177, 90, 194, 80, 172, 209, 17, 129, 132, 81, 138, 167, 69,
+            167, 254, 149, 2, 27, 39, 197, 64, 42, 22, 195, 86, 75,
+        ];
+        let stretched = SymmetricCryptoKey::stretch_master_key(&master_key).unwrap();
+        assert_eq!(
+            stretched.enc_key.as_slice(),
+            [
+                111, 31, 178, 45, 238, 152, 37, 114, 143, 215, 124, 83, 135, 173, 195, 23, 142,
+                134, 120, 249, 61, 132, 163, 182, 113, 197, 189, 204, 188, 21, 237, 96
+            ]
+        );
+        assert_eq!(
+            stretched.mac_key.as_ref().unwrap().as_slice(),
+            [
+                221, 127, 206, 234, 101, 27, 202, 38, 86, 52, 34, 28, 78, 28, 185, 16, 48, 61, 127,
+                166, 209, 247, 194, 87, 232, 26, 48, 85, 193, 249, 179, 155
+            ]
+        );
+    }
 
-    // Test authenticated Format 3 (trailing MAC [16 bytes IV][Ciphertext][32 bytes MAC])
-    let mut trailing_mac_blob = Vec::new();
-    trailing_mac_blob.extend_from_slice(&iv);
-    trailing_mac_blob.extend_from_slice(&ciphertext);
-    trailing_mac_blob.extend_from_slice(&mac);
-    let decrypted3 = decrypt_attachment_blob(&trailing_mac_blob, &key).unwrap();
-    assert_eq!(decrypted3, plaintext);
+    #[test]
+    fn test_pbkdf2_master_password_hash_matches_bitwarden_known_answer() {
+        for salt in [
+            "test@bitwarden.com",
+            "TEST@bitwarden.com",
+            " test@bitwarden.com",
+        ] {
+            let master_key =
+                derive_master_key(salt, "asdfasdf", KdfType::Pbkdf2Sha256, 100_000, None, None)
+                    .unwrap();
+            assert_eq!(
+                derive_master_password_hash(&master_key, "asdfasdf"),
+                "wmyadRMyBZOH7P/a/ucTCbSghKgdzDpPqUnu/DAVtSw="
+            );
+        }
+    }
 
-    // Unauthenticated blob (raw [16 bytes IV][ciphertext] without MAC) MUST be rejected
-    let mut unauthenticated_blob = Vec::new();
-    unauthenticated_blob.extend_from_slice(&iv);
-    unauthenticated_blob.extend_from_slice(&ciphertext);
-    assert!(
-        decrypt_attachment_blob(&unauthenticated_blob, &key).is_err(),
-        "Unauthenticated attachment blob (no MAC) must be rejected"
-    );
+    #[test]
+    fn test_argon2id_master_password_hash_matches_bitwarden_known_answer() {
+        let master_key = derive_master_key(
+            "test_salt",
+            "asdfasdf",
+            KdfType::Argon2id,
+            4,
+            Some(32),
+            Some(2),
+        )
+        .unwrap();
+        assert_eq!(
+            derive_master_password_hash(&master_key, "asdfasdf"),
+            "PR6UjYmjmppTYcdyTiNbAhPJuQQOmynKbdEl1oyi/iQ="
+        );
+    }
 
-    // Legacy unauthenticated format [0x00][16 bytes IV][ciphertext] MUST be rejected
-    let mut legacy_unauthenticated_blob = Vec::new();
-    legacy_unauthenticated_blob.push(0u8);
-    legacy_unauthenticated_blob.extend_from_slice(&iv);
-    legacy_unauthenticated_blob.extend_from_slice(&ciphertext);
-    assert!(
-        decrypt_attachment_blob(&legacy_unauthenticated_blob, &key).is_err(),
-        "Unauthenticated attachment blob with encType 0 must be rejected"
-    );
+    #[test]
+    fn test_decrypt_legacy_type_0_user_key_matches_bitwarden_known_answer() {
+        let master_key = BASE64
+            .decode("hvBMMb1t79YssFZkpetYsM3deyVuQv4r88Uj9gvYe08=")
+            .unwrap();
+        let protected_user_key = EncString::parse("0.tn/heK4HLbbEe+yEkC+kvw==|8QM94f7aVTtjm/bmvRdVxOxiLiiZtHYYO7+oBdjFCkilncesx0iVrXPl+tMKqW+Jo7+FtZdPNsTrL6RdoG7i5QbCRVwK+9010+xm7MTQY8s=").unwrap();
 
-    // Truncated blob (incomplete download) MUST fail decryption rather than returning raw ciphertext
-    let truncated_blob = &bitwarden_blob[..bitwarden_blob.len() - 5];
-    assert!(
-        decrypt_attachment_blob(truncated_blob, &key).is_err(),
-        "Truncated attachment blob must return Err, not Ok"
-    );
+        let raw_user_key =
+            SymmetricCryptoKey::decrypt_with_master_key(&protected_user_key, &master_key).unwrap();
+        let user_key = SymmetricCryptoKey::from_raw_bytes(&raw_user_key).unwrap();
+        assert_eq!(
+            user_key.enc_key.as_slice(),
+            [
+                116, 170, 187, 43, 80, 212, 193, 202, 234, 181, 57, 66, 151, 249, 59, 47, 70, 16,
+                57, 4, 170, 78, 85, 241, 152, 232, 91, 57, 9, 87, 209, 245,
+            ]
+        );
+        assert_eq!(
+            user_key.mac_key.as_ref().unwrap().as_slice(),
+            [
+                40, 245, 106, 140, 2, 225, 138, 213, 98, 223, 92, 168, 135, 208, 22, 194, 31, 21,
+                178, 252, 203, 198, 35, 174, 53, 218, 254, 151, 235, 57, 7, 98,
+            ]
+        );
+    }
 
-    // Blob with corrupted HMAC (e.g. truncated block boundary) MUST fail decryption
-    let mut bad_mac_blob = bitwarden_blob.clone();
-    bad_mac_blob[20] ^= 0xFF;
-    assert!(
-        decrypt_attachment_blob(&bad_mac_blob, &key).is_err(),
-        "Corrupted MAC attachment blob must return Err, not Ok"
-    );
+    fn assert_kdf_rejected(parameters: KdfParameters) {
+        match parameters.validate() {
+            Err(CryptoError::KdfParametersRejected(message)) => {
+                assert!(message.contains("outside the accepted range"), "{message}")
+            }
+            other => panic!("expected rejection for {parameters:?}, got {other:?}"),
+        }
+    }
 
-    // Tampered ciphertext with original MAC MUST fail decryption
-    let mut tampered_ct_blob = bitwarden_blob.clone();
-    let last_idx = tampered_ct_blob.len() - 1;
-    tampered_ct_blob[last_idx] ^= 0x01;
-    assert!(
-        decrypt_attachment_blob(&tampered_ct_blob, &key).is_err(),
-        "Tampered ciphertext with mismatched MAC must fail decryption"
-    );
+    #[test]
+    fn test_out_of_range_kdf_parameters_are_rejected() {
+        for iterations in [0, 5_000, 99_999, 2_000_001, u32::MAX] {
+            assert_kdf_rejected(KdfParameters::Pbkdf2Sha256 { iterations });
+        }
+        let valid_argon2 = (3, 64, 4);
+        let invalid_argon2 = [
+            (1, 64, 4),
+            (11, 64, 4),
+            (3, 15, 4),
+            (3, 1025, 4),
+            (3, u32::MAX, 4),
+            (3, 64, 0),
+            (3, 64, 17),
+        ];
+        for (iterations, memory_mib, parallelism) in invalid_argon2 {
+            assert_kdf_rejected(KdfParameters::Argon2id {
+                iterations,
+                memory_mib,
+                parallelism,
+            });
+        }
+        let (iterations, memory_mib, parallelism) = valid_argon2;
+        assert!(KdfParameters::Argon2id {
+            iterations,
+            memory_mib,
+            parallelism
+        }
+        .validate()
+        .is_ok());
+    }
 
-    // Decryption with key missing mac_key MUST be rejected
-    let enc_only_key = SymmetricCryptoKey {
-        enc_key: key.enc_key.clone(),
-        mac_key: None,
-    };
-    assert!(
-        decrypt_attachment_blob(&bitwarden_blob, &enc_only_key).is_err(),
-        "Decryption with key missing mac_key must fail"
-    );
+    #[test]
+    fn test_kdf_parameter_bounds_are_inclusive() {
+        for iterations in [100_000, 2_000_000] {
+            assert!(KdfParameters::Pbkdf2Sha256 { iterations }
+                .validate()
+                .is_ok());
+        }
+        for (iterations, memory_mib, parallelism) in [(2, 16, 1), (10, 1024, 16)] {
+            assert!(KdfParameters::Argon2id {
+                iterations,
+                memory_mib,
+                parallelism
+            }
+            .validate()
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn test_derive_master_key_refuses_instead_of_substituting() {
+        let result = derive_master_key(
+            "user@example.com",
+            "password",
+            KdfType::Pbkdf2Sha256,
+            5_000,
+            None,
+            None,
+        );
+        assert!(matches!(result, Err(CryptoError::KdfParametersRejected(_))));
+
+        let result = derive_master_key(
+            "user@example.com",
+            "password",
+            KdfType::Argon2id,
+            3,
+            Some(4_194_304),
+            Some(4),
+        );
+        assert!(matches!(result, Err(CryptoError::KdfParametersRejected(_))));
+    }
+
+    #[test]
+    fn test_kdf_defaults_apply_only_to_omitted_values() {
+        assert_eq!(
+            KdfParameters::from_server_values(None, None, None, None).unwrap(),
+            KdfParameters::Pbkdf2Sha256 {
+                iterations: PBKDF2_DEFAULT_ITERATIONS
+            }
+        );
+        assert_eq!(
+            KdfParameters::from_server_values(Some(1), None, None, None).unwrap(),
+            KdfParameters::Argon2id {
+                iterations: 3,
+                memory_mib: 64,
+                parallelism: 4
+            }
+        );
+        assert_eq!(
+            KdfParameters::from_server_values(Some(1), Some(1), Some(8), Some(32)).unwrap(),
+            KdfParameters::Argon2id {
+                iterations: 1,
+                memory_mib: 8,
+                parallelism: 32
+            }
+        );
+        assert!(matches!(
+            KdfParameters::from_server_values(Some(7), None, None, None),
+            Err(CryptoError::KdfParametersRejected(_))
+        ));
+    }
 }

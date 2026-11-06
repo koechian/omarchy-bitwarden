@@ -1,5 +1,7 @@
 # ADR 0014: Self-Hosted Icon Service Endpoint Resolution and Privacy Isolation
 
+> **Removed in this fork.** koechian/omarchy-bitwarden no longer includes website icons fetched from an icon service. This record is kept for history only.
+
 ## Status
 Accepted
 

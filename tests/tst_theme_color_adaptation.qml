@@ -87,24 +87,6 @@ Item {
     active: false
   }
 
-  SshApprovalModal {
-    id: sshApprovalModal
-    width: 800; height: 600
-    active: false
-  }
-
-  SshKeyModal {
-    id: sshKeyModal
-    width: 800; height: 600
-    active: false
-  }
-
-  ReleaseNotesModal {
-    id: releaseModal
-    width: 800; height: 600
-    active: false
-  }
-
   ScopeDropdown {
     id: scopeDropdown
     title: "Scope"
@@ -199,9 +181,6 @@ Item {
     Assert.check(Qt.colorEqual(paletteModal.muted, Commons.Color.muted), tag + ": paletteModal.muted === Color.muted")
     Assert.check(Qt.colorEqual(genModal.muted, Commons.Color.muted), tag + ": genModal.muted === Color.muted")
     Assert.check(Qt.colorEqual(histModal.muted, Commons.Color.muted), tag + ": histModal.muted === Color.muted")
-    Assert.check(Qt.colorEqual(sshApprovalModal.muted, Commons.Color.muted), tag + ": sshApprovalModal.muted === Color.muted")
-    Assert.check(Qt.colorEqual(sshKeyModal.muted, Commons.Color.muted), tag + ": sshKeyModal.muted === Color.muted")
-    Assert.check(Qt.colorEqual(releaseModal.muted, Commons.Color.muted), tag + ": releaseModal.muted === Color.muted")
     Assert.check(Qt.colorEqual(scopeDropdown.muted, Commons.Color.muted), tag + ": scopeDropdown.muted === Color.muted")
     Assert.check(Qt.colorEqual(depView.muted, Commons.Color.muted), tag + ": depView.muted === Color.muted")
 
@@ -209,23 +188,15 @@ Item {
     Assert.check(Qt.colorEqual(paletteModal.cardBackground, Commons.Color.popups.background), tag + ": paletteModal cardBackground === Color.popups.background")
     Assert.check(Qt.colorEqual(genModal.cardBackground, Commons.Color.popups.background), tag + ": genModal cardBackground === Color.popups.background")
     Assert.check(Qt.colorEqual(histModal.cardBackground, Commons.Color.popups.background), tag + ": histModal cardBackground === Color.popups.background")
-    Assert.check(Qt.colorEqual(sshApprovalModal.cardBackground, Commons.Color.popups.background), tag + ": sshApprovalModal cardBackground === Color.popups.background")
-    Assert.check(Qt.colorEqual(sshKeyModal.cardBackground, Commons.Color.popups.background), tag + ": sshKeyModal cardBackground === Color.popups.background")
-    Assert.check(Qt.colorEqual(releaseModal.cardBackground, Commons.Color.popups.background), tag + ": releaseModal cardBackground === Color.popups.background")
 
     Assert.check(Qt.colorEqual(paletteModal.borderColor, Commons.Color.popups.border), tag + ": paletteModal borderColor === Color.popups.border")
     Assert.check(Qt.colorEqual(genModal.borderColor, Commons.Color.popups.border), tag + ": genModal borderColor === Color.popups.border")
     Assert.check(Qt.colorEqual(histModal.borderColor, Commons.Color.popups.border), tag + ": histModal borderColor === Color.popups.border")
-    Assert.check(Qt.colorEqual(sshApprovalModal.borderColor, Commons.Color.popups.border), tag + ": sshApprovalModal borderColor === Color.popups.border")
-    Assert.check(Qt.colorEqual(sshKeyModal.borderColor, Commons.Color.popups.border), tag + ": sshKeyModal borderColor === Color.popups.border")
-    Assert.check(Qt.colorEqual(releaseModal.borderColor, Commons.Color.popups.border), tag + ": releaseModal borderColor === Color.popups.border")
 
     // 3. TextOnAccent Polarity
     Assert.check(Qt.colorEqual(auth.textOnAccent, "#ffffff"), tag + ": auth.textOnAccent is #ffffff")
     Assert.check(Qt.colorEqual(sm.textOnAccent, "#ffffff"), tag + ": sm.textOnAccent is #ffffff")
     Assert.check(Qt.colorEqual(genModal.textOnAccent, "#ffffff"), tag + ": genModal.textOnAccent is #ffffff")
-    Assert.check(Qt.colorEqual(sshApprovalModal.textOnAccent, "#ffffff"), tag + ": sshApprovalModal.textOnAccent is #ffffff")
-    Assert.check(Qt.colorEqual(sshKeyModal.textOnAccent, "#ffffff"), tag + ": sshKeyModal.textOnAccent is #ffffff")
     Assert.check(Qt.colorEqual(depView.textOnAccent, "#ffffff"), tag + ": depView.textOnAccent is #ffffff")
 
     // 4. Captions & Secondary Text following Muted
@@ -278,8 +249,6 @@ Item {
             "settings textOnAccent flips to menu.background on light accent")
       Assert.check(Qt.colorEqual(genModal.textOnAccent, Commons.Color.menu.background),
             "genModal textOnAccent flips to menu.background on light accent")
-      Assert.check(Qt.colorEqual(sshApprovalModal.textOnAccent, Commons.Color.menu.background),
-            "sshApprovalModal textOnAccent flips to menu.background on light accent")
       Commons.Color.setPreset("light")
       Commons.Color.setPreset("dark")
       Assert.check(Qt.colorEqual(auth.textOnAccent, "#ffffff"),

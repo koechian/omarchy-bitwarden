@@ -31,7 +31,7 @@ Item {
     border.width: 1
 
     Behavior on opacity {
-      NumberAnimation { duration: 150 }
+      NumberAnimation { duration: Style.duration(150); easing.type: Easing.OutCubic }
     }
 
     RowLayout {
@@ -40,6 +40,7 @@ Item {
       spacing: 6
 
       Text {
+        textFormat: Text.PlainText
         text: isBusy ? "\uf021" : (errorMessage ? "\uf071" : "\uf129")
         font.family: toastRoot.fontFamily
         font.pixelSize: Style.font.bodySmall
@@ -47,6 +48,7 @@ Item {
       }
 
       Text {
+        textFormat: Text.PlainText
         id: messageText
         text: errorMessage || statusMessage || (isBusy ? "Processing..." : "")
         color: errorMessage ? StatusPalette.textOnTint(StatusPalette.danger, 0.95, toastRoot.cardBackground) : toastRoot.foreground
@@ -61,13 +63,28 @@ Item {
           anchors.fill: parent
           hoverEnabled: true
           acceptedButtons: Qt.NoButton
-          ToolTip.visible: containsMouse && messageText.truncated
-          ToolTip.delay: 300
-          ToolTip.text: messageText.text
+        }
+
+        // The full message for a truncated toast. The default ToolTip
+        // content item is AutoText, so this one renders plain text: toast
+        // messages carry engine and server text.
+        ToolTip {
+          id: messageToolTip
+          visible: messageHoverArea.containsMouse && messageText.truncated
+          delay: 300
+          text: messageText.text
+          contentItem: Text {
+            textFormat: Text.PlainText
+            text: messageToolTip.text
+            font: messageToolTip.font
+            color: messageToolTip.palette.toolTipText
+            wrapMode: Text.Wrap
+          }
         }
       }
 
       Text {
+        textFormat: Text.PlainText
         visible: !isBusy && Boolean(errorMessage || statusMessage)
         text: "\uf00d"
         font.family: toastRoot.fontFamily

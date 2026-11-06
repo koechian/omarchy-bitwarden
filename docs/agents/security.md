@@ -45,22 +45,22 @@ These rules were distilled from real-world vulnerabilities and architectural pit
 
 ### Rule 2: Fail-Closed Integrity, AUR Native Distribution & Minimum Safe Version Gate
 
-**Principle**: All engine installations, updates, and runtime executions MUST be cryptographically verified and meet minimum security baseline versions. Engine distribution is strictly routed via native Arch Linux / AUR packages (`omawarden-bin`, `omawarden-git`), and the frontend enforces a fail-closed minimum engine version gate (`>= 0.8.1`).
+**Principle**: All engine installations, updates, and runtime executions MUST be cryptographically verified and meet minimum security baseline versions. Engine distribution is strictly routed via native Arch Linux / AUR packages (`omawarden-bin`, `omawarden-git`), and the frontend enforces a fail-closed minimum engine version gate (`>= 0.12.0`).
 
 - ❌ **Anti-Pattern**:
-  - Running arbitrary unverified or outdated local engine binaries (< 0.8.1) vulnerable to memory exhaustion via unbounded HTTP/attachment responses.
+  - Running arbitrary unverified or outdated local engine binaries (< 0.12.0). Engines before 0.12.0 return unredacted vault items (ADR 0027), and engines before 0.12.0 are also vulnerable to memory exhaustion via unbounded HTTP responses.
   - Relying on mutable in-tree downloaders that bypass OS package managers and depend on static checksum files that drift across releases.
   - Allowing vault operations or password unlocking when the underlying engine version is below the security baseline.
 - ✅ **Required Pattern**:
   - **Native AUR Package Distribution**: The engine is distributed exclusively via official Arch Linux AUR packages (`omawarden-bin` / `omawarden-git`), leveraging `makepkg` / `pacman` SHA-256 integrity verification.
-  - **Enforce Minimum Safe Engine Version Gate (>= 0.8.1)**: Both `DependencyCheckView.qml` and `OmarchyBitwarden.qml` strictly enforce `minimumEngineVersion: "0.8.1"`. Any engine reporting a version `< 0.8.1` is rejected, marked as missing/outdated, and immediately blocks all vault operations (login, unlock, search, sync). Development and VCS builds (`-dev`, `.dev`, `omawarden-git`) remain permitted for developers.
+  - **Enforce Minimum Safe Engine Version Gate (>= 0.12.0)**: Both `DependencyCheckView.qml` and `OmarchyBitwarden.qml` strictly enforce `minimumEngineVersion: "0.12.0"`. Any engine reporting a version `< 0.12.0` is rejected, marked as missing/outdated, and immediately blocks all vault operations (login, unlock, search, sync). Development and VCS builds (`-dev`, `.dev`, `omawarden-git`) remain permitted for developers; the overlay additionally discards any vault listing that carries a secret value, so an unredacted development engine fails closed.
   - **Fail-Closed Resolution**: If `command -v omawarden` fails or the installed package is missing/outdated, the frontend fails closed to the dependency check view (`effectiveView === "dependency_check"`).
   - **Workflow Action Pinning**: All GitHub Actions workflows (`.github/workflows/`) MUST pin all third-party actions and Git dependencies (`cargo install --git ... --rev ...`) to a full 40-character commit SHA rather than mutable branch or tag names.
   - **Cryptographic Build Provenance Attestation**: Release pipelines automatically sign and attest build provenance using GitHub Artifact Attestations (`actions/attest-build-provenance` via Sigstore OIDC) when generating release artifacts.
 - 🧪 **Mandatory Verification**:
   Maintain automated integration tests covering:
-  1. Engine versions `< 0.8.1` (such as `0.8.0`, `0.7.0`) are strictly rejected and marked as missing/outdated.
-  2. Engine versions `>= 0.8.1` and development builds (`-dev`, `omawarden-git`) are accepted.
+  1. Engine versions `< 0.12.0` (such as `0.11.0`, `0.8.1`) are strictly rejected and marked as missing/outdated.
+  2. Engine versions `>= 0.12.0` and development builds (`-dev`, `omawarden-git`) are accepted.
   3. System PATH resolution correctly clears `helperPath` when `omawarden` is not found.
   4. Missing engine packages gate vault operations fail-closed.
   5. Workflows pin every third-party action and Git dependency to 40-character commit SHAs.
@@ -140,8 +140,9 @@ These rules were distilled from real-world vulnerabilities and architectural pit
   - Trusting any connection that reaches the socket file simply because the socket file mode is `0600` (e.g. in containerized, shared runtime, or misconfigured permission scenarios).
   - Clients blindly connecting to `/tmp/omawarden-{uid}.sock` or `XDG_RUNTIME_DIR` sockets without verifying that the socket and its parent directory are owned by current UID, free of symlinks, and that the listening server UID matches caller UID before transmitting plaintext credentials (such as master password on unlock).
 - ✅ **Required Pattern**:
-  - **Mutual Peer Verification**: Both server AND client perform peer credential verification. On connection accept, the server queries caller process credentials using `getsockopt(fd, SOL_SOCKET, SO_PEERCRED, ...)` on Linux and ensures `ucred.uid == libc::getuid()`. Similarly, the client verifies the server process credentials immediately upon `connect()` before transmitting any request payload.
-  - **Path & Directory Hardening**: Socket paths and parent runtime directories are validated with `symlink_metadata()` to reject symlinks and foreign ownership. Fallback runtime directories in `/tmp` must be created atomically as dedicated `0700` directories (`/tmp/omawarden-runtime-{uid}/`).
+  - **Mutual Peer Verification**: Both server AND client perform peer credential verification. On connection accept, the server queries caller process credentials using `getsockopt(fd, SOL_SOCKET, SO_PEERCRED, ...)` on Linux and ensures `ucred.uid == libc::getuid()`. Similarly, the client verifies the server process credentials immediately upon `connect()` before transmitting any request payload. Both directions also compare the peer's `/proc/<pid>/exe` with their own executable and refuse a visible foreign executable (ADR 0027, `peer_identity.rs`).
+  - **Path & Directory Hardening**: Socket paths and parent runtime directories are validated with `symlink_metadata()` to reject symlinks and foreign ownership. The runtime directory is `XDG_RUNTIME_DIR` only, and it must be a real directory owned by the user with mode `0700`; there is no `/tmp` fallback (ADR 0027).
+  - **Request Bounds**: One request line per connection, at most 64 KiB, read within 5 seconds; at most 16 connections in service at once (`daemon_requests.rs`).
   - **Cryptographic Memory Hygiene**: Master keys, derived cryptographic keys, and master passwords in memory MUST implement `zeroize::Zeroize` and be scrubbed on lock.
   - **Threat Boundary Clarity**: Document clearly that processes running as the *same OS user* share access under the same UID; defense against same-user memory scraping requires OS sandboxing.
 - 🧪 **Mandatory Verification**:
@@ -169,15 +170,12 @@ These rules were distilled from real-world vulnerabilities and architectural pit
 
 ### Rule 8: Mandatory Authenticated Encryption & Zero Unauthenticated Ciphertext Fallback
 
-**Principle**: All symmetric cryptographic operations (vault items, fields, attachments) MUST follow strict Authenticated Encryption (Encrypt-then-MAC via HMAC-SHA256). Silent fallback to unauthenticated ciphertexts or bypass on HMAC mismatch is strictly forbidden.
+**Principle**: All symmetric cryptographic operations (vault items, fields) MUST follow strict Authenticated Encryption (Encrypt-then-MAC via HMAC-SHA256). Silent fallback to unauthenticated ciphertexts or bypass on HMAC mismatch is strictly forbidden.
 
 - ❌ **Anti-Pattern**:
   - Silently falling back to bare AES-CBC decryption without MAC when HMAC fails or when MAC is absent.
-  - Allowing unauthenticated attachment blob decryption (e.g. raw IV+ciphertext or encType 0) where a malicious or compromised server could alter ciphertext bytes undetected.
   - Swallowing `MacMismatch` errors or returning partial unverified plaintexts.
 - ✅ **Required Pattern**:
-  - `decrypt_attachment_blob` MUST require `key.mac_key` and enforce HMAC-SHA256 validation over `IV + Ciphertext` before any decryption.
-  - Any attachment payload failing HMAC validation or omitting cryptographic authentication MUST immediately return `Err(CryptoError)`.
   - Constant-time comparison (`subtle::ConstantTimeEq`) is mandatory for all MAC verifications.
 - 🧪 **Mandatory Verification**:
   Unit tests must assert that:
@@ -198,12 +196,15 @@ These rules were distilled from real-world vulnerabilities and architectural pit
   - Allowing indefinite vault unlock without an absolute maximum session lifetime limit.
 - ✅ **Required Pattern**:
   - **Mutual Peer Verification**: Both server and client perform kernel-level `SO_PEERCRED` UID checks on `/run/user/<uid>/omawarden.sock` (mode `0600`).
-  - **No Keep-Alive Leakage**: Background polling (`ping`, `status` without explicit `touch: true`) MUST NOT touch daemon activity; only genuine user actions (`search`, `list`, `sync`, `copy`, `totp`) refresh the idle timer.
+  - **No Keep-Alive Leakage**: Background polling (`ping`, `status`), loading (`list`) and background work (`sync`) MUST NOT touch daemon activity; only browsing the unlocked vault (`search`, `get_item`) and a successful unlock refresh the idle timer. Secret releases (`reveal_field`, `copy_field`) and actions that also work while locked (`copy`, `generate_password`, `totp`) do not, so neither paced extraction nor periodic calls can keep the vault unlocked. Clients cannot override this: there is no `touch` request field (ADR 0027).
+  - **Bounded Idle Lock**: `set_auto_lock` accepts 60 seconds to 12 hours; zero (never) is refused.
+  - **Redacted Reads, Budgeted Releases**: `list`, `search` and `get_item` return redacted items; a secret leaves the daemon only through `reveal_field` / `copy_field`, at most 30 per 60 seconds and 120 per hour (password history counts one per entry) before the vault hard-locks (ADR 0027).
+  - **Trusted Clipboard Program, Own Offers Only**: `wl-copy` is resolved only from root-owned, non-writable `/usr/bin` or `/usr/local/bin`, never `PATH`. A lock withdraws only the clipboard offers the daemon still serves and never runs `wl-copy --clear`, so another application's later copy survives (ADR 0027).
   - **Absolute Maximum Lifetime Watchdog**: Enforce a hard ceiling (`max_session_lifetime`, default 12 hours) from `unlocked_at`. The daemon locks the vault when this limit elapses, regardless of continuous user activity.
   - **Zero-Environ & Zero-Argv Compliance**: No session tokens, credentials, or 2FA codes are ever exported to `std::env` or passed via CLI flags.
 - 🧪 **Mandatory Verification**:
   Unit tests must assert that:
-  1. Privileged actions (`list`, `search`, `get_item`, `get_ssh_key`, `get_attachment_key`, `sync`, `totp`) fail when the vault is locked.
+  1. Privileged actions (`list`, `search`, `get_item`, `sync`, `reveal_field`, `copy_field`) fail when the vault is locked.
   2. Background `ping` and `status` requests do not touch activity.
   3. `check_auto_lock()` triggers when `max_session_lifetime` is exceeded even if `last_activity` is recent.
 

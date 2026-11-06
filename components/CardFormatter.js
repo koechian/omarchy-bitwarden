@@ -122,3 +122,14 @@ function formatMaskedCardNumber(num, brand) {
   }
   return parts.join(" ")
 }
+
+/**
+ * Masked card number for a redacted item, which carries only the last four
+ * digits (`number_last_four`, null when the number is shorter than 12
+ * digits). e.g. "•••• •••• •••• 4444", or "•••• •••• •••• ••••" without them.
+ */
+function formatMaskedLastFour(lastFour) {
+  var digits = cleanCardNumber(lastFour)
+  var suffix = digits.length === 4 ? digits : "••••"
+  return "•••• •••• •••• " + suffix
+}

@@ -3,7 +3,7 @@ import QtQuick
 
 // Stand-in for Omarchy's qs.Commons Style, whose real module needs the
 // Quickshell runtime. Lets component tests run under plain `qml6`:
-//   qml6 -I tests/stubs tests/tst_ssh_approval_modal.qml
+//   qml6 -I tests/stubs tests/tst_toast_alert.qml
 QtObject {
   id: root
   property int fontBaseSize: 12
@@ -25,4 +25,9 @@ QtObject {
     readonly property int iconLarge: root.fontPx(1.5)
   }
   readonly property int cornerRadius: 8
+  property bool reduceMotion: false
+  readonly property var easeOut: [0.23, 1.0, 0.32, 1.0, 1.0, 1.0]
+  function duration(ms) {
+    return reduceMotion ? 0 : ms
+  }
 }

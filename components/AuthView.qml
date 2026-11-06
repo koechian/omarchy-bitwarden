@@ -23,7 +23,6 @@ Item {
   property int resendCooldown: 0
   property int emailSentCount: 0
   property bool isSendingEmail: false
-  property bool isInstalling: false
   // ADR-0025: true when the engine reports quick unlock is enabled and a
   // soft-locked key is retained; shows the system-authentication button.
   property bool quickUnlockAvailable: false
@@ -69,7 +68,6 @@ Item {
   signal sendTwoFactorEmailRequested(string email, string password)
   signal checkFido2StatusRequested()
   signal copyRequested(string text, string label)
-  signal installPackageRequested(string pkgName)
 
   property alias unlockInput: unlockPasswordField
   property alias twoFactorInput: login2FAInput
@@ -221,14 +219,16 @@ Item {
             Layout.alignment: Qt.AlignHCenter
             spacing: 4
             Text {
+              textFormat: Text.PlainText
               Layout.alignment: Qt.AlignHCenter
               text: "\uf023"
               font.family: authRoot.fontFamily
               font.pixelSize: Style.font.displayLarge
               color: authRoot.accent
             }
-            Text { Layout.alignment: Qt.AlignHCenter; text: "Vault is Locked"; color: authRoot.foreground; font.pixelSize: Style.font.title; font.weight: Font.DemiBold }
+            Text { textFormat: Text.PlainText; Layout.alignment: Qt.AlignHCenter; text: "Vault is Locked"; color: authRoot.foreground; font.pixelSize: Style.font.title; font.weight: Font.DemiBold }
             Text {
+              textFormat: Text.PlainText
               Layout.alignment: Qt.AlignHCenter
               text: "Logged in as " + (authRoot.authState.user_email || "user")
               color: authRoot.muted
@@ -241,7 +241,7 @@ Item {
             Layout.fillWidth: true
             spacing: 4
 
-            Text { text: "Master Password:"; color: authRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
+            Text { textFormat: Text.PlainText; text: "Master Password:"; color: authRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
 
             Rectangle {
               Layout.fillWidth: true
@@ -276,6 +276,7 @@ Item {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   anchors.left: parent.left
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
@@ -316,6 +317,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               anchors.centerIn: parent
               text: "Unlock with System Authentication"
               color: authRoot.foreground
@@ -339,6 +341,7 @@ Item {
             color: authRoot.accent
 
             Text {
+              textFormat: Text.PlainText
               anchors.centerIn: parent
               text: authRoot.isBusy ? "Unlocking..." : "Unlock Vault"
               color: authRoot.textOnAccent
@@ -365,6 +368,7 @@ Item {
 
             // Logout Link
             Text {
+              textFormat: Text.PlainText
               text: "Log out from account"
               color: authRoot.muted
               font.pixelSize: Style.font.bodySmall
@@ -389,17 +393,19 @@ Item {
             Layout.alignment: Qt.AlignHCenter
             spacing: 4
             Text {
+              textFormat: Text.PlainText
               Layout.alignment: Qt.AlignHCenter
               text: "\uf132"
               font.family: authRoot.fontFamily
               font.pixelSize: Style.font.displayLarge
               color: authRoot.accent
             }
-            Text { Layout.alignment: Qt.AlignHCenter; text: "Log In to Bitwarden"; color: authRoot.foreground; font.pixelSize: Style.font.title; font.weight: Font.DemiBold }
+            Text { textFormat: Text.PlainText; Layout.alignment: Qt.AlignHCenter; text: "Log In to Bitwarden"; color: authRoot.foreground; font.pixelSize: Style.font.title; font.weight: Font.DemiBold }
             RowLayout {
               Layout.alignment: Qt.AlignHCenter
               spacing: 6
               Text {
+                textFormat: Text.PlainText
                 text: (authRoot.config && authRoot.config.server_url) ? authRoot.config.server_url : "https://vault.bitwarden.com"
                 color: authRoot.muted
                 font.pixelSize: Style.font.caption
@@ -417,6 +423,7 @@ Item {
                   anchors.centerIn: parent
                   spacing: 4
                   Text {
+                    textFormat: Text.PlainText
                     text: authRoot.showServerConfig ? "\uf00d Close" : "\uf013 Server"
                     font.family: authRoot.fontFamily
                     color: authRoot.accent
@@ -466,6 +473,7 @@ Item {
               spacing: 8
 
               Text {
+                textFormat: Text.PlainText
                 text: "SERVER & mTLS CLIENT CERTIFICATE"
                 color: authRoot.accent
                 font.pixelSize: Style.font.bodySmall
@@ -476,7 +484,7 @@ Item {
               ColumnLayout {
                 Layout.fillWidth: true
                 spacing: 3
-                Text { text: "Server URL:"; color: authRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
+                Text { textFormat: Text.PlainText; text: "Server URL:"; color: authRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
                 Rectangle {
                   Layout.fillWidth: true; height: 32; radius: 5; color: Qt.rgba(authRoot.foreground.r, authRoot.foreground.g, authRoot.foreground.b, 0.08); border.color: authServerUrlInput.activeFocus ? authRoot.accent : authRoot.borderColor; border.width: 1
                   TextInput {
@@ -494,6 +502,7 @@ Item {
 
               // Info text if official server is selected
               Text {
+                textFormat: Text.PlainText
                 visible: authRoot.isOfficialServer
                 Layout.fillWidth: true
                 text: "Official Bitwarden cloud uses standard HTTPS and does not require client certificates."
@@ -511,6 +520,7 @@ Item {
                   color: authRoot.enableMtlsChecked ? authRoot.accent : Qt.rgba(authRoot.foreground.r, authRoot.foreground.g, authRoot.foreground.b, 0.10)
                   border.color: authRoot.borderColor; border.width: 1
                   Text {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     visible: authRoot.enableMtlsChecked
                     text: "\uf00c"
@@ -525,6 +535,7 @@ Item {
                   }
                 }
                 Text {
+                  textFormat: Text.PlainText
                   text: "Use mTLS Client Certificate (for edge gateways)"
                   color: authRoot.foreground
                   font.pixelSize: Style.font.bodySmall
@@ -547,7 +558,7 @@ Item {
                 ColumnLayout {
                   Layout.fillWidth: true
                   spacing: 3
-                  Text { text: "Client Certificate Path (.pem / .crt):"; color: authRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
+                  Text { textFormat: Text.PlainText; text: "Client Certificate Path (.pem / .crt):"; color: authRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
                   Rectangle {
                     Layout.fillWidth: true; height: 32; radius: 5; color: Qt.rgba(authRoot.foreground.r, authRoot.foreground.g, authRoot.foreground.b, 0.08); border.color: authClientCertInput.activeFocus ? authRoot.accent : authRoot.borderColor; border.width: 1
                     TextInput {
@@ -561,6 +572,7 @@ Item {
                       text: authRoot.certMatchesServer ? ((authRoot.config && authRoot.config.client_cert_path) || "") : ""
                     }
                     Text {
+                      textFormat: Text.PlainText
                       anchors.left: parent.left; anchors.right: authCertBrowseBtn.left; anchors.leftMargin: 10; anchors.rightMargin: 6; anchors.verticalCenter: parent.verticalCenter
                       text: "e.g. /home/user/.certs/client.crt"
                       color: authRoot.muted
@@ -585,7 +597,7 @@ Item {
                 ColumnLayout {
                   Layout.fillWidth: true
                   spacing: 3
-                  Text { text: "Client Private Key Path (optional if merged):"; color: authRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
+                  Text { textFormat: Text.PlainText; text: "Client Private Key Path (optional if merged):"; color: authRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
                   Rectangle {
                     Layout.fillWidth: true; height: 32; radius: 5; color: Qt.rgba(authRoot.foreground.r, authRoot.foreground.g, authRoot.foreground.b, 0.08); border.color: authClientKeyInput.activeFocus ? authRoot.accent : authRoot.borderColor; border.width: 1
                     TextInput {
@@ -599,6 +611,7 @@ Item {
                       text: authRoot.certMatchesServer ? ((authRoot.config && authRoot.config.client_key_path) || "") : ""
                     }
                     Text {
+                      textFormat: Text.PlainText
                       anchors.left: parent.left; anchors.right: authKeyBrowseBtn.left; anchors.leftMargin: 10; anchors.rightMargin: 6; anchors.verticalCenter: parent.verticalCenter
                       text: "e.g. /home/user/.certs/client.key (0600 mode)"
                       color: authRoot.muted
@@ -640,6 +653,7 @@ Item {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   Layout.fillWidth: true
                   text: "Private key files must be restricted to 0600 or 0400 file permissions."
                   color: authRoot.muted
@@ -659,6 +673,7 @@ Item {
                   radius: 4
                   color: authRoot.accent
                   Text {
+                    textFormat: Text.PlainText
                     id: saveServerTxt
                     anchors.centerIn: parent
                     text: "Save & Apply"
@@ -691,6 +706,7 @@ Item {
                   border.color: authRoot.borderColor
                   border.width: 1
                   Text {
+                    textFormat: Text.PlainText
                     id: resetServerTxt
                     anchors.centerIn: parent
                     text: "Reset to Official"
@@ -731,7 +747,7 @@ Item {
               border.color: (authRoot.loginMethod === "password") ? authRoot.accent : authRoot.borderColor
               border.width: 1
 
-              Text { id: pwdTabTxt; anchors.centerIn: parent; text: "Master Password"; color: (authRoot.loginMethod === "password") ? authRoot.accent : authRoot.foreground; font.pixelSize: Style.font.bodySmall }
+              Text { textFormat: Text.PlainText; id: pwdTabTxt; anchors.centerIn: parent; text: "Master Password"; color: (authRoot.loginMethod === "password") ? authRoot.accent : authRoot.foreground; font.pixelSize: Style.font.bodySmall }
               MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: authRoot.loginMethod = "password" }
             }
 
@@ -743,7 +759,7 @@ Item {
               border.color: (authRoot.loginMethod === "apikey") ? authRoot.accent : authRoot.borderColor
               border.width: 1
 
-              Text { id: apiTabTxt; anchors.centerIn: parent; text: "API Key"; color: (authRoot.loginMethod === "apikey") ? authRoot.accent : authRoot.foreground; font.pixelSize: Style.font.bodySmall }
+              Text { textFormat: Text.PlainText; id: apiTabTxt; anchors.centerIn: parent; text: "API Key"; color: (authRoot.loginMethod === "apikey") ? authRoot.accent : authRoot.foreground; font.pixelSize: Style.font.bodySmall }
               MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: authRoot.loginMethod = "apikey" }
             }
           }
@@ -757,7 +773,7 @@ Item {
             ColumnLayout {
               Layout.fillWidth: true
               spacing: 3
-              Text { text: "Email:"; color: authRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
+              Text { textFormat: Text.PlainText; text: "Email:"; color: authRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
               Rectangle {
                 Layout.fillWidth: true; height: 32; radius: 5; color: Qt.rgba(authRoot.foreground.r, authRoot.foreground.g, authRoot.foreground.b, 0.08); border.color: loginEmailInput.activeFocus ? authRoot.accent : authRoot.borderColor; border.width: 1
                 TextInput {
@@ -779,7 +795,7 @@ Item {
             ColumnLayout {
               Layout.fillWidth: true
               spacing: 3
-              Text { text: "Master Password:"; color: authRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
+              Text { textFormat: Text.PlainText; text: "Master Password:"; color: authRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
               Rectangle {
                 Layout.fillWidth: true; height: 32; radius: 5; color: Qt.rgba(authRoot.foreground.r, authRoot.foreground.g, authRoot.foreground.b, 0.08); border.color: loginPwdInput.activeFocus ? authRoot.accent : authRoot.borderColor; border.width: 1
                 TextInput {
@@ -836,6 +852,7 @@ Item {
                     border.width: 1
 
                     Text {
+                      textFormat: Text.PlainText
                       anchors.centerIn: parent
                       text: modelData === 7
                         ? "Security Key"
@@ -882,6 +899,7 @@ Item {
                   spacing: 10
 
                   Text {
+                    textFormat: Text.PlainText
                     text: authRoot.fido2Status === "available"
                       ? "\uf084"
                       : (authRoot.fido2Status === "tool_not_found" ? "\uf071" : "\uf287")
@@ -900,6 +918,7 @@ Item {
                       spacing: 6
 
                       Text {
+                        textFormat: Text.PlainText
                         text: authRoot.fido2Status === "tool_not_found"
                           ? "libfido2 not installed"
                           : (authRoot.fido2Status === "no_device"
@@ -922,6 +941,7 @@ Item {
                         border.width: 1
 
                         Text {
+                          textFormat: Text.PlainText
                           id: checkAgainBtnText
                           anchors.centerIn: parent
                           text: checkAgainTimer.running ? "Checking..." : "Check Again"
@@ -944,6 +964,7 @@ Item {
                     }
 
                     Text {
+                      textFormat: Text.PlainText
                       text: authRoot.fido2Status === "tool_not_found"
                         ? "Install 'libfido2' package to use security keys, or select another method:"
                         : (authRoot.isBusy
@@ -974,37 +995,13 @@ Item {
                         spacing: 6
 
                         Text {
+                          textFormat: Text.PlainText
                           text: "sudo pacman -S libfido2"
                           color: authRoot.foreground
                           font.family: "monospace"
                           font.pixelSize: Style.font.caption
                           Layout.fillWidth: true
                           elide: Text.ElideRight
-                        }
-
-                        // One-Click Install Button
-                        Rectangle {
-                          implicitWidth: authRoot.isInstalling ? 68 : 46
-                          implicitHeight: 18
-                          radius: 2
-                          color: authRoot.isInstalling ? Qt.rgba(authRoot.foreground.r, authRoot.foreground.g, authRoot.foreground.b, 0.15) : (installMouse.containsMouse ? Qt.lighter(authRoot.accent, 1.1) : authRoot.accent)
-
-                          Text {
-                            anchors.centerIn: parent
-                            text: authRoot.isInstalling ? "Installing..." : "Install"
-                            color: authRoot.isInstalling ? authRoot.muted : authRoot.textOnAccent
-                            font.pixelSize: Style.fontPx(0.75)
-                            font.weight: Font.Medium
-                          }
-
-                          MouseArea {
-                            id: installMouse
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: authRoot.isInstalling ? Qt.ArrowCursor : Qt.PointingHandCursor
-                            enabled: !authRoot.isInstalling
-                            onClicked: authRoot.installPackageRequested("libfido2")
-                          }
                         }
 
                         // Copy Command Button
@@ -1015,6 +1012,7 @@ Item {
                           color: copyTimer.running ? StatusPalette.success : Qt.rgba(authRoot.foreground.r, authRoot.foreground.g, authRoot.foreground.b, 0.15)
 
                           Text {
+                            textFormat: Text.PlainText
                             anchors.centerIn: parent
                             text: copyTimer.running ? "Copied" : "Copy"
                             color: copyTimer.running ? StatusPalette.textOnTint(StatusPalette.success, 1, Commons.Color.popups.background) : authRoot.foreground
@@ -1050,6 +1048,7 @@ Item {
                 spacing: 3
 
                 Text {
+                  textFormat: Text.PlainText
                   text: authRoot.isNewDeviceVerification
                     ? "New Device Email Verification Code:"
                     : (authRoot.twoFactorProvider === 1
@@ -1102,6 +1101,7 @@ Item {
                     opacity: (resendCooldownTimer.running || authRoot.isBusy || authRoot.isSendingEmail) ? 0.7 : 1.0
 
                     Text {
+                      textFormat: Text.PlainText
                       id: resendBtnText
                       anchors.centerIn: parent
                       text: authRoot.isSendingEmail
@@ -1138,6 +1138,7 @@ Item {
               Rectangle {
                 width: 14; height: 14; radius: 3; color: authRoot.rememberEmailChecked ? authRoot.accent : Qt.rgba(authRoot.foreground.r, authRoot.foreground.g, authRoot.foreground.b, 0.10); border.color: authRoot.borderColor; border.width: 1
                 Text {
+                  textFormat: Text.PlainText
                   anchors.centerIn: parent
                   visible: authRoot.rememberEmailChecked
                   text: "\uf00c"
@@ -1147,7 +1148,7 @@ Item {
                 }
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: authRoot.rememberEmailChecked = !authRoot.rememberEmailChecked }
               }
-              Text { text: "Remember Email"; color: authRoot.foreground; font.pixelSize: Style.font.bodySmall }
+              Text { textFormat: Text.PlainText; text: "Remember Email"; color: authRoot.foreground; font.pixelSize: Style.font.bodySmall }
             }
 
             // Submit Button
@@ -1163,14 +1164,15 @@ Item {
                 && authRoot.twoFactorProvider === 7
                 && authRoot.fido2Status === "no_device"
               readonly property bool isSubmitEnabled: !authRoot.isBusy
-                && !authRoot.isInstalling
                 && !isFido2NoDevice
+                && !isToolNotFound
 
               color: isSubmitEnabled
                 ? (submitMouseArea.containsMouse ? Qt.lighter(authRoot.accent, 1.1) : authRoot.accent)
                 : Qt.rgba(authRoot.foreground.r, authRoot.foreground.g, authRoot.foreground.b, 0.08)
 
               Text {
+                textFormat: Text.PlainText
                 anchors.centerIn: parent
                 text: {
                   if (authRoot.isBusy) {
@@ -1178,7 +1180,7 @@ Item {
                   }
                   if (authRoot.show2FAField && authRoot.twoFactorProvider === 7) {
                     if (authRoot.fido2Status === "tool_not_found") {
-                      return authRoot.isInstalling ? "Installing libfido2 in Terminal..." : "⚡ Install libfido2"
+                      return "Install libfido2 to Continue"
                     }
                     if (authRoot.fido2Status === "no_device") {
                       return "Insert Security Key to Verify"
@@ -1199,10 +1201,6 @@ Item {
                 cursorShape: submitButton.isSubmitEnabled ? Qt.PointingHandCursor : Qt.ArrowCursor
                 enabled: submitButton.isSubmitEnabled
                 onClicked: {
-                  if (submitButton.isToolNotFound) {
-                    authRoot.installPackageRequested("libfido2")
-                    return
-                  }
                   authRoot.loginPasswordRequested(
                     loginEmailInput.text.trim(),
                     loginPwdInput.text,
@@ -1223,7 +1221,7 @@ Item {
             ColumnLayout {
               Layout.fillWidth: true
               spacing: 3
-              Text { text: "API Client ID (`user.xxxxxxxx`):"; color: authRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
+              Text { textFormat: Text.PlainText; text: "API Client ID (`user.xxxxxxxx`):"; color: authRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
               Rectangle {
                 Layout.fillWidth: true; height: 32; radius: 5; color: Qt.rgba(authRoot.foreground.r, authRoot.foreground.g, authRoot.foreground.b, 0.08); border.color: apiClientIdInput.activeFocus ? authRoot.accent : authRoot.borderColor; border.width: 1
                 TextInput {
@@ -1244,7 +1242,7 @@ Item {
             ColumnLayout {
               Layout.fillWidth: true
               spacing: 3
-              Text { text: "API Client Secret:"; color: authRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
+              Text { textFormat: Text.PlainText; text: "API Client Secret:"; color: authRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
               Rectangle {
                 Layout.fillWidth: true; height: 32; radius: 5; color: Qt.rgba(authRoot.foreground.r, authRoot.foreground.g, authRoot.foreground.b, 0.08); border.color: apiClientSecInput.activeFocus ? authRoot.accent : authRoot.borderColor; border.width: 1
                 TextInput {
@@ -1265,7 +1263,7 @@ Item {
             // Submit Button
             Rectangle {
               Layout.fillWidth: true; height: 32; radius: 5; color: authRoot.accent
-              Text { anchors.centerIn: parent; text: authRoot.isBusy ? "Logging in..." : "Log In with API Key"; color: authRoot.textOnAccent; font.pixelSize: Style.font.body; font.weight: Font.Medium }
+              Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: authRoot.isBusy ? "Logging in..." : "Log In with API Key"; color: authRoot.textOnAccent; font.pixelSize: Style.font.body; font.weight: Font.Medium }
               MouseArea {
                 anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                 onClicked: {

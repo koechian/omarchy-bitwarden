@@ -10,7 +10,6 @@ Item {
   property var dependencyModel: defaultModel
   property var missingPackages: []
   property bool isChecking: false
-  property bool isInstalling: false
 
   property color foreground: Commons.Color.foreground
   property color accent: Commons.Color.accent
@@ -22,7 +21,8 @@ Item {
 
   readonly property color textOnAccent: StatusPalette.textOn(accent)
 
-  readonly property string minimumEngineVersion: "0.8.1"
+  // The first engine that redacts items and releases secrets per field (ADR 0027).
+  readonly property string minimumEngineVersion: "0.12.0"
 
   function parseSemVer(v) {
     if (!v || typeof v !== "string") return null
@@ -62,7 +62,6 @@ Item {
   }
 
   signal recheckRequested()
-  signal installRequested()
 
   ListModel {
     id: defaultModel
@@ -188,6 +187,59 @@ Item {
     return depViewRoot.missingPackages.slice()
   }
 
+  function engineRowIndex() {
+    for (var i = 0; i < dependencyModel.count; i++) {
+      if (dependencyModel.get(i).pkgName === "omawarden") return i
+    }
+    return -1
+  }
+
+  // True when pacman did not report a satisfying engine package, so the
+  // overlay should look for a locally built engine on PATH.
+  function engineNeedsLocalProbe() {
+    var index = engineRowIndex()
+    return index >= 0 && dependencyModel.get(index).status !== "installed"
+  }
+
+  // Extracts the version from `omawarden --version` output
+  // ("omawarden 0.12.0 (c84c59d 2026-11-06)"); empty when unrecognised.
+  function parseEngineVersionOutput(output) {
+    var match = String(output || "").trim().match(/^omawarden\s+(\d+\.\d+\.\d+\S*)/)
+    return match ? match[1] : ""
+  }
+
+  // Records a locally built engine found on PATH. This fork's engine is not
+  // packaged, so a satisfying local build counts as installed.
+  function applyLocalEngineProbe(output) {
+    var version = parseEngineVersionOutput(output)
+    var index = engineRowIndex()
+    if (!version || index < 0) return
+    var satisfied = isEngineVersionSatisfied(version)
+    dependencyModel.setProperty(index, "status", satisfied ? "installed" : "missing")
+    dependencyModel.setProperty(index, "version", version)
+    dependencyModel.setProperty(index, "installedPackage", localEnginePackageLabel)
+    dependencyModel.setProperty(index, "isLocalFallback", true)
+  }
+
+  readonly property string localEnginePackageLabel: "local build"
+  readonly property bool engineMissing: missingPackages.indexOf("omawarden") !== -1
+  readonly property string engineBuildInstructions: "Build omawarden " + minimumEngineVersion
+    + " or later from this plugin's repository and install it to ~/.local/bin (see the README), then press Recheck."
+
+  // The command the user runs to install the missing system packages. The
+  // overlay only displays it; it never launches an installer itself. The
+  // engine is built from source in this fork, so it is never part of it.
+  readonly property var missingSystemPackages: missingPackages.filter(function (name) { return name !== "omawarden" })
+  readonly property string installCommand: missingSystemPackages.length > 0
+    ? "paru -S --needed " + missingSystemPackages.join(" ")
+    : ""
+
+  function copyInstallCommand() {
+    installCommandField.selectAll()
+    installCommandField.copy()
+    installCommandField.deselect()
+  }
+
   Flickable {
     id: flickable
     anchors.fill: parent
@@ -211,6 +263,7 @@ Item {
           spacing: 10
 
           Text {
+            textFormat: Text.PlainText
             text: "\uf0ad"
             font.family: depViewRoot.fontFamily
             font.pixelSize: Style.fontPx(1.833)
@@ -218,6 +271,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             text: "System Dependencies Required"
             color: depViewRoot.foreground
             font.pixelSize: Style.font.heading
@@ -233,6 +287,7 @@ Item {
             border.width: 1
 
             Text {
+              textFormat: Text.PlainText
               id: setupBadge
               anchors.centerIn: parent
               text: "Prerequisite Setup"
@@ -244,6 +299,7 @@ Item {
         }
 
         Text {
+          textFormat: Text.PlainText
           text: "Omarchy Bitwarden requires native Arch / AUR packages to provide background encryption, system keyring session caching, and Wayland clipboard management."
           color: depViewRoot.muted
           font.pixelSize: Style.font.bodySmall
@@ -304,6 +360,7 @@ Item {
                   spacing: 8
 
                   Text {
+                    textFormat: Text.PlainText
                     text: model.pkgName
                     color: depViewRoot.foreground
                     font.pixelSize: Style.font.subtitle
@@ -316,14 +373,16 @@ Item {
                     radius: 3
                     color: Qt.rgba(depViewRoot.foreground.r, depViewRoot.foreground.g, depViewRoot.foreground.b, 0.08)
                     Text {
+                      textFormat: Text.PlainText
                       id: reqTagText
                       anchors.centerIn: parent
                       text: {
                         if (model.pkgName === "omawarden") {
+                          if (model.isLocalFallback) return "Local build"
                           if (model.status === "installed" && model.installedPackage) {
                             return "AUR: " + model.installedPackage
                           }
-                          return "AUR: omawarden-bin / omawarden-git"
+                          return "Build from source"
                         }
                         return "Core System Package"
                       }
@@ -337,6 +396,7 @@ Item {
                   }
 
                   Text {
+                    textFormat: Text.PlainText
                     text: model.version ? ("v" + model.version) : ""
                     color: StatusPalette.installed
                     font.pixelSize: Style.font.bodySmall
@@ -346,6 +406,7 @@ Item {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   text: model.title
                   color: depViewRoot.foreground
                   font.pixelSize: Style.font.bodySmall
@@ -353,6 +414,7 @@ Item {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   text: model.description
                   color: depViewRoot.muted
                   font.pixelSize: Style.font.caption
@@ -381,6 +443,7 @@ Item {
                 border.width: 1
 
                 Text {
+                  textFormat: Text.PlainText
                   id: statusText
                   anchors.centerIn: parent
                   text: {
@@ -429,6 +492,7 @@ Item {
           border.width: 1
 
           Text {
+            textFormat: Text.PlainText
             id: recheckTxt
             anchors.centerIn: parent
             text: depViewRoot.isChecking ? "Checking..." : "↻ Recheck"
@@ -440,61 +504,113 @@ Item {
           MouseArea {
             id: recheckMouse
             anchors.fill: parent
-            enabled: !depViewRoot.isChecking && !depViewRoot.isInstalling
+            enabled: !depViewRoot.isChecking
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
             onClicked: depViewRoot.recheckRequested()
           }
         }
 
-        // One-Click Install Button
-        Rectangle {
-          id: installBtn
-          property bool hasMissing: depViewRoot.missingPackages.length > 0
+        Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
-          implicitHeight: 36
-          radius: 6
-          color: {
-            if (depViewRoot.isChecking || depViewRoot.isInstalling || !installBtn.hasMissing) {
-              return Qt.rgba(depViewRoot.foreground.r, depViewRoot.foreground.g, depViewRoot.foreground.b, 0.08)
-            }
-            return installMouse.pressed ? Qt.darker(depViewRoot.accent, 1.2) : (installMouse.containsMouse ? Qt.lighter(depViewRoot.accent, 1.1) : depViewRoot.accent)
+          text: {
+            if (depViewRoot.isChecking) return "Checking Dependencies..."
+            if (depViewRoot.missingPackages.length > 0) return "Missing: " + depViewRoot.getInstallPackageNames().join(", ")
+            return "✓ All Dependencies Installed"
+          }
+          color: (!depViewRoot.isChecking && depViewRoot.missingPackages.length === 0) ? StatusPalette.installed : depViewRoot.muted
+          font.pixelSize: Style.font.body
+          font.bold: true
+          elide: Text.ElideRight
+        }
+      }
+
+      // Install command: shown as selectable text for the user to run in a terminal
+      Rectangle {
+        visible: !depViewRoot.isChecking && Boolean(depViewRoot.installCommand)
+        Layout.fillWidth: true
+        implicitHeight: 36
+        radius: 6
+        color: Qt.rgba(depViewRoot.foreground.r, depViewRoot.foreground.g, depViewRoot.foreground.b, 0.08)
+        border.color: depViewRoot.borderColor
+        border.width: 1
+
+        RowLayout {
+          anchors.fill: parent
+          anchors.leftMargin: 10
+          anchors.rightMargin: 6
+          spacing: 8
+
+          TextEdit {
+            textFormat: Text.PlainText
+            id: installCommandField
+            Layout.fillWidth: true
+            text: depViewRoot.installCommand
+            readOnly: true
+            selectByMouse: true
+            color: depViewRoot.foreground
+            selectionColor: depViewRoot.accent
+            selectedTextColor: depViewRoot.textOnAccent
+            font.family: "monospace"
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: TextEdit.WrapAnywhere
           }
 
-          Text {
-            id: installBtnText
-            anchors.centerIn: parent
-            text: {
-              if (depViewRoot.isChecking) return "Checking Dependencies..."
-              if (depViewRoot.isInstalling) return "Installing in Floating Terminal..."
-              if (installBtn.hasMissing) return "⚡ One-Click Install Missing Dependencies (" + depViewRoot.getInstallPackageNames().join(", ") + ")"
-              return "✓ All Dependencies Installed"
-            }
-            color: {
-              if (!installBtn.hasMissing && !depViewRoot.isChecking && !depViewRoot.isInstalling) return StatusPalette.installed
-              if (depViewRoot.isChecking || depViewRoot.isInstalling) return depViewRoot.muted
-              return depViewRoot.textOnAccent
-            }
-            font.pixelSize: Style.font.body
-            font.bold: true
-          }
+          Rectangle {
+            implicitWidth: copyCmdText.implicitWidth + 16
+            implicitHeight: 24
+            radius: 4
+            color: copyCmdMouse.containsMouse ? Qt.lighter(depViewRoot.accent, 1.1) : depViewRoot.accent
 
-          MouseArea {
-            id: installMouse
-            anchors.fill: parent
-            enabled: installBtn.hasMissing && !depViewRoot.isChecking && !depViewRoot.isInstalling
-            hoverEnabled: true
-            cursorShape: (installBtn.hasMissing && !depViewRoot.isChecking && !depViewRoot.isInstalling) ? Qt.PointingHandCursor : Qt.ArrowCursor
-            onClicked: depViewRoot.installRequested()
+            Text {
+              textFormat: Text.PlainText
+              id: copyCmdText
+              anchors.centerIn: parent
+              text: copyCmdTimer.running ? "Copied" : "Copy"
+              color: depViewRoot.textOnAccent
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+
+            MouseArea {
+              id: copyCmdMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                depViewRoot.copyInstallCommand()
+                copyCmdTimer.restart()
+              }
+            }
+
+            Timer {
+              id: copyCmdTimer
+              interval: 1500
+            }
           }
         }
       }
 
       Text {
-        text: "Automatically launches an Omarchy floating presentation terminal running paru / yay / pacman to install prerequisites."
+        textFormat: Text.PlainText
+        visible: !depViewRoot.isChecking && Boolean(depViewRoot.installCommand)
+        text: "Run the command above in a terminal, then press Recheck. Replace paru with yay if that is your AUR helper."
         color: depViewRoot.muted
         font.pixelSize: Style.font.caption
         horizontalAlignment: Text.AlignHCenter
+        wrapMode: Text.WordWrap
+        Layout.fillWidth: true
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        visible: !depViewRoot.isChecking && depViewRoot.engineMissing
+        text: depViewRoot.engineBuildInstructions
+        color: depViewRoot.muted
+        font.pixelSize: Style.font.caption
+        horizontalAlignment: Text.AlignHCenter
+        wrapMode: Text.WordWrap
         Layout.fillWidth: true
       }
     }

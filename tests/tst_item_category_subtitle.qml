@@ -52,12 +52,6 @@ ApplicationWindow {
         type_name: "note",
         sub_title: "Secure Note"
       }
-      var sshKeyItem = {
-        name: "Deploy Key",
-        type_name: "ssh_key",
-        ssh_key: { key_type: "ED25519" },
-        sub_title: "SSH Key (ED25519)"
-      }
       var customItem = {
         name: "Custom Data",
         type_name: "custom_type",
@@ -69,7 +63,6 @@ ApplicationWindow {
       Assert.check(itemList.getSubtitle(cardItem) === "Visa", "VaultItemList: card item subtitle is card brand")
       Assert.check(itemList.getSubtitle(identityItem) === "user@example.com", "VaultItemList: identity item subtitle is email")
       Assert.check(itemList.getSubtitle(noteItem) === "Secure Note", "VaultItemList: note item subtitle is sub_title")
-      Assert.check(itemList.getSubtitle(sshKeyItem) === "ED25519", "VaultItemList: ssh_key item subtitle is key_type")
       Assert.check(itemList.getSubtitle(customItem) === "Custom Subtitle", "VaultItemList: custom item falls back to sub_title")
       Assert.check(itemList.getSubtitle(null) === "", "VaultItemList: null item subtitle is empty string")
 
@@ -78,7 +71,6 @@ ApplicationWindow {
       Assert.check(itemInspector.getItemCategoryLabel(cardItem) === "Card", "ItemInspector: card item label is 'Card'")
       Assert.check(itemInspector.getItemCategoryLabel(identityItem) === "Identity", "ItemInspector: identity item label is 'Identity'")
       Assert.check(itemInspector.getItemCategoryLabel(noteItem) === "Secure Note", "ItemInspector: note item label is 'Secure Note'")
-      Assert.check(itemInspector.getItemCategoryLabel(sshKeyItem) === "SSH Key", "ItemInspector: ssh_key item label is 'SSH Key'")
       Assert.check(itemInspector.getItemCategoryLabel(customItem) === "Custom Subtitle", "ItemInspector: custom item falls back to sub_title")
       Assert.check(itemInspector.getItemCategoryLabel(null) === "", "ItemInspector: null item label is empty string")
 

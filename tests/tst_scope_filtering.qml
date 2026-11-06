@@ -40,8 +40,8 @@ Item {
     },
     {
       id: "item-4",
-      name: "Work Server SSH Key",
-      type_name: "ssh_key",
+      name: "Work Server Notes",
+      type_name: "note",
       organization_id: "org-1",
       organization_name: "Acme Corp",
       folder_id: "dev-folder",
@@ -85,7 +85,7 @@ Item {
       }
 
       // 3. Category Filter
-      if (cat !== "all" && item.type_name !== cat && !(cat === "ssh_key" && item.category === "ssh_key")) return false
+      if (cat !== "all" && item.type_name !== cat) return false
 
       // 4. Query Filter
       if (q === "") return true
@@ -134,15 +134,15 @@ Item {
     // Test 7: 4-Way Conjunction:
     // Vault Scope = org-1 (Acme Corp)
     // Folder Scope = dev-folder (Development)
-    // Category = ssh_key
+    // Category = note
     // Query = "server"
     activeVaultScope = "org-1"
     activeFolderScope = "dev-folder"
-    activeCategory = "ssh_key"
+    activeCategory = "note"
     searchQuery = "server"
     var resConjunction = filterItems()
     Assert.check(resConjunction.length === 1, "4-way conjunction returns 1 item")
-    Assert.check(resConjunction[0].id === "item-4", "4-way conjunction correctly matched Work Server SSH Key")
+    Assert.check(resConjunction[0].id === "item-4", "4-way conjunction correctly matched Work Server Notes")
 
     // Test 8: 4-Way Conjunction mismatch (Category mismatch)
     activeCategory = "login"

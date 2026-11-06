@@ -98,26 +98,15 @@ impl KeyringManager {
             .output()
             .ok()?;
 
+        // Lookups are always scoped to the server. Secret Service matches
+        // items by attribute subset, so a lookup without server_url would
+        // return a token stored for any other server.
         if output.status.success() {
             let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !val.is_empty() {
                 return Some(val);
             }
         }
-
-        // Backwards compatibility fallback: lookup un-scoped token from older versions
-        let legacy = Command::new(&self.secret_tool_path)
-            .args(["lookup", "service", SERVICE_NAME, "kind", kind])
-            .output()
-            .ok()?;
-
-        if legacy.status.success() {
-            let val = String::from_utf8_lossy(&legacy.stdout).trim().to_string();
-            if !val.is_empty() {
-                return Some(val);
-            }
-        }
-
         None
     }
 
@@ -295,7 +284,10 @@ impl KeyringManager {
         }
 
         // Look up server_url scoped legacy account=session
-        if let Ok(output) = Command::new(&self.secret_tool_path)
+        // Items stored before server scoping carry no server_url and are no
+        // longer read: they cannot be attributed to a server. They are still
+        // removed by clear_all.
+        let output = Command::new(&self.secret_tool_path)
             .args([
                 "lookup",
                 "service",
@@ -305,19 +297,6 @@ impl KeyringManager {
                 "server_url",
                 norm_url,
             ])
-            .output()
-        {
-            if output.status.success() {
-                let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !val.is_empty() {
-                    return Some(val);
-                }
-            }
-        }
-
-        // Fallback to legacy un-scoped account=session
-        let output = Command::new(&self.secret_tool_path)
-            .args(["lookup", "service", SERVICE_NAME, "account", ACCOUNT_NAME])
             .output()
             .ok()?;
 
@@ -671,6 +650,43 @@ esac
             mgr.get_token(server_b, KIND_ACCESS_TOKEN),
             Some("token_b_access".to_string())
         );
+    }
+
+    #[test]
+    fn test_lookups_never_omit_server_scope() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("invocations.log");
+        let script_path = dir.path().join("mock-secret-tool");
+
+        // Behaves like Secret Service attribute-subset matching for an item
+        // stored for another server: any lookup without server_url finds it.
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "{}"
+case "$*" in
+    *server_url*) exit 1 ;;
+    lookup*) printf 'token_for_other_server'; exit 0 ;;
+esac
+exit 1
+"#,
+            log_path.display()
+        );
+        crate::write_test_executable(&script_path, script);
+
+        let mgr = KeyringManager::new(script_path.to_str().unwrap());
+        let server = "https://vault.example.com";
+        assert_eq!(mgr.get_token(server, KIND_ACCESS_TOKEN), None);
+        assert_eq!(mgr.get_token(server, KIND_REFRESH_TOKEN), None);
+        assert_eq!(mgr.get_session(server), None);
+
+        let invocations = fs::read_to_string(&log_path).unwrap();
+        assert!(!invocations.is_empty());
+        for line in invocations.lines() {
+            assert!(
+                line.contains("server_url https://vault.example.com"),
+                "unscoped lookup issued: {line}"
+            );
+        }
     }
 
     #[test]

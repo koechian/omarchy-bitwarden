@@ -1,14 +1,11 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
-import "./IconPolicy.js" as IconPolicy
 import qs.Commons
 import qs.Commons as Commons
 
 Item {
   id: itemListRoot
-
-  property string serverUrl: ""
 
   property var items: []
   property int selectedIndex: 0
@@ -22,7 +19,6 @@ Item {
   property color selectedText: Commons.Color.menu.selectedText
   property color borderColor: Commons.Color.menu.border
   property string fontFamily: ""
-  property bool showWebsiteIcons: false
 
   signal itemSelected(int index)
   signal itemTriggered(int index)
@@ -39,47 +35,11 @@ Item {
     }
   }
 
-  function isAppScheme(uri) {
-    if (!uri) return false
-    var str = String(uri).trim()
-    var match = str.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/i)
-    if (match) {
-      var scheme = match[1].toLowerCase()
-      return scheme !== "http" && scheme !== "https"
-    }
-    return false
-  }
-
-  function getHostname(uri) {
-    if (!uri || isAppScheme(uri)) return ""
-    var str = String(uri).trim()
-    var match = str.match(/^(?:https?:\/\/)?(?:[^@\n]+@)?(?:www\.)?([^:\/\n?#]+)/i)
-    return match ? match[1] : ""
-  }
-
-  function getFaviconUrl(item) {
-    if (!showWebsiteIcons) return ""
-    if (!item) return ""
-    if (item.type_name !== "login" && item.category !== "login") return ""
-    if (!item.login || !item.login.uris || item.login.uris.length === 0) return ""
-    for (var i = 0; i < item.login.uris.length; i++) {
-      var u = item.login.uris[i]
-      var uriStr = (typeof u === "string") ? u : (u && u.uri ? u.uri : "")
-      if (!uriStr || isAppScheme(uriStr)) continue
-      var domain = getHostname(uriStr)
-      if (domain && domain.indexOf(".") !== -1) {
-        return IconPolicy.resolveIconUrl(itemListRoot.serverUrl, domain)
-      }
-    }
-    return ""
-  }
-
   function getItemIcon(item) {
     if (!item) return "\uf084"
     if (item.type_name === "card") return "\uf09d"
     if (item.type_name === "identity") return "\uf2c2"
     if (item.type_name === "note") return "\uf0f6"
-    if (item.type_name === "ssh_key" || item.category === "ssh_key") return "\uf084"
     return "\uf084"
   }
 
@@ -88,7 +48,6 @@ Item {
     if (item.type_name === "login" && item.login && item.login.username) return item.login.username
     if (item.type_name === "card" && item.card && item.card.brand) return item.card.brand
     if (item.type_name === "identity" && item.identity && item.identity.email) return item.identity.email
-    if (item.type_name === "ssh_key" && item.ssh_key && item.ssh_key.key_type) return item.ssh_key.key_type
     return item.sub_title || ""
   }
 
@@ -102,6 +61,7 @@ Item {
       spacing: 8
 
       Text {
+        textFormat: Text.PlainText
         Layout.alignment: Qt.AlignHCenter
         text: "\uf002"
         font.family: itemListRoot.fontFamily
@@ -110,6 +70,7 @@ Item {
       }
 
       Text {
+        textFormat: Text.PlainText
         Layout.alignment: Qt.AlignHCenter
         text: (itemListRoot.searchQuery || itemListRoot.activeVaultScope !== "all" || itemListRoot.activeFolderScope !== "all") ? "No matching items found" : "Vault is empty"
         color: itemListRoot.foreground
@@ -118,6 +79,7 @@ Item {
       }
 
       Text {
+        textFormat: Text.PlainText
         visible: Boolean(itemListRoot.searchQuery || itemListRoot.activeVaultScope !== "all" || itemListRoot.activeFolderScope !== "all")
         Layout.alignment: Qt.AlignHCenter
         text: (itemListRoot.activeVaultScope !== "all" || itemListRoot.activeFolderScope !== "all") ? "Try resetting scope filters or press Esc" : "Try a different keyword or press Tab to switch category"
@@ -169,27 +131,15 @@ Item {
         anchors.rightMargin: 10
         spacing: 10
 
-        // Type Icon (Favicon with fallback)
+        // Type Icon
         Item {
           id: iconContainer
           Layout.preferredWidth: 20
           Layout.preferredHeight: 20
 
-          property string favUrl: itemListRoot.getFaviconUrl(modelData)
-
-          Image {
-            id: faviconImg
-            anchors.fill: parent
-            asynchronous: true
-            cache: true
-            fillMode: Image.PreserveAspectFit
-            source: iconContainer.favUrl
-            visible: iconContainer.favUrl !== "" && status === Image.Ready
-          }
-
           Text {
+            textFormat: Text.PlainText
             anchors.centerIn: parent
-            visible: !faviconImg.visible
             text: itemListRoot.getItemIcon(modelData)
             font.family: itemListRoot.fontFamily
             font.pixelSize: Style.font.title
@@ -209,6 +159,7 @@ Item {
             spacing: 6
 
             Text {
+              textFormat: Text.PlainText
               text: modelData.name || "Untitled"
               color: itemDelegate.isSelected ? itemListRoot.selectedText : itemListRoot.foreground
               font.pixelSize: Style.font.body
@@ -229,6 +180,7 @@ Item {
               border.width: 1
 
               Text {
+                textFormat: Text.PlainText
                 id: orgText
                 anchors.centerIn: parent
                 width: Math.min(102, implicitWidth)
@@ -252,6 +204,7 @@ Item {
               border.width: 1
 
               Text {
+                textFormat: Text.PlainText
                 id: folderText
                 anchors.centerIn: parent
                 width: Math.min(92, implicitWidth)
@@ -264,17 +217,9 @@ Item {
               }
             }
 
-            // Attachment Indicator
-            Text {
-              visible: Boolean(modelData.attachments && modelData.attachments.length > 0)
-              text: "\uf0c6"
-              font.family: itemListRoot.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              color: itemDelegate.isSelected ? itemListRoot.selectedText : itemListRoot.muted
-            }
-
             // Monochrome Favorite Indicator (Always at the far right)
             Text {
+              textFormat: Text.PlainText
               visible: Boolean(modelData.favorite)
               text: "\uf005"
               font.family: itemListRoot.fontFamily
@@ -285,6 +230,7 @@ Item {
 
           // Subtitle / Username
           Text {
+            textFormat: Text.PlainText
             property string sub: itemListRoot.getSubtitle(modelData)
             visible: Boolean(sub)
             text: sub

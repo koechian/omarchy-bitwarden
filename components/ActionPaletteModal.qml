@@ -66,6 +66,7 @@ Rectangle {
         spacing: 8
 
         Text {
+          textFormat: Text.PlainText
           text: "\uf0e7"
           font.family: paletteRoot.fontFamily
           font.pixelSize: Style.font.subtitle
@@ -125,7 +126,6 @@ Rectangle {
               } else if (event.modifiers & Qt.ControlModifier) {
                 var pressedKey = ""
                 if (event.key === Qt.Key_U) pressedKey = "Ctrl+U"
-                else if (event.key === Qt.Key_E) pressedKey = "Ctrl+E"
                 else if (event.key === Qt.Key_T) pressedKey = "Ctrl+T"
                 else if (event.key === Qt.Key_O) pressedKey = "Ctrl+O"
                 else if (event.key === Qt.Key_H) pressedKey = "Ctrl+H"
@@ -144,6 +144,7 @@ Rectangle {
           }
 
           Text {
+            textFormat: Text.PlainText
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
@@ -156,6 +157,7 @@ Rectangle {
         }
 
         Text {
+          textFormat: Text.PlainText
           text: "Esc"
           color: paletteRoot.muted
           font.pixelSize: Style.font.caption
@@ -195,6 +197,7 @@ Rectangle {
             spacing: 8
 
             Text {
+              textFormat: Text.PlainText
               text: modelData.icon || "\uf0e7"
               font.family: paletteRoot.fontFamily
               font.pixelSize: Style.font.subtitle
@@ -202,6 +205,7 @@ Rectangle {
             }
 
             Text {
+              textFormat: Text.PlainText
               text: modelData.label || ""
               color: actionDelegate.isSelected ? paletteRoot.accent : paletteRoot.foreground
               font.pixelSize: Style.font.body
@@ -220,6 +224,7 @@ Rectangle {
               border.width: 1
 
               Text {
+                textFormat: Text.PlainText
                 id: scText
                 anchors.centerIn: parent
                 text: modelData.shortcut || ""

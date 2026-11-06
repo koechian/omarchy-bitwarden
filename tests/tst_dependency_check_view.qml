@@ -62,56 +62,53 @@ Item {
     check(installNames.length === 1, "installNames length is 1")
     check(installNames[0] === "omawarden", "installNames includes omawarden for user provider selection")
 
-    // 7. Parse stdout with omawarden-bin satisfying omawarden (version >= 0.8.1)
-    var mockAurStdout = "omawarden-bin 0.8.1-1\n"
+    // 7. Parse stdout with omawarden-bin satisfying omawarden (version >= 0.12.0)
+    var mockAurStdout = "omawarden-bin 0.12.0-1\n"
     depView.parsePacmanStdout(mockAurStdout)
-    check(depView.dependencyModel.get(0).status === "installed", "omawarden is satisfied by omawarden-bin >= 0.8.1")
-    check(depView.dependencyModel.get(0).version === "0.8.1-1", "omawarden version set to 0.8.1-1")
+    check(depView.dependencyModel.get(0).status === "installed", "omawarden is satisfied by omawarden-bin >= 0.12.0")
+    check(depView.dependencyModel.get(0).version === "0.12.0-1", "omawarden version set to 0.12.0-1")
     check(depView.dependencyModel.get(0).installedPackage === "omawarden-bin", "omawarden installedPackage is omawarden-bin")
 
     var missingAfter = depView.finalizeCheck()
     check(missingAfter.length === 0, "all dependencies satisfied, missing length is 0")
     check(depView.missingPackages.length === 0, "depView.missingPackages is empty when all installed")
 
-    // 7b. Outdated version test: omawarden-bin 0.8.0 must be rejected (< 0.8.1)
+    // 7b. Outdated version test: omawarden-bin 0.11.0 must be rejected (< 0.12.0)
     depView.resetToChecking()
-    depView.parsePacmanStdout("libsecret 0.21.7-1\nwl-clipboard 1:2.3.0-1\nomawarden-bin 0.8.0-1\n")
-    check(depView.dependencyModel.get(0).status === "missing", "omawarden 0.8.0 marked missing due to minimum version requirement")
+    depView.parsePacmanStdout("libsecret 0.21.7-1\nwl-clipboard 1:2.3.0-1\nomawarden-bin 0.11.0-1\n")
+    check(depView.dependencyModel.get(0).status === "missing", "omawarden 0.11.0 marked missing due to minimum version requirement")
     var missingOutdated = depView.finalizeCheck()
     check(missingOutdated.indexOf("omawarden") !== -1, "missingOutdated contains omawarden")
 
-    // 7c. Outdated VCS version test: omawarden-git 0.8.0.r45 must be rejected (< 0.8.1)
+    // 7c. Outdated VCS version test: omawarden-git 0.11.0.r45 must be rejected (< 0.12.0)
     depView.resetToChecking()
     check(depView.dependencyModel.get(0).installedPackage === "", "installedPackage is reset to empty string on resetToChecking")
-    var mockOldGitStdout = "libsecret 0.21.7-1\nwl-clipboard 1:2.3.0-1\nomawarden-git 0.8.0.r45.ga1b2c3d-1\n"
+    var mockOldGitStdout = "libsecret 0.21.7-1\nwl-clipboard 1:2.3.0-1\nomawarden-git 0.11.0.r45.ga1b2c3d-1\n"
     depView.parsePacmanStdout(mockOldGitStdout)
-    check(depView.dependencyModel.get(0).status === "missing", "omawarden-git 0.8.0.r45 marked missing due to minimum version requirement")
+    check(depView.dependencyModel.get(0).status === "missing", "omawarden-git 0.11.0.r45 marked missing due to minimum version requirement")
     var missingOldGit = depView.finalizeCheck()
     check(missingOldGit.indexOf("omawarden") !== -1, "missingOldGit contains omawarden")
 
-    // 7d. Satisfied VCS version test: omawarden-git 0.8.1.r12 (>= 0.8.1)
+    // 7d. Satisfied VCS version test: omawarden-git 0.12.0.r12 (>= 0.12.0)
     depView.resetToChecking()
-    var mockGitStdout = "libsecret 0.21.7-1\nwl-clipboard 1:2.3.0-1\nomawarden-git 0.8.1.r12.ga1b2c3d-1\n"
+    var mockGitStdout = "libsecret 0.21.7-1\nwl-clipboard 1:2.3.0-1\nomawarden-git 0.12.0.r12.ga1b2c3d-1\n"
     depView.parsePacmanStdout(mockGitStdout)
-    check(depView.dependencyModel.get(0).status === "installed", "omawarden is satisfied by omawarden-git >= 0.8.1")
-    check(depView.dependencyModel.get(0).version === "0.8.1.r12.ga1b2c3d-1", "omawarden version set to git version")
+    check(depView.dependencyModel.get(0).status === "installed", "omawarden is satisfied by omawarden-git >= 0.12.0")
+    check(depView.dependencyModel.get(0).version === "0.12.0.r12.ga1b2c3d-1", "omawarden version set to git version")
     check(depView.dependencyModel.get(0).installedPackage === "omawarden-git", "omawarden installedPackage is omawarden-git")
 
     var missingAfterGit = depView.finalizeCheck()
-    check(missingAfterGit.length === 0, "all dependencies satisfied with omawarden-git >= 0.8.1, missing length is 0")
-    check(depView.missingPackages.length === 0, "depView.missingPackages is empty when omawarden-git >= 0.8.1 is installed")
+    check(missingAfterGit.length === 0, "all dependencies satisfied with omawarden-git >= 0.12.0, missing length is 0")
+    check(depView.missingPackages.length === 0, "depView.missingPackages is empty when omawarden-git >= 0.12.0 is installed")
 
-    // 8. Signals test
+    // 8. Signals test: recheck only; the view never launches an installer
     var recheckEmitted = false
-    var installEmitted = false
     depView.recheckRequested.connect(function() { recheckEmitted = true })
-    depView.installRequested.connect(function() { installEmitted = true })
 
     depView.recheckRequested()
     check(recheckEmitted, "recheckRequested signal emitted")
-
-    depView.installRequested()
-    check(installEmitted, "installRequested signal emitted")
+    check(depView.installRequested === undefined, "no installRequested signal exists")
+    check(depView.isInstalling === undefined, "no installer state exists")
 
     // 9. Overlay view gating test (modeled after OmarchyBitwarden.qml effectiveView logic)
     function computeEffectiveView(dependenciesMissing, currentView, authState) {
@@ -139,19 +136,20 @@ Item {
     check(computeEffectiveView(false, "auto", authLocked) === "unlock", "Routes to unlock view when dependencies satisfied and locked")
     check(computeEffectiveView(false, "auto", authUnauthenticated) === "login", "Routes to login view when dependencies satisfied and unauthenticated")
 
-    // 10. Installer command generation test
-    function buildInstallCommand(missingPkgs) {
-      var pkgs = missingPkgs.join(" ")
-      return "if command -v paru >/dev/null 2>&1; then paru -S --needed " + pkgs +
-             "; elif command -v yay >/dev/null 2>&1; then yay -S --needed " + pkgs +
-             "; else sudo pacman -S --needed " + pkgs + "; fi"
-    }
-
-    var cmd = buildInstallCommand(["omawarden", "libsecret", "wl-clipboard"])
-    check(cmd.indexOf("omawarden libsecret wl-clipboard") !== -1, "Install command targets omawarden, libsecret, wl-clipboard")
-    check(cmd.indexOf("paru -S --needed") !== -1, "Install command checks paru")
-    check(cmd.indexOf("yay -S --needed") !== -1, "Install command checks yay")
-    check(cmd.indexOf("sudo pacman -S --needed") !== -1, "Install command falls back to pacman")
+    // 10. Install command is displayed as text, built from the missing packages
+    depView.resetToChecking()
+    check(depView.installCommand === "", "No install command while nothing is missing")
+    depView.parsePacmanStderr("error: package 'omawarden' was not found\nerror: package 'libsecret' was not found\nerror: package 'wl-clipboard' was not found\n")
+    depView.finalizeCheck()
+    check(depView.installCommand === "paru -S --needed libsecret wl-clipboard",
+          "Install command names the missing system packages and never the source-built engine")
+    check(depView.engineMissing === true, "A missing engine is reported separately")
+    check(depView.engineBuildInstructions.indexOf("~/.local/bin") !== -1, "Engine build instructions name the install location")
+    check(typeof depView.copyInstallCommand === "function", "Install command can be copied")
+    depView.resetToChecking()
+    depView.parsePacmanStdout("omawarden-bin 0.12.0-1\nlibsecret 0.21.7-1\nwl-clipboard 1:2.3.0-1\n")
+    depView.finalizeCheck()
+    check(depView.installCommand === "", "Install command clears once everything is installed")
 
     // 11. Missing package via stderr
     depView.resetToChecking()
@@ -164,7 +162,7 @@ Item {
 
     // 12. Robustness: parsePacmanStderr must not overwrite installed status
     depView.resetToChecking()
-    depView.parsePacmanStdout("omawarden-bin 0.8.1-1\nlibsecret 0.21.7-1\nwl-clipboard 1:2.3.0-1\n")
+    depView.parsePacmanStdout("omawarden-bin 0.12.0-1\nlibsecret 0.21.7-1\nwl-clipboard 1:2.3.0-1\n")
     depView.parsePacmanStderr("error: package 'omawarden' was not found\n")
     check(depView.dependencyModel.get(0).status === "installed", "parsePacmanStderr does not overwrite installed omawarden-bin")
     check(depView.dependencyModel.get(0).installedPackage === "omawarden-bin", "installedPackage remains omawarden-bin")
@@ -172,11 +170,42 @@ Item {
     // 13. Robustness: stderr arrives BEFORE stdout when candidate provider is installed
     depView.resetToChecking()
     depView.parsePacmanStderr("error: package 'omawarden' was not found\nerror: package 'omawarden-git' was not found\n")
-    depView.parsePacmanStdout("omawarden-bin 0.8.1-1\nlibsecret 0.21.7-1\nwl-clipboard 1:2.3.0-1\n")
+    depView.parsePacmanStdout("omawarden-bin 0.12.0-1\nlibsecret 0.21.7-1\nwl-clipboard 1:2.3.0-1\n")
     check(depView.dependencyModel.get(0).status === "installed", "omawarden-bin satisfies dependency even if stderr finished first")
     check(depView.dependencyModel.get(0).installedPackage === "omawarden-bin", "installedPackage is correctly omawarden-bin when stderr arrived first")
     var missingInverted = depView.finalizeCheck()
     check(missingInverted.length === 0, "missing count is 0 when stderr finished before stdout")
+
+    // 14. A locally built engine on PATH satisfies the check when pacman has no engine package
+    depView.resetToChecking()
+    depView.parsePacmanStdout("libsecret 0.21.7-1\nwl-clipboard 1:2.3.0-1\n")
+    depView.parsePacmanStderr("error: package 'omawarden' was not found\nerror: package 'omawarden-bin' was not found\nerror: package 'omawarden-git' was not found\n")
+    check(depView.engineNeedsLocalProbe() === true, "Engine without a package needs a local probe")
+    depView.applyLocalEngineProbe("omawarden 0.12.0 (c84c59d 2026-11-06)\n")
+    check(depView.dependencyModel.get(0).status === "installed", "Local engine 0.12.0 counts as installed")
+    check(depView.dependencyModel.get(0).isLocalFallback === true, "Local engine is marked as a local build")
+    check(depView.dependencyModel.get(0).version === "0.12.0", "Local engine version is recorded")
+    check(depView.finalizeCheck().length === 0, "Nothing is missing once the local engine is found")
+    check(depView.installCommand === "", "No install command once the local engine is found")
+
+    // 15. A local engine older than the minimum stays missing
+    depView.resetToChecking()
+    depView.parsePacmanStdout("libsecret 0.21.7-1\nwl-clipboard 1:2.3.0-1\n")
+    depView.applyLocalEngineProbe("omawarden 0.11.0 (cc8d22b 2026-11-03)\n")
+    check(depView.dependencyModel.get(0).status === "missing", "Local engine 0.11.0 is rejected")
+    check(depView.finalizeCheck().indexOf("omawarden") !== -1, "Rejected local engine is reported missing")
+
+    // 16. Unrecognised probe output changes nothing
+    depView.resetToChecking()
+    depView.applyLocalEngineProbe("")
+    depView.applyLocalEngineProbe("sh: omawarden: not found")
+    check(depView.dependencyModel.get(0).status === "checking", "Empty or unrecognised probe output leaves the engine unresolved")
+    check(depView.parseEngineVersionOutput("omawarden 0.12.0-dev") === "0.12.0-dev", "Development versions are parsed")
+
+    // 17. A packaged engine needs no local probe
+    depView.resetToChecking()
+    depView.parsePacmanStdout("omawarden-bin 0.12.0-1\nlibsecret 0.21.7-1\nwl-clipboard 1:2.3.0-1\n")
+    check(depView.engineNeedsLocalProbe() === false, "Packaged engine skips the local probe")
 
     console.log("ALL DEPENDENCY CHECK VIEW TESTS PASSED!")
     Qt.exit(failures === 0 ? 0 : 1)

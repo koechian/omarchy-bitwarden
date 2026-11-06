@@ -1,5 +1,10 @@
 # omarchy-bitwarden
 
+> [!IMPORTANT]
+> 本文档描述的是上游项目 [icyleaf/omarchy-bitwarden](https://github.com/icyleaf/omarchy-bitwarden)。本分支已移除 SSH 代理、附件、网站图标、更新检查和一键安装程序，并修改了密钥的读取方式；请以英文 [README.md](README.md) 为准。
+>
+> This document describes upstream. This fork removes the SSH agent, attachments, website icons, the update check and the one-click installer, and changes how secrets are released; see [README.md](README.md).
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![Omarchy](https://img.shields.io/badge/Omarchy-Plugin-8b5cf6.svg)](https://github.com/omarchy)

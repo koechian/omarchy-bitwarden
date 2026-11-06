@@ -9,11 +9,10 @@ GhostIconButton 1.0 GhostIconButton.qml
 ItemInspector 1.0 ItemInspector.qml
 PasswordGeneratorModal 1.0 PasswordGeneratorModal.qml
 PasswordHistoryModal 1.0 PasswordHistoryModal.qml
-ReleaseNotesModal 1.0 ReleaseNotesModal.qml
 ScopeDropdown 1.0 ScopeDropdown.qml
 SearchHeader 1.0 SearchHeader.qml
+SecretFieldRow 1.0 SecretFieldRow.qml
+SecretReleaseController 1.0 SecretReleaseController.qml
 SettingsModal 1.0 SettingsModal.qml
-SshApprovalModal 1.0 SshApprovalModal.qml
-SshKeyModal 1.0 SshKeyModal.qml
 ToastAlert 1.0 ToastAlert.qml
 VaultItemList 1.0 VaultItemList.qml

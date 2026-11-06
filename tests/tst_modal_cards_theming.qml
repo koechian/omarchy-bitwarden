@@ -61,36 +61,6 @@ Item {
     borderColor: lattePopupBorder
   }
 
-  Components.SshApprovalModal {
-    id: sshApprovalModal
-    active: true
-    foreground: latteFg
-    accent: latteAccent
-    muted: latteMuted
-    cardBackground: lattePopupBg
-    borderColor: lattePopupBorder
-  }
-
-  Components.SshKeyModal {
-    id: sshKeyModal
-    active: true
-    foreground: latteFg
-    accent: latteAccent
-    muted: latteMuted
-    cardBackground: lattePopupBg
-    borderColor: lattePopupBorder
-  }
-
-  Components.ReleaseNotesModal {
-    id: releaseModal
-    visible: true
-    foreground: latteFg
-    accent: latteAccent
-    muted: latteMuted
-    cardBackground: lattePopupBg
-    borderColor: lattePopupBorder
-  }
-
   Components.ScopeDropdown {
     id: scopeDropdown
     foreground: latteFg
@@ -130,17 +100,11 @@ Item {
       check(paletteModal.hasOwnProperty("cardBackground"), "ActionPaletteModal should have cardBackground property")
       check(genModal.hasOwnProperty("cardBackground"), "PasswordGeneratorModal should have cardBackground property")
       check(histModal.hasOwnProperty("cardBackground"), "PasswordHistoryModal should have cardBackground property")
-      check(sshApprovalModal.hasOwnProperty("cardBackground"), "SshApprovalModal should have cardBackground property")
-      check(sshKeyModal.hasOwnProperty("cardBackground"), "SshKeyModal should have cardBackground property")
-      check(releaseModal.hasOwnProperty("cardBackground"), "ReleaseNotesModal should have cardBackground property")
 
       // 2. Card background colors should match lattePopupBg (#e6e9ef)
       check(paletteModal.cardBackground == lattePopupBg, "paletteModal cardBackground matches popup background token")
       check(genModal.cardBackground == lattePopupBg, "genModal cardBackground matches popup background token")
       check(histModal.cardBackground == lattePopupBg, "histModal cardBackground matches popup background token")
-      check(sshApprovalModal.cardBackground == lattePopupBg, "sshApprovalModal cardBackground matches popup background token")
-      check(sshKeyModal.cardBackground == lattePopupBg, "sshKeyModal cardBackground matches popup background token")
-      check(releaseModal.cardBackground == lattePopupBg, "releaseModal cardBackground matches popup background token")
 
       if (failures > 0) {
         console.error("TOTAL FAILURES:", failures)

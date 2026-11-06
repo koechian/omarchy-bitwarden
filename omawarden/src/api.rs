@@ -1,15 +1,17 @@
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::crypto::{
-    derive_master_key, derive_master_password_hash, EncString, KdfType, SymmetricCryptoKey,
+    derive_master_key_with_parameters, derive_master_password_hash, EncString, KdfParameters,
+    SymmetricCryptoKey,
 };
-use crate::vault::{parse_ssh_key_fields, SshMetadata, VaultItem};
+use crate::locked::LockedKey32;
+use crate::vault::VaultItem;
 
 /// Maximum response size for error bodies (64 KiB)
 pub const MAX_ERROR_BODY_SIZE: u64 = 64 * 1024;
@@ -153,6 +155,22 @@ pub struct PreloginResponse {
         alias = "parallelism"
     )]
     pub kdf_parallelism: Option<u32>,
+}
+
+impl PreloginResponse {
+    /// Derives the master key with the advertised KDF. Out-of-range
+    /// parameters are refused with an error the user sees at login.
+    pub fn derive_master_key(&self, email: &str, password: &str) -> Result<LockedKey32, ApiError> {
+        let parameters = KdfParameters::from_server_values(
+            self.kdf,
+            self.kdf_iterations,
+            self.kdf_memory,
+            self.kdf_parallelism,
+        )
+        .map_err(|e| ApiError::Crypto(e.to_string()))?;
+        derive_master_key_with_parameters(email, password, &parameters)
+            .map_err(|e| ApiError::Crypto(e.to_string()))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -363,40 +381,94 @@ impl TwoFactorProviderType {
     }
 }
 
-/// Returns a stable device identifier (UUID format) for Bitwarden identity endpoints.
-/// Uses `/etc/machine-id` or `/var/lib/dbus/machine-id` if available,
-/// or falls back to an RFC 4122 v4 UUID.
-pub fn get_device_identifier() -> String {
-    for path in &["/etc/machine-id", "/var/lib/dbus/machine-id"] {
-        if let Ok(id) = std::fs::read_to_string(path) {
-            let trimmed = id.trim();
-            if trimmed.len() == 32 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-                return format!(
-                    "{}-{}-{}-{}-{}",
-                    &trimmed[0..8],
-                    &trimmed[8..12],
-                    &trimmed[12..16],
-                    &trimmed[16..20],
-                    &trimmed[20..32]
-                );
-            }
-        }
-    }
+/// File holding the persisted device identifier, next to data.json.
+pub const DEVICE_IDENTIFIER_FILENAME: &str = "device_identifier";
 
+/// Returns the device identifier sent to Bitwarden identity endpoints.
+///
+/// It is a random UUID v4 generated once from the OS RNG and persisted with
+/// 0600 permissions; it is never derived from /etc/machine-id, which would
+/// expose a host-wide tracking identifier to the server.
+pub fn get_device_identifier() -> String {
+    load_or_create_device_identifier(&device_identifier_path())
+}
+
+#[cfg(not(test))]
+fn device_identifier_path() -> PathBuf {
+    let storage_path = crate::storage::resolve_default_storage_path();
+    let data_dir = storage_path.parent().unwrap_or_else(|| Path::new("."));
+    data_dir.join(DEVICE_IDENTIFIER_FILENAME)
+}
+
+/// Unit tests must not write into the user's data directory.
+#[cfg(test)]
+fn device_identifier_path() -> PathBuf {
+    std::env::temp_dir()
+        .join("omawarden-unit-tests")
+        .join(DEVICE_IDENTIFIER_FILENAME)
+}
+
+/// Reads the persisted identifier at `path`, or generates and persists a new
+/// one. If persisting fails the generated identifier is still returned, so
+/// login keeps working; the server then sees a new device next time.
+pub fn load_or_create_device_identifier(path: &Path) -> String {
+    if let Some(existing) = read_device_identifier(path) {
+        return existing;
+    }
+    let identifier = generate_uuid_v4();
+    if let Err(e) = persist_device_identifier(path, &identifier) {
+        crate::log_warn!(
+            "omawarden:api",
+            "Could not persist device identifier at {}: {}",
+            path.display(),
+            e
+        );
+    }
+    identifier
+}
+
+fn read_device_identifier(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let candidate = content.trim();
+    is_canonical_uuid(candidate).then(|| candidate.to_ascii_lowercase())
+}
+
+fn persist_device_identifier(path: &Path, identifier: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        crate::fs_util::create_secure_dir_all(parent, 0o700)?;
+    }
+    crate::fs_util::atomic_write_str(path, identifier, 0o600)
+}
+
+/// True for the 8-4-4-4-12 hexadecimal UUID text form.
+fn is_canonical_uuid(candidate: &str) -> bool {
+    const HYPHEN_POSITIONS: [usize; 4] = [8, 13, 18, 23];
+    candidate.len() == 36
+        && candidate.char_indices().all(|(index, c)| {
+            if HYPHEN_POSITIONS.contains(&index) {
+                c == '-'
+            } else {
+                c.is_ascii_hexdigit()
+            }
+        })
+}
+
+/// Generates an RFC 4122 version 4 UUID from the operating system RNG.
+fn generate_uuid_v4() -> String {
     use rand_core::RngCore;
     let mut bytes = [0u8; 16];
-    let mut rng = rand_core::OsRng;
-    rng.fill_bytes(&mut bytes);
+    rand_core::OsRng.fill_bytes(&mut bytes);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
 
+    let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
     format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5],
-        bytes[6], bytes[7],
-        bytes[8], bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
     )
 }
 
@@ -739,19 +811,38 @@ pub fn load_client_identity_from_pem(
         .map_err(|e| ApiError::Http(format!("Failed to parse client identity PEM: {}", e)))
 }
 
+/// Plaintext HTTP is permitted only when the target is an explicit http://
+/// loopback URL, mirroring the configuration rule in
+/// `ConfigManager::validate_url_scheme_security`.
+pub fn permits_plaintext_http(target_url: Option<&str>) -> bool {
+    let Some(parsed) = target_url.and_then(|u| url::Url::parse(u.trim()).ok()) else {
+        return false;
+    };
+    parsed.scheme() == "http" && parsed.host_str().is_some_and(is_loopback_host)
+}
+
+/// Client used only when the configured client cannot be built; it keeps the
+/// same redirect and HTTPS restrictions.
+fn restricted_fallback_client() -> Client {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
+        .build()
+        .unwrap_or_default()
+}
+
 /// Builds an HTTP blocking client with standard Bitwarden client headers and client-context-aware User-Agent.
 pub fn build_http_client_with_context(
     timeout: Duration,
     client_context: Option<&ClientContext>,
 ) -> Client {
     build_http_client_for_url(timeout, client_context, None)
-        .unwrap_or_else(|_| Client::builder().build().unwrap_or_default())
+        .unwrap_or_else(|_| restricted_fallback_client())
 }
 
 /// Builds a default HTTP blocking client with standard Bitwarden client headers and the specified timeout.
 pub fn build_http_client(timeout: Duration) -> Client {
-    build_http_client_for_url(timeout, None, None)
-        .unwrap_or_else(|_| Client::builder().build().unwrap_or_default())
+    build_http_client_for_url(timeout, None, None).unwrap_or_else(|_| restricted_fallback_client())
 }
 
 /// Builds an HTTP blocking client optionally targeting a specific server URL for mTLS client certificate presentation.
@@ -789,9 +880,14 @@ pub fn build_http_client_for_url_with_config(
         reqwest::header::HeaderValue::from_static(BITWARDEN_DEVICE_TYPE),
     );
 
+    // Redirects are never followed: a redirect could carry credentials or the
+    // password hash to another origin. HTTPS is mandatory unless the target is
+    // an explicit http:// loopback address (for example a local Vaultwarden).
     let mut builder = Client::builder()
         .default_headers(default_headers)
-        .timeout(timeout);
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(!permits_plaintext_http(target_url));
 
     // Gated mTLS Identity Attachment
     let loaded_cfg;
@@ -807,8 +903,8 @@ pub fn build_http_client_for_url_with_config(
         cfg.client_cert_server.as_deref(),
     ) {
         let should_attach = match target_url {
-            Some(t_url) => crate::attachment::is_same_origin(cert_server, t_url),
-            None => crate::attachment::is_same_origin(cert_server, &cfg.server_url),
+            Some(t_url) => crate::origin::is_same_origin(cert_server, t_url),
+            None => crate::origin::is_same_origin(cert_server, &cfg.server_url),
         };
 
         if should_attach {
@@ -874,7 +970,7 @@ impl BitwardenApiClient {
             config_override,
         ) {
             Ok(c) => (c, None),
-            Err(e) => (Client::builder().build().unwrap_or_default(), Some(e)),
+            Err(e) => (restricted_fallback_client(), Some(e)),
         };
         Self {
             server_url: urls.base_url.clone(),
@@ -951,18 +1047,7 @@ impl BitwardenApiClient {
         new_device_otp: Option<&str>,
     ) -> Result<(TokenResponse, SymmetricCryptoKey), ApiError> {
         let prelogin = self.prelogin(email)?;
-        let kdf_type = KdfType::from(prelogin.kdf.unwrap_or(0));
-        let iterations = prelogin.kdf_iterations.unwrap_or(600_000);
-
-        let master_key = derive_master_key(
-            email,
-            password,
-            kdf_type,
-            iterations,
-            prelogin.kdf_memory,
-            prelogin.kdf_parallelism,
-        )
-        .map_err(|e| ApiError::Crypto(e.to_string()))?;
+        let master_key = prelogin.derive_master_key(email, password)?;
 
         let password_hash = derive_master_password_hash(&master_key, password);
 
@@ -1010,9 +1095,10 @@ impl BitwardenApiClient {
                 let parsed_enc_key =
                     EncString::parse(enc_user_key).map_err(|e| ApiError::Crypto(e.to_string()))?;
 
-                let decrypted_raw_user_key =
+                let decrypted_raw_user_key = zeroize::Zeroizing::new(
                     SymmetricCryptoKey::decrypt_with_master_key(&parsed_enc_key, &master_key)
-                        .map_err(|e| ApiError::Crypto(format!("{:?}", e)))?;
+                        .map_err(|e| ApiError::Crypto(format!("{:?}", e)))?,
+                );
 
                 let user_key = SymmetricCryptoKey::from_raw_bytes(&decrypted_raw_user_key)
                     .map_err(|e| ApiError::Crypto(format!("{:?}", e)))?;
@@ -1192,18 +1278,7 @@ impl BitwardenApiClient {
     /// Triggers sending a two-factor verification code to the user's email address.
     pub fn send_two_factor_email(&self, email: &str, password: &str) -> Result<(), ApiError> {
         let prelogin = self.prelogin(email)?;
-        let kdf_type = KdfType::from(prelogin.kdf.unwrap_or(0));
-        let iterations = prelogin.kdf_iterations.unwrap_or(600_000);
-
-        let master_key = derive_master_key(
-            email,
-            password,
-            kdf_type,
-            iterations,
-            prelogin.kdf_memory,
-            prelogin.kdf_parallelism,
-        )
-        .map_err(|e| ApiError::Crypto(e.to_string()))?;
+        let master_key = prelogin.derive_master_key(email, password)?;
 
         let password_hash = derive_master_password_hash(&master_key, password);
 
@@ -1386,8 +1461,533 @@ pub fn decrypt_cipher_string(
     }
 }
 
+/// Organization keys are wrapped with the user's RSA public key (EncString
+/// types 3 to 6). Symmetric wrapping (types 0 to 2) is refused: Bitwarden
+/// never issues it, and accepting it would let a server substitute an
+/// organization key of its choosing encrypted under the user key.
+fn decrypt_organization_key(
+    encrypted_key: &str,
+    rsa_private_key: Option<&rsa::RsaPrivateKey>,
+) -> Option<SymmetricCryptoKey> {
+    let enc_str = EncString::parse(encrypted_key).ok()?;
+    if !matches!(enc_str.enc_type, 3..=6) {
+        return None;
+    }
+    let key_bytes = zeroize::Zeroizing::new(enc_str.decrypt_rsa(rsa_private_key?).ok()?);
+    crate::crypto::parse_symmetric_key_from_decrypted_bytes(&key_bytes)
+}
+
+type OrganizationKeys = HashMap<String, SymmetricCryptoKey>;
+type OrganizationNames = HashMap<String, String>;
+
+fn decrypt_organization_keys(
+    organizations: &[Value],
+    rsa_private_key: Option<&rsa::RsaPrivateKey>,
+) -> (OrganizationKeys, OrganizationNames) {
+    let mut org_keys = HashMap::new();
+    let mut org_names = HashMap::new();
+    for org in organizations {
+        let Some(org_id) = org.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if let Some(org_name) = org.get("name").and_then(|v| v.as_str()) {
+            org_names.insert(org_id.to_string(), org_name.to_string());
+        }
+        let encrypted_key = org.get("key").and_then(|v| v.as_str());
+        match encrypted_key.and_then(|k| decrypt_organization_key(k, rsa_private_key)) {
+            Some(key) => {
+                org_keys.insert(org_id.to_string(), key);
+            }
+            None => crate::log_warn!(
+                "omawarden:api",
+                "Organization {} key is missing or not RSA-wrapped; its items will be skipped",
+                org_id
+            ),
+        }
+    }
+    (org_keys, org_names)
+}
+
+/// Resolves the key protecting a cipher's fields. An organization item is
+/// decrypted only with its organization key, never with the user key; when
+/// that key is unavailable the item is reported as undecryptable.
+fn resolve_cipher_key(
+    cipher: &Value,
+    organization_id: Option<&str>,
+    org_keys: &OrganizationKeys,
+    user_key: &SymmetricCryptoKey,
+) -> Result<SymmetricCryptoKey, String> {
+    let base_key = match organization_id {
+        Some(oid) => org_keys
+            .get(oid)
+            .ok_or_else(|| format!("organization {} key is unavailable", oid))?,
+        None => user_key,
+    };
+    let encrypted_item_key = cipher
+        .get("key")
+        .and_then(|v| v.as_str())
+        .filter(|k| !k.is_empty());
+    let Some(encrypted_item_key) = encrypted_item_key else {
+        return Ok(base_key.clone());
+    };
+    decrypt_item_key(encrypted_item_key, base_key)
+        .ok_or_else(|| "item key could not be decrypted".to_string())
+}
+
+/// Decrypts a per-item key, which must be a 64-byte enc+mac key.
+fn decrypt_item_key(
+    encrypted_item_key: &str,
+    base_key: &SymmetricCryptoKey,
+) -> Option<SymmetricCryptoKey> {
+    let enc_str = EncString::parse(encrypted_item_key).ok()?;
+    let key_bytes = zeroize::Zeroizing::new(enc_str.decrypt(base_key).ok()?);
+    crate::crypto::parse_symmetric_key_from_decrypted_bytes(&key_bytes)
+}
+
 pub fn decrypt_sync_ciphers(ciphers: &[Value], user_key: &SymmetricCryptoKey) -> Vec<VaultItem> {
     decrypt_sync_ciphers_with_context(ciphers, &[], &[], user_key, None)
+}
+
+/// Keys and names shared by every cipher of one sync payload.
+struct CipherDecryptionContext<'a> {
+    folder_names: &'a HashMap<String, String>,
+    org_keys: &'a OrganizationKeys,
+    org_names: &'a OrganizationNames,
+    user_key: &'a SymmetricCryptoKey,
+}
+
+fn decrypt_folder_names(
+    folders: &[Value],
+    user_key: &SymmetricCryptoKey,
+) -> HashMap<String, String> {
+    let mut folder_names = HashMap::new();
+    for folder in folders {
+        let Some(folder_id) = folder.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let name = decrypt_cipher_string(folder.get("name").and_then(|v| v.as_str()), user_key)
+            .unwrap_or_else(|| "Folder".to_string());
+        folder_names.insert(folder_id.to_string(), name);
+    }
+    folder_names
+}
+
+/// Decrypts the user's RSA private key. The DER bytes are zeroized as soon
+/// as the key is parsed; `RsaPrivateKey` zeroizes its own components.
+fn decrypt_user_private_key(
+    enc_private_key: Option<&str>,
+    user_key: &SymmetricCryptoKey,
+) -> Option<rsa::RsaPrivateKey> {
+    let parsed = EncString::parse(enc_private_key?).ok()?;
+    let der_bytes = zeroize::Zeroizing::new(parsed.decrypt(user_key).ok()?);
+    crate::crypto::parse_rsa_private_key_der(&der_bytes).ok()
+}
+
+fn is_soft_deleted(cipher: &Value) -> bool {
+    cipher
+        .get("deletedDate")
+        .or_else(|| cipher.get("DeletedDate"))
+        .is_some_and(|v| !v.is_null())
+}
+
+/// The first string value among `keys` of `object`.
+fn first_string(object: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(|v| v.as_str()))
+        .map(str::to_string)
+}
+
+/// The first value among `keys` of any of `objects`, in order.
+fn first_present<'a>(objects: &[&'a Value], keys: &[&str]) -> Option<&'a Value> {
+    objects
+        .iter()
+        .find_map(|object| keys.iter().find_map(|key| object.get(*key)))
+}
+
+/// A decrypted string moved into a JSON value without an intermediate copy
+/// (`json!` would serialize a copy and drop the original unzeroized).
+fn decrypted_value(text: Option<String>) -> Value {
+    text.map_or(Value::Null, Value::String)
+}
+
+/// Decrypts the named EncString fields of `object` into a JSON map.
+fn decrypt_named_fields(
+    object: &Value,
+    names: &[&str],
+    key: &SymmetricCryptoKey,
+) -> Map<String, Value> {
+    names
+        .iter()
+        .map(|name| {
+            let text = decrypt_cipher_string(object.get(*name).and_then(|v| v.as_str()), key);
+            ((*name).to_string(), decrypted_value(text))
+        })
+        .collect()
+}
+
+/// The type-specific section (`login`, `card`, `identity`) of a cipher.
+fn cipher_section<'a>(cipher: &'a Value, lower: &str, upper: &str) -> Option<&'a Value> {
+    cipher
+        .get(lower)
+        .or_else(|| cipher.get(upper))
+        .filter(|v| !v.is_null())
+}
+
+fn decrypt_login_uris(login: &Value, key: &SymmetricCryptoKey) -> Value {
+    let uris = login.get("uris").and_then(|v| v.as_array());
+    let decrypted = uris.into_iter().flatten().map(|uri| {
+        let text = decrypt_cipher_string(uri.get("uri").and_then(|v| v.as_str()), key);
+        let mut entry = Map::new();
+        entry.insert("uri".to_string(), decrypted_value(text));
+        Value::Object(entry)
+    });
+    Value::Array(decrypted.collect())
+}
+
+fn decrypt_password_history(cipher: &Value, login: &Value, key: &SymmetricCryptoKey) -> Value {
+    let history = first_present(
+        &[cipher, login],
+        &["passwordHistory", "password_history", "PasswordHistory"],
+    )
+    .and_then(|v| v.as_array());
+    let entries = history.into_iter().flatten().filter_map(|entry| {
+        let password = decrypt_cipher_string(entry.get("password").and_then(|v| v.as_str()), key)?;
+        let last_used = first_string(entry, &["lastUsedDate", "last_used_date", "LastUsedDate"]);
+        let mut decrypted = Map::new();
+        decrypted.insert("password".to_string(), Value::String(password));
+        decrypted.insert("last_used_date".to_string(), Value::from(last_used));
+        Some(Value::Object(decrypted))
+    });
+    Value::Array(entries.collect())
+}
+
+/// Whether the login carries a passkey, and when the first one was created.
+fn passkey_metadata(login: &Value) -> (bool, Option<String>) {
+    let credentials = login
+        .get("fido2Credentials")
+        .or_else(|| login.get("fido2_credentials"))
+        .and_then(|v| v.as_array())
+        .filter(|credentials| !credentials.is_empty());
+    let Some(credentials) = credentials else {
+        return (false, None);
+    };
+    let created_at = credentials
+        .first()
+        .and_then(|first| first_string(first, &["creationDate", "creation_date"]));
+    (true, created_at)
+}
+
+fn decrypt_login(cipher: &Value, key: &SymmetricCryptoKey) -> Option<Value> {
+    let login = cipher_section(cipher, "login", "Login")?;
+    let mut decrypted = decrypt_named_fields(login, &["username", "password", "totp"], key);
+    decrypted.insert("uris".to_string(), decrypt_login_uris(login, key));
+    decrypted.insert(
+        "password_history".to_string(),
+        decrypt_password_history(cipher, login, key),
+    );
+    let (has_passkey, passkey_created_at) = passkey_metadata(login);
+    decrypted.insert("has_passkey".to_string(), Value::Bool(has_passkey));
+    decrypted.insert(
+        "passkey_created_at".to_string(),
+        Value::from(passkey_created_at),
+    );
+    Some(Value::Object(decrypted))
+}
+
+const CARD_FIELDS: &[&str] = &[
+    "cardholderName",
+    "brand",
+    "number",
+    "expMonth",
+    "expYear",
+    "code",
+];
+
+const IDENTITY_FIELDS: &[&str] = &[
+    "title",
+    "firstName",
+    "middleName",
+    "lastName",
+    "address1",
+    "address2",
+    "city",
+    "state",
+    "postalCode",
+    "country",
+    "company",
+    "email",
+    "phone",
+    "ssn",
+    "username",
+    "passportNumber",
+    "licenseNumber",
+];
+
+fn decrypt_card(cipher: &Value, key: &SymmetricCryptoKey) -> Option<Value> {
+    let card = cipher_section(cipher, "card", "Card")?;
+    Some(Value::Object(decrypt_named_fields(card, CARD_FIELDS, key)))
+}
+
+fn decrypt_identity(cipher: &Value, key: &SymmetricCryptoKey) -> Option<Value> {
+    let identity = cipher_section(cipher, "identity", "Identity")?;
+    Some(Value::Object(decrypt_named_fields(
+        identity,
+        IDENTITY_FIELDS,
+        key,
+    )))
+}
+
+fn decrypt_custom_fields(cipher: &Value, key: &SymmetricCryptoKey) -> Vec<Value> {
+    let fields = cipher.get("fields").and_then(|v| v.as_array());
+    fields
+        .into_iter()
+        .flatten()
+        .map(|field| {
+            let name = decrypt_cipher_string(field.get("name").and_then(|v| v.as_str()), key)
+                .unwrap_or_default();
+            let value = decrypt_cipher_string(field.get("value").and_then(|v| v.as_str()), key)
+                .unwrap_or_default();
+            let field_type = crate::item_redaction::custom_field_type(field);
+            let mut decrypted = Map::new();
+            decrypted.insert("name".to_string(), Value::String(name));
+            decrypted.insert("value".to_string(), Value::String(value));
+            decrypted.insert("type".to_string(), Value::from(field_type));
+            Value::Object(decrypted)
+        })
+        .collect()
+}
+
+fn cipher_type_name(item_type: i64) -> &'static str {
+    match item_type {
+        2 => "note",
+        3 => "card",
+        4 => "identity",
+        _ => "login",
+    }
+}
+
+fn text_of<'a>(section: Option<&'a Value>, key: &str) -> &'a str {
+    section
+        .and_then(|s| s.get(key))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+}
+
+/// "Visa •••• 4444" style subtitle. The suffix appears only for a number
+/// long enough that four digits do not reveal it (see item_redaction).
+fn card_sub_title(card: Option<&Value>) -> String {
+    let Some(card) = card else {
+        return "Payment Card".to_string();
+    };
+    let brand = card.get("brand").and_then(|v| v.as_str()).unwrap_or("Card");
+    let last_four = crate::item_redaction::card_number_last_four(text_of(Some(card), "number"));
+    match last_four {
+        Some(last_four) if !brand.is_empty() && brand != "Card" => {
+            format!("{} •••• {}", brand, last_four)
+        }
+        Some(last_four) => format!("•••• {}", last_four),
+        None if !brand.is_empty() => brand.to_string(),
+        None => "Payment Card".to_string(),
+    }
+}
+
+fn identity_full_name(identity: &Value) -> String {
+    ["title", "firstName", "middleName", "lastName"]
+        .iter()
+        .map(|key| text_of(Some(identity), key))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn identity_sub_title(identity: Option<&Value>) -> String {
+    let Some(identity) = identity else {
+        return "Identity".to_string();
+    };
+    let full_name = identity_full_name(identity);
+    if !full_name.is_empty() {
+        return full_name;
+    }
+    let fallback = identity
+        .get("email")
+        .and_then(|v| v.as_str())
+        .or_else(|| identity.get("username").and_then(|v| v.as_str()));
+    match fallback {
+        Some(text) if !text.is_empty() => text.to_string(),
+        _ => "Identity".to_string(),
+    }
+}
+
+fn compose_sub_title(item_type: i64, sections: &DecryptedSections) -> String {
+    match item_type {
+        2 => "Secure Note".to_string(),
+        3 => card_sub_title(sections.card.as_ref()),
+        4 => identity_sub_title(sections.identity.as_ref()),
+        _ => text_of(sections.login.as_ref(), "username").to_string(),
+    }
+}
+
+/// Identity fields that are searchable. The SSN, passport and licence
+/// numbers are secrets and are never searchable (ADR 0027).
+const SEARCHABLE_IDENTITY_FIELDS: &[&str] = &[
+    "firstName",
+    "lastName",
+    "email",
+    "phone",
+    "username",
+    "company",
+    "address1",
+    "city",
+];
+
+fn login_search_tokens(login: &Value, tokens: &mut Vec<String>) {
+    tokens.push(text_of(Some(login), "username").to_lowercase());
+    let uris = login.get("uris").and_then(|v| v.as_array());
+    for uri in uris.into_iter().flatten() {
+        tokens.push(text_of(Some(uri), "uri").to_lowercase());
+    }
+}
+
+fn card_search_tokens(card: &Value, tokens: &mut Vec<String>) {
+    tokens.push(text_of(Some(card), "brand").to_lowercase());
+    tokens.push(text_of(Some(card), "cardholderName").to_lowercase());
+    if let Some(last_four) =
+        crate::item_redaction::card_number_last_four(text_of(Some(card), "number"))
+    {
+        tokens.push(last_four);
+    }
+}
+
+fn custom_field_search_tokens(fields: &[Value], tokens: &mut Vec<String>) {
+    for field in fields {
+        tokens.push(text_of(Some(field), "name").to_lowercase());
+        let field_type = crate::item_redaction::custom_field_type(field);
+        if crate::item_redaction::custom_field_value_is_public(field_type) {
+            tokens.push(text_of(Some(field), "value").to_lowercase());
+        }
+    }
+}
+
+/// Lower-cased search text built from non-secret content only: notes, card
+/// numbers and codes, identity document numbers, passwords, TOTP seeds and
+/// hidden custom field values are excluded, so `search` cannot be used as
+/// an oracle for secret content (ADR 0027).
+fn build_search_text(item: &VaultItem) -> String {
+    let mut tokens = vec![item.name.to_lowercase(), item.sub_title.to_lowercase()];
+    if let Some(login) = item.login.as_ref() {
+        login_search_tokens(login, &mut tokens);
+    }
+    if let Some(card) = item.card.as_ref() {
+        card_search_tokens(card, &mut tokens);
+    }
+    if let Some(identity) = item.identity.as_ref() {
+        for key in SEARCHABLE_IDENTITY_FIELDS {
+            tokens.push(text_of(Some(identity), key).to_lowercase());
+        }
+    }
+    custom_field_search_tokens(&item.fields, &mut tokens);
+    for name in [&item.folder_name, &item.organization_name]
+        .into_iter()
+        .flatten()
+    {
+        tokens.push(name.to_lowercase());
+    }
+    tokens.retain(|token| !token.is_empty());
+    tokens.join(" ")
+}
+
+/// The decrypted type-specific sections of one cipher; only the section of
+/// the cipher's own type is ever populated.
+struct DecryptedSections {
+    login: Option<Value>,
+    card: Option<Value>,
+    identity: Option<Value>,
+}
+
+fn decrypt_sections(cipher: &Value, item_type: i64, key: &SymmetricCryptoKey) -> DecryptedSections {
+    DecryptedSections {
+        login: (item_type == 1)
+            .then(|| decrypt_login(cipher, key))
+            .flatten(),
+        card: (item_type == 3)
+            .then(|| decrypt_card(cipher, key))
+            .flatten(),
+        identity: (item_type == 4)
+            .then(|| decrypt_identity(cipher, key))
+            .flatten(),
+    }
+}
+
+/// Decrypts one cipher into a vault item, or `None` when it is deleted, of
+/// an unlisted type, or its key is unavailable.
+fn decrypt_cipher_item(cipher: &Value, context: &CipherDecryptionContext) -> Option<VaultItem> {
+    if is_soft_deleted(cipher) {
+        return None;
+    }
+    let id = first_string(cipher, &["id"]).unwrap_or_default();
+    let item_type = cipher.get("type").and_then(|v| v.as_i64()).unwrap_or(1);
+    if !crate::vault::is_listed_cipher_type(item_type) {
+        return None;
+    }
+    let organization_id = first_string(cipher, &["organizationId"]);
+    let cipher_key = resolve_cipher_key(
+        cipher,
+        organization_id.as_deref(),
+        context.org_keys,
+        context.user_key,
+    )
+    .map_err(|reason| crate::log_warn!("omawarden:api", "Skipping item {}: {}", id, reason))
+    .ok()?;
+
+    let name = decrypt_cipher_string(cipher.get("name").and_then(|v| v.as_str()), &cipher_key)
+        .unwrap_or_else(|| "Untitled".to_string());
+    let notes = decrypt_cipher_string(cipher.get("notes").and_then(|v| v.as_str()), &cipher_key);
+    let sections = decrypt_sections(cipher, item_type, &cipher_key);
+    let sub_title = compose_sub_title(item_type, &sections);
+    let folder_id = first_string(cipher, &["folderId"]);
+    let folder_name = folder_id
+        .as_ref()
+        .and_then(|fid| context.folder_names.get(fid).cloned());
+    let organization_name = organization_id
+        .as_ref()
+        .and_then(|oid| context.org_names.get(oid).cloned());
+    let collection_ids = cipher
+        .get("collectionIds")
+        .and_then(|v| v.as_array())
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        });
+
+    let mut item = VaultItem {
+        id,
+        name,
+        item_type,
+        type_name: cipher_type_name(item_type).to_string(),
+        sub_title,
+        notes,
+        favorite: cipher
+            .get("favorite")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        created_at: first_string(cipher, &["creationDate", "creation_date", "created_at"]),
+        updated_at: first_string(cipher, &["revisionDate", "revision_date", "updated_at"]),
+        folder_id,
+        folder_name,
+        organization_id,
+        organization_name,
+        collection_ids,
+        login: sections.login,
+        card: sections.card,
+        identity: sections.identity,
+        fields: decrypt_custom_fields(cipher, &cipher_key),
+        search_text: String::new(),
+    };
+    item.search_text = build_search_text(&item);
+    Some(item)
 }
 
 pub fn decrypt_sync_ciphers_with_context(
@@ -1397,669 +1997,25 @@ pub fn decrypt_sync_ciphers_with_context(
     user_key: &SymmetricCryptoKey,
     enc_private_key: Option<&str>,
 ) -> Vec<VaultItem> {
-    use std::collections::HashMap;
-
-    // 1. Decrypt Folders
-    let mut folder_map: HashMap<String, String> = HashMap::new();
-    for f in folders {
-        if let Some(fid) = f.get("id").and_then(|v| v.as_str()) {
-            let fname = decrypt_cipher_string(f.get("name").and_then(|v| v.as_str()), user_key)
-                .unwrap_or_else(|| "Folder".to_string());
-            folder_map.insert(fid.to_string(), fname);
-        }
-    }
-
-    // 2. Decrypt User RSA Private Key
-    let rsa_priv_key: Option<rsa::RsaPrivateKey> = if let Some(enc_priv) = enc_private_key {
-        if let Ok(enc_priv_str) = EncString::parse(enc_priv) {
-            if let Ok(der_bytes) = enc_priv_str.decrypt(user_key) {
-                crate::crypto::parse_rsa_private_key_der(&der_bytes).ok()
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
+    let folder_names = decrypt_folder_names(folders, user_key);
+    let rsa_private_key = decrypt_user_private_key(enc_private_key, user_key);
+    let (org_keys, org_names) = decrypt_organization_keys(organizations, rsa_private_key.as_ref());
+    let context = CipherDecryptionContext {
+        folder_names: &folder_names,
+        org_keys: &org_keys,
+        org_names: &org_names,
+        user_key,
     };
-
-    // 3. Decrypt Organization Keys & Names
-    let mut org_keys: HashMap<String, SymmetricCryptoKey> = HashMap::new();
-    let mut org_names: HashMap<String, String> = HashMap::new();
-    for org in organizations {
-        if let Some(org_id) = org.get("id").and_then(|v| v.as_str()) {
-            if let Some(org_name) = org.get("name").and_then(|v| v.as_str()) {
-                org_names.insert(org_id.to_string(), org_name.to_string());
-            }
-            if let Some(org_key_enc) = org.get("key").and_then(|v| v.as_str()) {
-                if let Ok(enc_str) = EncString::parse(org_key_enc) {
-                    let raw_key = match enc_str.enc_type {
-                        3..=6 => {
-                            if let Some(ref rsa) = rsa_priv_key {
-                                enc_str.decrypt_rsa(rsa).ok()
-                            } else {
-                                None
-                            }
-                        }
-                        0..=2 => enc_str.decrypt(user_key).ok(),
-                        _ => None,
-                    };
-                    if let Some(key_bytes) = raw_key {
-                        if let Some(sym_key) =
-                            crate::crypto::parse_symmetric_key_from_decrypted_bytes(&key_bytes)
-                        {
-                            org_keys.insert(org_id.to_string(), sym_key);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut items = Vec::new();
-
-    for c in ciphers {
-        // Filter out soft-deleted items (items in Trash / Recycle Bin)
-        let is_deleted = c
-            .get("deletedDate")
-            .or_else(|| c.get("DeletedDate"))
-            .map(|v| !v.is_null())
-            .unwrap_or(false);
-        if is_deleted {
-            continue;
-        }
-
-        let id = c
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let item_type = c.get("type").and_then(|v| v.as_i64()).unwrap_or(1);
-        let favorite = c.get("favorite").and_then(|v| v.as_bool()).unwrap_or(false);
-        let created_at = c
-            .get("creationDate")
-            .or_else(|| c.get("creation_date"))
-            .or_else(|| c.get("created_at"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let updated_at = c
-            .get("revisionDate")
-            .or_else(|| c.get("revision_date"))
-            .or_else(|| c.get("updated_at"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        // Folder metadata
-        let folder_id = c
-            .get("folderId")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let folder_name = folder_id
-            .as_ref()
-            .and_then(|fid| folder_map.get(fid).cloned());
-
-        // Organization metadata & key resolution
-        let org_id_opt = c
-            .get("organizationId")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let org_name_opt = org_id_opt
-            .as_ref()
-            .and_then(|oid| org_names.get(oid).cloned());
-
-        let collection_ids = c
-            .get("collectionIds")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect::<Vec<_>>()
-            });
-
-        // Determine base key for this cipher: org_key if org-owned, else user_key
-        let base_key = if let Some(ref oid) = org_id_opt {
-            org_keys.get(oid).unwrap_or(user_key)
-        } else {
-            user_key
-        };
-
-        // Determine item key: if cipher has an encrypted key, decrypt it using base_key or user_key
-        let mut cipher_key = base_key.clone();
-        if let Some(enc_key_str) = c.get("key").and_then(|v| v.as_str()) {
-            if let Ok(parsed_k) = EncString::parse(enc_key_str) {
-                let raw_k = parsed_k
-                    .decrypt(base_key)
-                    .or_else(|_| parsed_k.decrypt(user_key));
-                if let Ok(raw_k_bytes) = raw_k {
-                    if let Some(k) =
-                        crate::crypto::parse_symmetric_key_from_decrypted_bytes(&raw_k_bytes)
-                    {
-                        cipher_key = k;
-                    }
-                }
-            }
-        }
-
-        let name = decrypt_cipher_string(c.get("name").and_then(|v| v.as_str()), &cipher_key)
-            .unwrap_or_else(|| "Untitled".to_string());
-        let notes = decrypt_cipher_string(c.get("notes").and_then(|v| v.as_str()), &cipher_key);
-
-        // Decrypt login details if present
-        let mut login_val: Option<Value> = None;
-        if item_type == 1 {
-            if let Some(login_obj) = c.get("login").or_else(|| c.get("Login")) {
-                if !login_obj.is_null() {
-                    let user = decrypt_cipher_string(
-                        login_obj.get("username").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let pwd = decrypt_cipher_string(
-                        login_obj.get("password").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let totp = decrypt_cipher_string(
-                        login_obj.get("totp").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-
-                    let mut uris_decrypted = Vec::new();
-                    if let Some(uris_arr) = login_obj.get("uris").and_then(|v| v.as_array()) {
-                        for u in uris_arr {
-                            let uri_str = decrypt_cipher_string(
-                                u.get("uri").and_then(|v| v.as_str()),
-                                &cipher_key,
-                            );
-                            uris_decrypted.push(json!({ "uri": uri_str }));
-                        }
-                    }
-
-                    let mut password_history = Vec::new();
-                    let raw_hist_arr = c
-                        .get("passwordHistory")
-                        .or_else(|| c.get("password_history"))
-                        .or_else(|| c.get("PasswordHistory"))
-                        .or_else(|| login_obj.get("passwordHistory"))
-                        .or_else(|| login_obj.get("password_history"))
-                        .or_else(|| login_obj.get("PasswordHistory"))
-                        .and_then(|v| v.as_array());
-
-                    if let Some(hist_arr) = raw_hist_arr {
-                        for h in hist_arr {
-                            let hist_pwd = decrypt_cipher_string(
-                                h.get("password").and_then(|v| v.as_str()),
-                                &cipher_key,
-                            );
-                            let last_used = h
-                                .get("lastUsedDate")
-                                .or_else(|| h.get("last_used_date"))
-                                .or_else(|| h.get("LastUsedDate"))
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            if let Some(p) = hist_pwd {
-                                password_history.push(json!({
-                                    "password": p,
-                                    "last_used_date": last_used,
-                                }));
-                            }
-                        }
-                    }
-
-                    let mut has_passkey = false;
-                    let mut passkey_created_at: Option<String> = None;
-                    if let Some(fido2_arr) = login_obj
-                        .get("fido2Credentials")
-                        .or_else(|| login_obj.get("fido2_credentials"))
-                        .and_then(|v| v.as_array())
-                    {
-                        if !fido2_arr.is_empty() {
-                            has_passkey = true;
-                            if let Some(first_fido) = fido2_arr.first() {
-                                if let Some(created) = first_fido
-                                    .get("creationDate")
-                                    .or_else(|| first_fido.get("creation_date"))
-                                    .and_then(|v| v.as_str())
-                                {
-                                    passkey_created_at = Some(created.to_string());
-                                }
-                            }
-                        }
-                    }
-
-                    login_val = Some(json!({
-                        "username": user,
-                        "password": pwd,
-                        "totp": totp,
-                        "uris": uris_decrypted,
-                        "password_history": password_history,
-                        "has_passkey": has_passkey,
-                        "passkey_created_at": passkey_created_at,
-                    }));
-                }
-            }
-        }
-
-        // Decrypt card details if present
-        let mut card_val: Option<Value> = None;
-        if item_type == 3 {
-            if let Some(card_obj) = c.get("card").or_else(|| c.get("Card")) {
-                if !card_obj.is_null() {
-                    let cardholder_name = decrypt_cipher_string(
-                        card_obj.get("cardholderName").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let brand = decrypt_cipher_string(
-                        card_obj.get("brand").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let number = decrypt_cipher_string(
-                        card_obj.get("number").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let exp_month = decrypt_cipher_string(
-                        card_obj.get("expMonth").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let exp_year = decrypt_cipher_string(
-                        card_obj.get("expYear").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let code = decrypt_cipher_string(
-                        card_obj.get("code").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-
-                    card_val = Some(json!({
-                        "cardholderName": cardholder_name,
-                        "brand": brand,
-                        "number": number,
-                        "expMonth": exp_month,
-                        "expYear": exp_year,
-                        "code": code,
-                    }));
-                }
-            }
-        }
-
-        // Decrypt identity details if present
-        let mut identity_val: Option<Value> = None;
-        if item_type == 4 {
-            if let Some(id_obj) = c.get("identity").or_else(|| c.get("Identity")) {
-                if !id_obj.is_null() {
-                    let title = decrypt_cipher_string(
-                        id_obj.get("title").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let first_name = decrypt_cipher_string(
-                        id_obj.get("firstName").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let middle_name = decrypt_cipher_string(
-                        id_obj.get("middleName").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let last_name = decrypt_cipher_string(
-                        id_obj.get("lastName").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let address1 = decrypt_cipher_string(
-                        id_obj.get("address1").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let address2 = decrypt_cipher_string(
-                        id_obj.get("address2").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let city = decrypt_cipher_string(
-                        id_obj.get("city").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let state = decrypt_cipher_string(
-                        id_obj.get("state").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let postal_code = decrypt_cipher_string(
-                        id_obj.get("postalCode").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let country = decrypt_cipher_string(
-                        id_obj.get("country").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let company = decrypt_cipher_string(
-                        id_obj.get("company").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let email = decrypt_cipher_string(
-                        id_obj.get("email").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let phone = decrypt_cipher_string(
-                        id_obj.get("phone").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let ssn = decrypt_cipher_string(
-                        id_obj.get("ssn").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let username = decrypt_cipher_string(
-                        id_obj.get("username").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let passport_number = decrypt_cipher_string(
-                        id_obj.get("passportNumber").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let license_number = decrypt_cipher_string(
-                        id_obj.get("licenseNumber").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-
-                    identity_val = Some(json!({
-                        "title": title,
-                        "firstName": first_name,
-                        "middleName": middle_name,
-                        "lastName": last_name,
-                        "address1": address1,
-                        "address2": address2,
-                        "city": city,
-                        "state": state,
-                        "postalCode": postal_code,
-                        "country": country,
-                        "company": company,
-                        "email": email,
-                        "phone": phone,
-                        "ssn": ssn,
-                        "username": username,
-                        "passportNumber": passport_number,
-                        "licenseNumber": license_number,
-                    }));
-                }
-            }
-        }
-
-        let mut ssh_key_val: Option<SshMetadata> = None;
-        if item_type == 5 {
-            if let Some(ssh_obj) = c.get("sshKey").or_else(|| c.get("SshKey")) {
-                if !ssh_obj.is_null() {
-                    let priv_k = decrypt_cipher_string(
-                        ssh_obj.get("privateKey").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let pub_k = decrypt_cipher_string(
-                        ssh_obj.get("publicKey").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    let fp = decrypt_cipher_string(
-                        ssh_obj.get("keyFingerprint").and_then(|v| v.as_str()),
-                        &cipher_key,
-                    );
-                    ssh_key_val = Some(parse_ssh_key_fields(priv_k, pub_k, fp));
-                }
-            }
-        }
-
-        // Decrypt fields if present
-        let mut fields_decrypted = Vec::new();
-        if let Some(fields_arr) = c.get("fields").and_then(|v| v.as_array()) {
-            for f in fields_arr {
-                let fname =
-                    decrypt_cipher_string(f.get("name").and_then(|v| v.as_str()), &cipher_key)
-                        .unwrap_or_default();
-                let fval =
-                    decrypt_cipher_string(f.get("value").and_then(|v| v.as_str()), &cipher_key)
-                        .unwrap_or_default();
-                let ftype = f.get("type").and_then(|v| v.as_i64()).unwrap_or(0);
-                fields_decrypted.push(json!({
-                    "name": fname,
-                    "value": fval,
-                    "type": ftype,
-                }));
-            }
-        }
-
-        // Attachments metadata
-        let mut attachments_decrypted = Vec::new();
-        if let Some(att_arr) = c.get("attachments").and_then(|v| v.as_array()) {
-            for att in att_arr {
-                let fname = decrypt_cipher_string(
-                    att.get("fileName").and_then(|v| v.as_str()),
-                    &cipher_key,
-                )
-                .unwrap_or_default();
-                let att_id = att
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let size = att
-                    .get("size")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("0")
-                    .to_string();
-                let url = att
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                attachments_decrypted.push(json!({
-                    "id": att_id,
-                    "fileName": fname,
-                    "size": size,
-                    "url": url,
-                }));
-            }
-        }
-
-        let type_name = match item_type {
-            1 => "login",
-            2 => "note",
-            3 => "card",
-            4 => "identity",
-            5 => "ssh_key",
-            _ => "login",
-        }
-        .to_string();
-
-        let sub_title = match item_type {
-            1 => {
-                if let Some(ref l) = login_val {
-                    l.get("username")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string()
-                } else {
-                    String::new()
-                }
-            }
-            2 => "Secure Note".to_string(),
-            3 => {
-                if let Some(ref c) = card_val {
-                    let num = c.get("number").and_then(|v| v.as_str()).unwrap_or("");
-                    let brand = c.get("brand").and_then(|v| v.as_str()).unwrap_or("Card");
-                    if num.len() >= 4 {
-                        let last4 = &num[num.len() - 4..];
-                        if !brand.is_empty() && brand != "Card" {
-                            format!("{} •••• {}", brand, last4)
-                        } else {
-                            format!("•••• {}", last4)
-                        }
-                    } else if !brand.is_empty() {
-                        brand.to_string()
-                    } else {
-                        "Payment Card".to_string()
-                    }
-                } else {
-                    "Payment Card".to_string()
-                }
-            }
-            4 => {
-                if let Some(ref id) = identity_val {
-                    let full_name = format!(
-                        "{} {} {} {}",
-                        id.get("title").and_then(|v| v.as_str()).unwrap_or(""),
-                        id.get("firstName").and_then(|v| v.as_str()).unwrap_or(""),
-                        id.get("middleName").and_then(|v| v.as_str()).unwrap_or(""),
-                        id.get("lastName").and_then(|v| v.as_str()).unwrap_or("")
-                    )
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ");
-
-                    if !full_name.is_empty() {
-                        full_name
-                    } else if let Some(em) = id.get("email").and_then(|v| v.as_str()) {
-                        if !em.is_empty() {
-                            em.to_string()
-                        } else {
-                            "Identity".to_string()
-                        }
-                    } else if let Some(un) = id.get("username").and_then(|v| v.as_str()) {
-                        if !un.is_empty() {
-                            un.to_string()
-                        } else {
-                            "Identity".to_string()
-                        }
-                    } else {
-                        "Identity".to_string()
-                    }
-                } else {
-                    "Identity".to_string()
-                }
-            }
-            5 => {
-                if let Some(ref s) = ssh_key_val {
-                    format!("SSH Key ({})", s.key_type)
-                } else {
-                    "SSH Key".to_string()
-                }
-            }
-            _ => {
-                if let Some(ref l) = login_val {
-                    l.get("username")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string()
-                } else {
-                    String::new()
-                }
-            }
-        };
-
-        let mut search_tokens = vec![
-            name.to_lowercase(),
-            notes.clone().unwrap_or_default().to_lowercase(),
-        ];
-        if !sub_title.is_empty() {
-            search_tokens.push(sub_title.to_lowercase());
-        }
-        if let Some(ref l) = login_val {
-            if let Some(u) = l.get("username").and_then(|v| v.as_str()) {
-                search_tokens.push(u.to_lowercase());
-            }
-            if let Some(uris) = l.get("uris").and_then(|v| v.as_array()) {
-                for u in uris {
-                    if let Some(u_str) = u.get("uri").and_then(|v| v.as_str()) {
-                        search_tokens.push(u_str.to_lowercase());
-                    }
-                }
-            }
-        }
-        if let Some(ref c) = card_val {
-            if let Some(b) = c.get("brand").and_then(|v| v.as_str()) {
-                search_tokens.push(b.to_lowercase());
-            }
-            if let Some(num) = c.get("number").and_then(|v| v.as_str()) {
-                search_tokens.push(num.to_lowercase());
-            }
-            if let Some(ch) = c.get("cardholderName").and_then(|v| v.as_str()) {
-                search_tokens.push(ch.to_lowercase());
-            }
-        }
-        if let Some(ref id) = identity_val {
-            for k in [
-                "firstName",
-                "lastName",
-                "email",
-                "phone",
-                "username",
-                "company",
-                "address1",
-                "city",
-                "ssn",
-            ] {
-                if let Some(val) = id.get(k).and_then(|v| v.as_str()) {
-                    search_tokens.push(val.to_lowercase());
-                }
-            }
-        }
-        if item_type == 5 {
-            search_tokens.push("ssh".to_string());
-            search_tokens.push("ssh key".to_string());
-            if let Some(ref s) = ssh_key_val {
-                search_tokens.push(s.key_type.to_lowercase());
-                if let Some(ref pubk) = s.public_key {
-                    search_tokens.push(pubk.to_lowercase());
-                }
-                if let Some(ref fp) = s.fingerprint {
-                    search_tokens.push(fp.to_lowercase());
-                }
-            }
-        }
-        for f in &fields_decrypted {
-            if let Some(fn_str) = f.get("name").and_then(|v| v.as_str()) {
-                search_tokens.push(fn_str.to_lowercase());
-            }
-            if let Some(fv_str) = f.get("value").and_then(|v| v.as_str()) {
-                search_tokens.push(fv_str.to_lowercase());
-            }
-        }
-        for att in &attachments_decrypted {
-            if let Some(fn_str) = att.get("fileName").and_then(|v| v.as_str()) {
-                search_tokens.push(fn_str.to_lowercase());
-            }
-        }
-        if let Some(ref fn_name) = folder_name {
-            search_tokens.push(fn_name.to_lowercase());
-        }
-        if let Some(ref on_name) = org_name_opt {
-            search_tokens.push(on_name.to_lowercase());
-        }
-
-        let search_text = search_tokens.join(" ");
-
-        items.push(VaultItem {
-            id,
-            name,
-            item_type,
-            type_name,
-            sub_title,
-            notes,
-            favorite,
-            created_at,
-            updated_at,
-            folder_id,
-            folder_name,
-            organization_id: org_id_opt,
-            organization_name: org_name_opt,
-            collection_ids,
-            login: if item_type == 1 { login_val } else { None },
-            card: if item_type == 3 { card_val } else { None },
-            identity: if item_type == 4 { identity_val } else { None },
-            ssh_key: if item_type == 5 { ssh_key_val } else { None },
-            fields: fields_decrypted,
-            attachments: attachments_decrypted,
-            search_text,
-        });
-    }
-
-    items
+    ciphers
+        .iter()
+        .filter_map(|cipher| decrypt_cipher_item(cipher, &context))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::{derive_master_key, KdfType};
     use aes::Aes256;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
@@ -2129,6 +2085,43 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_field_without_a_type_decrypts_as_hidden_and_is_not_searchable() {
+        let user_key = SymmetricCryptoKey::from_raw_bytes(&[5u8; 64]).unwrap();
+        let ciphers = vec![json!({
+            "id": "cipher-untyped-field",
+            "type": 1,
+            "name": encrypt_test_string("Untyped field", &user_key),
+            "login": {},
+            "fields": [
+                {
+                    "name": encrypt_test_string("Recovery", &user_key),
+                    "value": encrypt_test_string("untypedfieldvalue", &user_key)
+                },
+                {
+                    "name": encrypt_test_string("Label", &user_key),
+                    "value": encrypt_test_string("typedtextvalue", &user_key),
+                    "type": 0
+                }
+            ]
+        })];
+        let items = decrypt_sync_ciphers(&ciphers, &user_key);
+        assert_eq!(items.len(), 1);
+        let fields = &items[0].fields;
+        assert_eq!(
+            fields[0]["type"],
+            crate::item_redaction::CUSTOM_FIELD_TYPE_HIDDEN
+        );
+        assert_eq!(
+            fields[1]["type"],
+            crate::item_redaction::CUSTOM_FIELD_TYPE_TEXT
+        );
+        assert!(!items[0].search_text.contains("untypedfieldvalue"));
+        assert!(items[0].search_text.contains("typedtextvalue"));
+        let view = crate::item_redaction::redact_item(&items[0]);
+        assert!(!view.to_string().contains("untypedfieldvalue"));
+    }
+
+    #[test]
     fn test_decrypt_card_and_identity_ciphers() {
         let raw_user_key = [7u8; 64];
         let user_key = SymmetricCryptoKey::from_raw_bytes(&raw_user_key).unwrap();
@@ -2182,7 +2175,6 @@ mod tests {
         assert_eq!(items[0].sub_title, "Visa •••• 4444");
         assert!(items[0].login.is_none());
         assert!(items[0].identity.is_none());
-        assert!(items[0].ssh_key.is_none());
         let card = items[0].card.as_ref().unwrap();
         assert_eq!(card.get("cardholderName").unwrap(), "Alice Doe");
         assert_eq!(card.get("brand").unwrap(), "Visa");
@@ -2195,7 +2187,6 @@ mod tests {
         assert_eq!(items[1].sub_title, "Alice Doe");
         assert!(items[1].login.is_none());
         assert!(items[1].card.is_none());
-        assert!(items[1].ssh_key.is_none());
         let id_val = items[1].identity.as_ref().unwrap();
         assert_eq!(id_val.get("firstName").unwrap(), "Alice");
         assert_eq!(id_val.get("lastName").unwrap(), "Doe");
@@ -2211,7 +2202,6 @@ mod tests {
         assert!(items[2].login.is_none());
         assert!(items[2].card.is_none());
         assert!(items[2].identity.is_none());
-        assert!(items[2].ssh_key.is_none());
         assert_eq!(
             items[2].notes.as_deref(),
             Some("Mnemonic: alpha beta gamma delta")
@@ -2273,45 +2263,93 @@ mod tests {
     }
 
     #[test]
-    fn test_decrypt_organization_ciphers() {
+    fn test_symmetric_wrapped_organization_key_is_rejected() {
         let raw_user_key = [11u8; 64];
         let user_key = SymmetricCryptoKey::from_raw_bytes(&raw_user_key).unwrap();
 
         let raw_org_key = [12u8; 64];
         let org_key = SymmetricCryptoKey::from_raw_bytes(&raw_org_key).unwrap();
 
-        // Encrypt org key with user_key (CipherType 2: AES-CBC)
-        let enc_org_key =
-            encrypt_test_string(std::str::from_utf8(&raw_org_key).unwrap_or(""), &user_key);
+        // Organization key wrapped with the user key (EncString type 2)
+        // instead of the user's RSA public key.
+        let enc_org_key = user_key.encrypt(&raw_org_key).unwrap();
 
         let organizations = vec![json!({
             "id": "org-789",
             "name": "Acme Global",
-            "key": format!("2.{}", &enc_org_key[2..]),
+            "key": enc_org_key,
         })];
 
-        // Organization cipher encrypted with org_key
         let ciphers = vec![json!({
             "id": "org-cipher-1",
             "type": 4,
             "organizationId": "org-789",
             "name": encrypt_test_string("Corporate Identity", &org_key),
-            "identity": {
-                "firstName": encrypt_test_string("Bob", &org_key),
-                "lastName": encrypt_test_string("Acme", &org_key),
-                "company": encrypt_test_string("Acme Global Inc", &org_key),
-            }
         })];
 
         let items =
             decrypt_sync_ciphers_with_context(&ciphers, &[], &organizations, &user_key, None);
+        assert!(
+            items.is_empty(),
+            "an organization key wrapped symmetrically must not be accepted"
+        );
+    }
+
+    #[test]
+    fn test_organization_item_with_missing_key_is_skipped_not_decrypted_with_user_key() {
+        let user_key = SymmetricCryptoKey::from_raw_bytes(&[13u8; 64]).unwrap();
+
+        // The item claims an organization whose key is absent, but its fields
+        // are encrypted under the user key. It must not be decrypted.
+        let ciphers = vec![
+            json!({
+                "id": "org-cipher-missing-key",
+                "type": 2,
+                "organizationId": "org-without-key",
+                "name": encrypt_test_string("Should not decrypt", &user_key),
+            }),
+            json!({
+                "id": "personal-cipher",
+                "type": 2,
+                "name": encrypt_test_string("Personal note", &user_key),
+            }),
+        ];
+        let organizations = vec![json!({ "id": "org-without-key", "name": "No Key Org" })];
+
+        let items =
+            decrypt_sync_ciphers_with_context(&ciphers, &[], &organizations, &user_key, None);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].name, "Corporate Identity");
-        assert_eq!(items[0].organization_id.as_deref(), Some("org-789"));
-        assert_eq!(items[0].organization_name.as_deref(), Some("Acme Global"));
-        assert_eq!(items[0].sub_title, "Bob Acme");
-        assert!(items[0].identity.is_some());
-        assert!(items[0].search_text.contains("acme global"));
+        assert_eq!(items[0].id, "personal-cipher");
+        assert_eq!(items[0].name, "Personal note");
+    }
+
+    #[test]
+    fn test_item_key_requires_64_byte_key_and_never_falls_back_to_user_key() {
+        let user_key = SymmetricCryptoKey::from_raw_bytes(&[14u8; 64]).unwrap();
+
+        // A MAC-less 32-byte item key is refused, so the item is skipped
+        // instead of being shown with fields decrypted under another key.
+        let short_item_key = user_key.encrypt(&[15u8; 32]).unwrap();
+        let ciphers = vec![json!({
+            "id": "cipher-short-item-key",
+            "type": 2,
+            "key": short_item_key,
+            "name": encrypt_test_string("Short key item", &user_key),
+        })];
+        assert!(decrypt_sync_ciphers(&ciphers, &user_key).is_empty());
+
+        // A valid 64-byte item key is honoured.
+        let raw_item_key = [16u8; 64];
+        let item_key = SymmetricCryptoKey::from_raw_bytes(&raw_item_key).unwrap();
+        let ciphers = vec![json!({
+            "id": "cipher-item-key",
+            "type": 2,
+            "key": user_key.encrypt(&raw_item_key).unwrap(),
+            "name": encrypt_test_string("Item key item", &item_key),
+        })];
+        let items = decrypt_sync_ciphers(&ciphers, &user_key);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Item key item");
     }
 
     #[test]
@@ -2347,17 +2385,30 @@ mod tests {
             "key": format!("4.{}", org_key_b64),
         })];
 
-        let ciphers = vec![json!({
-            "id": "cipher-rsa-4",
-            "type": 4,
-            "organizationId": "org-rsa-4",
-            "name": encrypt_test_string("Wang Shen Identity", &org_key),
-            "identity": {
-                "firstName": encrypt_test_string("Shen", &org_key),
-                "lastName": encrypt_test_string("Wang", &org_key),
-                "company": encrypt_test_string("LZSH Org", &org_key),
-            }
-        })];
+        // An organization item whose item key is wrapped with the user key
+        // instead of the organization key must be skipped, not decrypted.
+        let raw_item_key = [23u8; 64];
+        let item_key = SymmetricCryptoKey::from_raw_bytes(&raw_item_key).unwrap();
+        let ciphers = vec![
+            json!({
+                "id": "cipher-rsa-4",
+                "type": 4,
+                "organizationId": "org-rsa-4",
+                "name": encrypt_test_string("Wang Shen Identity", &org_key),
+                "identity": {
+                    "firstName": encrypt_test_string("Shen", &org_key),
+                    "lastName": encrypt_test_string("Wang", &org_key),
+                    "company": encrypt_test_string("LZSH Org", &org_key),
+                }
+            }),
+            json!({
+                "id": "cipher-item-key-under-user-key",
+                "type": 2,
+                "organizationId": "org-rsa-4",
+                "key": user_key.encrypt(&raw_item_key).unwrap(),
+                "name": encrypt_test_string("Wrongly wrapped item", &item_key),
+            }),
+        ];
 
         let items = decrypt_sync_ciphers_with_context(
             &ciphers,
@@ -2431,7 +2482,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decrypt_ssh_key_cipher_type_5() {
+    fn test_decrypt_sync_ciphers_omits_ssh_key_items() {
         let raw_user_key = [16u8; 64];
         let user_key = SymmetricCryptoKey::from_raw_bytes(&raw_user_key).unwrap();
 
@@ -2455,32 +2506,13 @@ mod tests {
         ];
 
         let items = decrypt_sync_ciphers(&ciphers, &user_key);
-        assert_eq!(items.len(), 2);
 
-        // Cipher Type 5
-        assert_eq!(items[0].type_name, "ssh_key");
-        assert_eq!(items[0].sub_title, "SSH Key (ED25519)");
-        let ssh_meta = items[0].ssh_key.as_ref().unwrap();
-        assert_eq!(ssh_meta.key_type, "ED25519");
-        assert!(ssh_meta
-            .public_key
-            .as_ref()
-            .unwrap()
-            .starts_with("ssh-ed25519"));
-        assert!(ssh_meta
-            .private_key
-            .as_ref()
-            .unwrap()
-            .contains("BEGIN OPENSSH"));
-        assert_eq!(
-            ssh_meta.fingerprint.as_deref(),
-            Some("SHA256:fingerprint123456")
-        );
-
-        // Cipher Type 2 (Note) remains Note!
-        assert_eq!(items[1].type_name, "note");
-        assert_eq!(items[1].sub_title, "Secure Note");
-        assert!(items[1].ssh_key.is_none());
+        // The SSH key cipher (type 5) is not listed; the note that mentions a
+        // key in its text is still an ordinary secure note.
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "cipher-note-2");
+        assert_eq!(items[0].type_name, "note");
+        assert_eq!(items[0].sub_title, "Secure Note");
     }
 
     #[test]
@@ -2806,6 +2838,51 @@ mod tests {
     }
 
     #[test]
+    fn test_login_password_refuses_out_of_range_prelogin_kdf() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_url = format!("http://127.0.0.1:{}", port);
+
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                if req.contains("/accounts/prelogin") {
+                    let body = r#"{"kdf":0,"kdfIterations":5000}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    break;
+                }
+            }
+        });
+
+        let client = BitwardenApiClient::new(&server_url);
+        let err = client
+            .login_password("user@example.com", "password", None, None, None)
+            .unwrap_err();
+        let _ = handle.join();
+
+        // Refused before any password hash is sent to the token endpoint.
+        let message = err.to_string();
+        assert!(matches!(err, ApiError::Crypto(_)), "{message}");
+        assert!(message.contains("KDF parameters rejected"), "{message}");
+        let user_visible = crate::auth::sanitize_auth_error(Some(&message));
+        assert!(
+            user_visible.contains("PBKDF2 iterations 5000 is outside the accepted range"),
+            "{user_visible}"
+        );
+    }
+
+    #[test]
     fn test_client_prelogin_fallback_from_identity_to_api() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -2992,6 +3069,44 @@ mod tests {
     }
 
     #[test]
+    fn test_device_identifier_is_random_v4_persisted_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join(DEVICE_IDENTIFIER_FILENAME);
+
+        let first = load_or_create_device_identifier(&path);
+        assert!(is_canonical_uuid(&first));
+        assert_eq!(&first[14..15], "4", "UUID version must be 4");
+        assert!(matches!(&first[19..20], "8" | "9" | "a" | "b"));
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+
+        // Stable across calls.
+        assert_eq!(load_or_create_device_identifier(&path), first);
+
+        // Not derived from the host machine identifier.
+        if let Ok(machine_id) = std::fs::read_to_string("/etc/machine-id") {
+            let compact: String = first.chars().filter(|c| *c != '-').collect();
+            assert_ne!(compact, machine_id.trim());
+        }
+    }
+
+    #[test]
+    fn test_device_identifier_replaces_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DEVICE_IDENTIFIER_FILENAME);
+        std::fs::write(&path, "not-a-uuid\n").unwrap();
+
+        let identifier = load_or_create_device_identifier(&path);
+        assert!(is_canonical_uuid(&identifier));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), identifier);
+        assert!(!is_canonical_uuid("0123456789abcdef0123456789abcdef"));
+        assert!(!is_canonical_uuid("0123456789abcdef0123456789abcdef----"));
+    }
+
+    #[test]
     fn test_get_device_identifier_format() {
         let id = get_device_identifier();
         assert_eq!(id.len(), 36);
@@ -3091,7 +3206,7 @@ mod tests {
         let password = "master_password";
         let master_key =
             derive_master_key(email, password, KdfType::Pbkdf2Sha256, 100_000, None, None).unwrap();
-        let sym_key = SymmetricCryptoKey::from_master_key(&master_key);
+        let sym_key = SymmetricCryptoKey::stretch_master_key(&master_key).unwrap();
 
         let iv = [3u8; 16];
         let plaintext = [4u8; 64];
@@ -3203,7 +3318,7 @@ mod tests {
         let password = "master_password";
         let master_key =
             derive_master_key(email, password, KdfType::Pbkdf2Sha256, 100_000, None, None).unwrap();
-        let sym_key = SymmetricCryptoKey::from_master_key(&master_key);
+        let sym_key = SymmetricCryptoKey::stretch_master_key(&master_key).unwrap();
 
         let iv = [3u8; 16];
         let plaintext = [4u8; 64];
@@ -3308,7 +3423,7 @@ mod tests {
         let password = "master_password";
         let master_key =
             derive_master_key(email, password, KdfType::Pbkdf2Sha256, 100_000, None, None).unwrap();
-        let sym_key = SymmetricCryptoKey::from_master_key(&master_key);
+        let sym_key = SymmetricCryptoKey::stretch_master_key(&master_key).unwrap();
 
         let iv = [5u8; 16];
         let plaintext = [6u8; 64];
@@ -3541,10 +3656,11 @@ mod tests {
     #[test]
     fn test_build_http_client_default_headers_and_timeout() {
         use std::io::{Read, Write};
-        let client = build_http_client(Duration::from_secs(5));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server_url = format!("http://127.0.0.1:{}", port);
+        let client =
+            build_http_client_for_url(Duration::from_secs(5), None, Some(&server_url)).unwrap();
 
         let handle = std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
@@ -3715,10 +3831,12 @@ mod tests {
     fn test_build_http_client_with_context_wire_headers() {
         use std::io::{Read, Write};
         let ctx = ClientContext::new("Omarchy_Bitwarden", "0.11.2");
-        let client = build_http_client_with_context(Duration::from_secs(5), Some(&ctx));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server_url = format!("http://127.0.0.1:{}", port);
+        let client =
+            build_http_client_for_url(Duration::from_secs(5), Some(&ctx), Some(&server_url))
+                .unwrap();
 
         let handle = std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
@@ -3740,6 +3858,72 @@ mod tests {
         let res = client.get(&server_url).send();
         assert!(res.is_ok());
         let _ = handle.join();
+    }
+
+    #[test]
+    fn test_permits_plaintext_http_only_for_loopback_targets() {
+        assert!(permits_plaintext_http(Some("http://localhost:8080")));
+        assert!(permits_plaintext_http(Some("http://127.0.0.1:8000")));
+        assert!(permits_plaintext_http(Some("http://[::1]:8000")));
+        assert!(!permits_plaintext_http(Some("http://vault.example.com")));
+        assert!(!permits_plaintext_http(Some("https://localhost")));
+        assert!(!permits_plaintext_http(Some("localhost:8080")));
+        assert!(!permits_plaintext_http(None));
+    }
+
+    #[test]
+    fn test_http_client_refuses_plaintext_for_non_loopback_target() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = build_http_client_for_url(
+            Duration::from_secs(2),
+            None,
+            Some("https://vault.example.com"),
+        )
+        .unwrap();
+        let res = client.get(format!("http://127.0.0.1:{}", port)).send();
+        assert!(res.is_err(), "HTTPS-only client must refuse an http:// URL");
+
+        let untargeted = build_http_client(Duration::from_secs(2));
+        let res = untargeted.get(format!("http://127.0.0.1:{}", port)).send();
+        assert!(res.is_err(), "untargeted client must require HTTPS");
+    }
+
+    #[test]
+    fn test_http_client_does_not_follow_redirects() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_url = format!("http://127.0.0.1:{}", port);
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&request_count);
+
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let location = format!("http://127.0.0.1:{}/followed", port);
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    location
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let client =
+            build_http_client_for_url(Duration::from_secs(5), None, Some(&server_url)).unwrap();
+        let res = client
+            .post(format!("{}/identity/connect/token", server_url))
+            .send()
+            .unwrap();
+        let _ = handle.join();
+        assert_eq!(res.status(), reqwest::StatusCode::FOUND);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

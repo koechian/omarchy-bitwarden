@@ -1,5 +1,7 @@
 # ADR 0024: Vault-Backed OpenSSH Agent with Notification Prompts
 
+> **Removed in this fork.** koechian/omarchy-bitwarden no longer includes the vault-backed SSH agent. This record is kept for history only.
+
 ## Status
 Proposed
 

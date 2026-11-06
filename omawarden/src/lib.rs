@@ -1,20 +1,25 @@
 pub mod api;
-pub mod attachment;
 pub mod auth;
 pub mod clipboard;
 pub mod config;
 pub mod crypto;
 pub mod daemon;
+pub mod daemon_actions;
+pub mod daemon_requests;
 pub mod fs_util;
 pub mod generator;
 pub mod health;
 pub mod hook;
+pub mod item_redaction;
 pub mod keyring;
 pub mod locked;
 pub mod logging;
+pub mod origin;
+pub mod peer_identity;
 pub mod polkit;
-pub mod ssh;
-pub mod ssh_agent;
+pub mod secret_access;
+pub mod secret_memory;
+pub mod session_supervision;
 pub mod storage;
 pub mod totp;
 pub mod vault;
@@ -28,6 +33,16 @@ pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A temporary directory with mode 0700, usable as `XDG_RUNTIME_DIR` (the
+/// daemon refuses a runtime directory with any other mode).
+#[cfg(test)]
+pub(crate) fn private_runtime_dir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    dir
 }
 
 /// Writes an executable test script from a child process.

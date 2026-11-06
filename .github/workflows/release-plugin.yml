@@ -34,7 +34,9 @@ jobs:
 
           tar -czvf "dist/${ARCHIVE_NAME}.tar.gz" \
             OmarchyBitwarden.qml \
+            BitwardenBarWidget.qml \
             components \
+            i18n \
             scripts \
             manifest.json \
             preview.png \
