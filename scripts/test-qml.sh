@@ -6,11 +6,13 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 cd "${ROOT_DIR}"
 
-echo "=== 1. Checking Static Gates (colors, module manifest) ==="
+echo "=== 1. Checking Static Gates (colors, module manifest, text format) ==="
 python3 "${ROOT_DIR}/scripts/check-hardcoded-colors.py"
 python3 "${ROOT_DIR}/scripts/check-hardcoded-colors.py" --self-test
 python3 "${ROOT_DIR}/scripts/check-qml-module.py"
 python3 "${ROOT_DIR}/scripts/check-qml-module.py" --self-test
+python3 "${ROOT_DIR}/scripts/check-qml-text-format.py"
+python3 "${ROOT_DIR}/scripts/check-qml-text-format.py" --self-test
 
 if command -v qmllint >/dev/null 2>&1; then
   echo "=== 2. Running QML Lint ==="
@@ -20,7 +22,7 @@ if command -v qmllint >/dev/null 2>&1; then
   # and prints nothing for a file it cannot parse, and linting the whole tree
   # in one call hides that silence behind the warnings of every other file.
   lint_failures=0
-  for qml_file in OmarchyBitwarden.qml components/*.qml; do
+  for qml_file in OmarchyBitwarden.qml BitwardenBarWidget.qml components/*.qml; do
     file_status=0
     file_output=$(qmllint -I components "${qml_file}" 2>&1) || file_status=$?
     if [ -n "${file_output}" ]; then
@@ -47,7 +49,11 @@ fi
 
 echo "=== 3. Running Standalone QML Test Suites ==="
 export QML_IMPORT_PATH="${ROOT_DIR}/tests/stubs${QML_IMPORT_PATH:+:${QML_IMPORT_PATH}}"
-export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
+# Run headless by default. A desktop session exports QT_QPA_PLATFORM
+# (wayland;xcb on Omarchy); inheriting it opens a window per suite, and a
+# window the compositor never exposes is never polished, so layout-dependent
+# assertions fail. QML_TEST_PLATFORM selects another platform deliberately.
+export QT_QPA_PLATFORM="${QML_TEST_PLATFORM:-offscreen}"
 # Qt drops QML console output when stderr is not a TTY (pipes, CI logs, agent
 # tooling), leaving a failing suite with an exit code and no diagnostic.
 export QT_ASSUME_STDERR_HAS_CONSOLE=1

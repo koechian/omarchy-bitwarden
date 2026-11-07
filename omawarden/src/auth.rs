@@ -372,11 +372,7 @@ impl AuthManager {
         two_factor_provider: Option<i32>,
         new_device_otp: Option<&str>,
     ) -> AuthResult {
-        crate::log_info!(
-            "omawarden:auth",
-            "Starting login with password for {}",
-            email
-        );
+        crate::log_info!("omawarden:auth", "Starting login with password");
         if !self.keyring_mgr.is_available() {
             let err_msg = "System keyring is not available. Keyring is required to securely store authentication tokens.";
             crate::log_error!("omawarden:auth", "{}", err_msg);
@@ -408,11 +404,7 @@ impl AuthManager {
                 providers,
                 providers2,
             }) => {
-                crate::log_info!(
-                    "omawarden:auth",
-                    "Two-factor authentication required for {}",
-                    email
-                );
+                crate::log_info!("omawarden:auth", "Two-factor authentication required");
 
                 // If WebAuthn (provider 7) is requested (or is the sole provider) and token was not provided,
                 // automatically attempt FIDO2 assertion with a connected security key.
@@ -507,11 +499,7 @@ impl AuthManager {
                 };
             }
             Err(crate::api::ApiError::NewDeviceVerificationRequired) => {
-                crate::log_info!(
-                    "omawarden:auth",
-                    "New device verification required for {}",
-                    email
-                );
+                crate::log_info!("omawarden:auth", "New device verification required");
                 return AuthResult {
                     ok: false,
                     status: Some("unauthenticated".to_string()),
@@ -532,7 +520,7 @@ impl AuthManager {
                     || err_msg.to_lowercase().contains("two-factor")
                     || err_msg.to_lowercase().contains("two factor")
                     || err_msg.to_lowercase().contains("2fa");
-                crate::log_warn!("omawarden:auth", "Login failed for {}: {}", email, err_msg);
+                crate::log_warn!("omawarden:auth", "Login failed: {}", err_msg);
                 return AuthResult {
                     ok: false,
                     status: Some("unauthenticated".to_string()),
@@ -641,25 +629,24 @@ impl AuthManager {
 
         let _ = self.storage_mgr.save(&storage);
 
+        // A configuration that fails to parse is left untouched rather than
+        // overwritten with defaults.
         if let Some(ref cm) = self.config_mgr {
-            let mut cfg = cm.load();
-            if cfg.remember_email {
-                cfg.email = email.trim().to_lowercase();
-                let _ = cm.save(&cfg);
+            if let Ok(mut cfg) = cm.try_load() {
+                if cfg.remember_email {
+                    cfg.email = email.trim().to_lowercase();
+                    let _ = cm.save(&cfg);
+                }
             }
         }
 
         // Auto-unlock daemon with decrypted items in memory
         crate::daemon::ensure_daemon_running();
-        let _ = crate::daemon::send_daemon_request(&serde_json::json!({
-            "action": "unlock",
-            "password": password
-        }));
+        let _ = crate::daemon::send_unlock_request(password);
 
         crate::log_info!(
             "omawarden:auth",
-            "Login successful for {}. Initial sync retrieved {} ciphers.",
-            email,
+            "Login successful. Initial sync retrieved {} ciphers.",
             storage.ciphers.len()
         );
 
@@ -681,11 +668,7 @@ impl AuthManager {
     }
 
     pub fn login_apikey(&self, client_id: &str, client_secret: &str) -> AuthResult {
-        crate::log_info!(
-            "omawarden:auth",
-            "Starting login with API Key client_id: {}",
-            client_id
-        );
+        crate::log_info!("omawarden:auth", "Starting login with an API key");
         if !self.keyring_mgr.is_available() {
             let err_msg = "System keyring is not available. Keyring is required to securely store authentication tokens.";
             crate::log_error!("omawarden:auth", "{}", err_msg);
@@ -802,47 +785,15 @@ impl AuthManager {
             storage.folders = sync_data.folders;
             storage.collections = sync_data.collections;
             if let Some(ref prof) = sync_data.profile {
-                if let Some(email) = prof.get("email").and_then(|v| v.as_str()) {
-                    storage.user_email = email.trim().to_lowercase();
-                }
-                if let Some(id) = prof.get("id").and_then(|v| v.as_str()) {
-                    storage.user_id = Some(id.to_string());
-                }
-                if storage.enc_user_key.is_none() {
-                    if let Some(key) = prof.get("key").and_then(|v| v.as_str()) {
-                        storage.enc_user_key = Some(key.to_string());
-                    }
-                }
-                if storage.enc_private_key.is_none() {
-                    if let Some(pk) = prof.get("privateKey").and_then(|v| v.as_str()) {
-                        storage.enc_private_key = Some(pk.to_string());
-                    }
-                }
-                if storage.kdf.is_none() {
-                    if let Some(kdf) = prof.get("kdf").and_then(|v| v.as_u64()) {
-                        storage.kdf = Some(kdf as u32);
-                    }
-                }
-                if storage.kdf_iterations.is_none() {
-                    if let Some(iter) = prof.get("kdfIterations").and_then(|v| v.as_u64()) {
-                        storage.kdf_iterations = Some(iter as u32);
-                    }
-                }
-                if storage.kdf_memory.is_none() {
-                    if let Some(mem) = prof.get("kdfMemory").and_then(|v| v.as_u64()) {
-                        storage.kdf_memory = Some(mem as u32);
-                    }
-                }
-                if storage.kdf_parallelism.is_none() {
-                    if let Some(par) = prof.get("kdfParallelism").and_then(|v| v.as_u64()) {
-                        storage.kdf_parallelism = Some(par as u32);
-                    }
-                }
-                if let Some(orgs) = prof.get("organizations").and_then(|v| v.as_array()) {
-                    storage.organizations = orgs.clone();
+                if let Err(rejection) = adopt_sync_profile(&mut storage, prof) {
+                    return self.abandon_apikey_login(&storage, client_id, &rejection);
                 }
             }
             storage.last_sync = Some(chrono::Utc::now().to_rfc3339());
+        }
+
+        if let Err(rejection) = validate_stored_kdf(&storage) {
+            return self.abandon_apikey_login(&storage, client_id, &rejection);
         }
 
         if storage.user_email.is_empty() {
@@ -852,10 +803,11 @@ impl AuthManager {
         let _ = self.storage_mgr.save(&storage);
 
         if let Some(ref cm) = self.config_mgr {
-            let mut cfg = cm.load();
-            if cfg.remember_email && cfg.email.is_empty() && !storage.user_email.is_empty() {
-                cfg.email = storage.user_email.clone();
-                let _ = cm.save(&cfg);
+            if let Ok(mut cfg) = cm.try_load() {
+                if cfg.remember_email && cfg.email.is_empty() && !storage.user_email.is_empty() {
+                    cfg.email = storage.user_email.clone();
+                    let _ = cm.save(&cfg);
+                }
             }
         }
 
@@ -865,6 +817,34 @@ impl AuthManager {
             ok: true,
             status: Some("locked".to_string()),
             session: Some(token_resp.access_token),
+            ..Default::default()
+        }
+    }
+
+    /// Ends an API-key login whose key derivation settings were refused:
+    /// removes the credentials already stored in the keyring and saves
+    /// nothing, so no account is left half logged in.
+    fn abandon_apikey_login(
+        &self,
+        storage: &VaultStorage,
+        client_id: &str,
+        rejection: &crate::crypto::CryptoError,
+    ) -> AuthResult {
+        let s_url = if storage.server_url.is_empty() {
+            &self.server_url
+        } else {
+            &storage.server_url
+        };
+        self.keyring_mgr.clear_token(s_url, KIND_ACCESS_TOKEN);
+        self.keyring_mgr.clear_token(s_url, KIND_REFRESH_TOKEN);
+        self.keyring_mgr.clear_api_secret(s_url, client_id.trim());
+        let err_msg = format!("The server's key derivation settings were refused: {rejection}");
+        crate::log_warn!("omawarden:auth", "{}", err_msg);
+        AuthResult {
+            ok: false,
+            status: Some("unauthenticated".to_string()),
+            session: None,
+            error: Some(err_msg),
             ..Default::default()
         }
     }
@@ -910,10 +890,7 @@ impl AuthManager {
 
                 // Auto-unlock daemon with decrypted items in memory
                 crate::daemon::ensure_daemon_running();
-                let _ = crate::daemon::send_daemon_request(&serde_json::json!({
-                    "action": "unlock",
-                    "password": password
-                }));
+                let _ = crate::daemon::send_unlock_request(password);
 
                 crate::log_info!("omawarden:auth", "Vault unlocked successfully.");
 
@@ -948,7 +925,6 @@ impl AuthManager {
         let _ = crate::daemon::send_daemon_request(&serde_json::json!({
             "action": "lock"
         }));
-        crate::attachment::clear_preview_attachments(None);
         crate::log_info!("omawarden:auth", "Vault locked.");
         AuthResult {
             ok: true,
@@ -971,7 +947,6 @@ impl AuthManager {
         let _ = crate::daemon::send_daemon_request(&serde_json::json!({
             "action": "lock"
         }));
-        crate::attachment::clear_preview_attachments(None);
         crate::log_info!(
             "omawarden:auth",
             "Account logged out and all keyring credentials cleared."
@@ -985,6 +960,88 @@ impl AuthManager {
     }
 }
 
+fn profile_text<'a>(profile: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    profile.get(key).and_then(serde_json::Value::as_str)
+}
+
+/// Copies what the initial sync profile of an API-key login adds to the
+/// token response: email and id, and the keys and KDF parameters the token
+/// response left out. Fails when a KDF value does not fit its type.
+fn adopt_sync_profile(
+    storage: &mut VaultStorage,
+    profile: &serde_json::Value,
+) -> Result<(), crate::crypto::CryptoError> {
+    if let Some(email) = profile_text(profile, "email") {
+        storage.user_email = email.trim().to_lowercase();
+    }
+    if let Some(id) = profile_text(profile, "id") {
+        storage.user_id = Some(id.to_string());
+    }
+    if storage.enc_user_key.is_none() {
+        storage.enc_user_key = profile_text(profile, "key").map(str::to_string);
+    }
+    if storage.enc_private_key.is_none() {
+        storage.enc_private_key = profile_text(profile, "privateKey").map(str::to_string);
+    }
+    adopt_profile_kdf(storage, profile)?;
+    if let Some(orgs) = profile
+        .get("organizations")
+        .and_then(serde_json::Value::as_array)
+    {
+        storage.organizations = orgs.clone();
+    }
+    Ok(())
+}
+
+/// Fills the KDF parameters the token response left out. Every value is
+/// converted with a range check; nothing is assigned unless all convert.
+fn adopt_profile_kdf(
+    storage: &mut VaultStorage,
+    profile: &serde_json::Value,
+) -> Result<(), crate::crypto::CryptoError> {
+    let kdf = stored_or_profile_u32(storage.kdf, profile, "kdf")?;
+    let iterations = stored_or_profile_u32(storage.kdf_iterations, profile, "kdfIterations")?;
+    let memory = stored_or_profile_u32(storage.kdf_memory, profile, "kdfMemory")?;
+    let parallelism = stored_or_profile_u32(storage.kdf_parallelism, profile, "kdfParallelism")?;
+    storage.kdf = kdf;
+    storage.kdf_iterations = iterations;
+    storage.kdf_memory = memory;
+    storage.kdf_parallelism = parallelism;
+    Ok(())
+}
+
+/// The stored value when there is one, otherwise the profile's value,
+/// refused (instead of truncated) when it does not fit in `u32`.
+fn stored_or_profile_u32(
+    stored: Option<u32>,
+    profile: &serde_json::Value,
+    key: &str,
+) -> Result<Option<u32>, crate::crypto::CryptoError> {
+    if stored.is_some() {
+        return Ok(stored);
+    }
+    let Some(raw) = profile.get(key).and_then(serde_json::Value::as_u64) else {
+        return Ok(None);
+    };
+    u32::try_from(raw).map(Some).map_err(|_| {
+        crate::crypto::CryptoError::KdfParametersRejected(format!(
+            "{key} {raw} is outside the accepted range"
+        ))
+    })
+}
+
+/// The bounds check the prelogin and unlock paths apply, run on the KDF
+/// parameters an API-key login is about to store.
+fn validate_stored_kdf(storage: &VaultStorage) -> Result<(), crate::crypto::CryptoError> {
+    crate::crypto::KdfParameters::from_server_values(
+        storage.kdf,
+        storage.kdf_iterations,
+        storage.kdf_memory,
+        storage.kdf_parallelism,
+    )?
+    .validate()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,6 +1053,104 @@ mod tests {
         let script_path = dir.join("mock-secret-tool");
         crate::write_test_executable(&script_path, "#!/bin/sh\nexit 0\n");
         KeyringManager::new(script_path.to_str().unwrap())
+    }
+
+    #[test]
+    fn test_profile_kdf_values_are_range_checked_instead_of_truncated() {
+        let truncating = serde_json::json!({
+            "kdf": 0,
+            "kdfIterations": u64::from(u32::MAX) + 1 + 600_000,
+        });
+        let mut storage = VaultStorage::default();
+        assert!(adopt_sync_profile(&mut storage, &truncating).is_err());
+        assert_eq!(
+            storage.kdf, None,
+            "nothing is adopted from a refused profile"
+        );
+        assert_eq!(storage.kdf_iterations, None);
+
+        let valid = serde_json::json!({ "kdf": 0, "kdfIterations": 600_000 });
+        let mut storage = VaultStorage::default();
+        adopt_sync_profile(&mut storage, &valid).unwrap();
+        assert_eq!(storage.kdf, Some(0));
+        assert_eq!(storage.kdf_iterations, Some(600_000));
+        assert!(validate_stored_kdf(&storage).is_ok());
+
+        let token_values_win = serde_json::json!({ "kdfIterations": 700_000 });
+        adopt_sync_profile(&mut storage, &token_values_win).unwrap();
+        assert_eq!(storage.kdf_iterations, Some(600_000));
+    }
+
+    #[test]
+    fn test_stored_kdf_validation_refuses_out_of_range_parameters() {
+        for (kdf, iterations, memory, parallelism) in [
+            (Some(0), Some(1), None, None),
+            (Some(1), Some(3), Some(1), Some(4)),
+            (Some(7), None, None, None),
+        ] {
+            let storage = VaultStorage {
+                kdf,
+                kdf_iterations: iterations,
+                kdf_memory: memory,
+                kdf_parallelism: parallelism,
+                ..Default::default()
+            };
+            assert!(
+                validate_stored_kdf(&storage).is_err(),
+                "{kdf:?} {iterations:?} {memory:?} {parallelism:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_login_apikey_refuses_a_profile_kdf_that_does_not_fit() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let dir = tempdir().unwrap();
+        let storage_path = dir.path().join("data_profile_kdf.json");
+        let storage_mgr = StorageManager::new(storage_path.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let oversized_iterations = u64::from(u32::MAX) + 1 + 600_000;
+        let handle = std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten().take(2) {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = if req.contains("POST /identity/connect/token") {
+                    r#"{"access_token":"synthetic_profile_token","token_type":"Bearer","Key":"2.dummy_iv|dummy_ct|dummy_mac"}"#.to_string()
+                } else {
+                    format!(
+                        r#"{{"ciphers":[],"folders":[],"collections":[],"profile":{{"email":"profile@example.test","kdf":0,"kdfIterations":{oversized_iterations}}}}}"#
+                    )
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let auth_mgr = AuthManager::new(
+            &server_url,
+            Some(storage_mgr.clone()),
+            Some(create_test_mock_keyring(dir.path())),
+        );
+        let res = auth_mgr.login_apikey("client.id", "client_secret");
+        assert!(!res.ok, "{:?}", res.error);
+        assert!(
+            res.error.as_deref().unwrap().contains("key derivation"),
+            "{:?}",
+            res.error
+        );
+        assert!(
+            !storage_path.exists(),
+            "a refused login saves nothing to storage"
+        );
+        let _ = handle.join();
     }
 
     #[test]
@@ -1082,6 +1237,8 @@ mod tests {
 
     #[test]
     fn test_auth_manager_status_and_lock() {
+        // Reaches the daemon socket of the current XDG_RUNTIME_DIR.
+        let _env = crate::env_lock();
         let dir = tempdir().unwrap();
         let storage_path = dir.path().join("test_auth_data.json");
         let storage_mgr = StorageManager::new(storage_path);
@@ -1147,6 +1304,8 @@ mod tests {
 
     #[test]
     fn test_login_password_endpoint_404_error() {
+        // Reaches the daemon socket of the current XDG_RUNTIME_DIR.
+        let _env = crate::env_lock();
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::thread;
@@ -1186,6 +1345,8 @@ mod tests {
 
     #[test]
     fn test_login_password_two_factor_required() {
+        // Reaches the daemon socket of the current XDG_RUNTIME_DIR.
+        let _env = crate::env_lock();
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::thread;
@@ -1244,6 +1405,8 @@ mod tests {
 
     #[test]
     fn test_login_password_webauthn_smart_default_provider_selection() {
+        // Reaches the daemon socket of the current XDG_RUNTIME_DIR.
+        let _env = crate::env_lock();
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::thread;
@@ -1304,6 +1467,8 @@ mod tests {
 
     #[test]
     fn test_auth_status_with_apikey_session() {
+        // Reaches the daemon socket of the current XDG_RUNTIME_DIR.
+        let _env = crate::env_lock();
         let dir = tempdir().unwrap();
         let storage_path = dir.path().join("test_apikey_status.json");
         let storage_mgr = StorageManager::new(storage_path.clone());
@@ -1357,6 +1522,8 @@ mod tests {
 
     #[test]
     fn test_auth_status_with_expired_token() {
+        // Reaches the daemon socket of the current XDG_RUNTIME_DIR.
+        let _env = crate::env_lock();
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
 
@@ -1401,6 +1568,8 @@ mod tests {
 
     #[test]
     fn test_auth_status_with_expired_token_but_renewable_via_api_secret() {
+        // Reaches the daemon socket of the current XDG_RUNTIME_DIR.
+        let _env = crate::env_lock();
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         use std::fs;
@@ -1508,6 +1677,8 @@ esac
 
     #[test]
     fn test_auth_status_token_auto_migration() {
+        // Reaches the daemon socket of the current XDG_RUNTIME_DIR.
+        let _env = crate::env_lock();
         use std::fs;
 
         let dir = tempdir().unwrap();
@@ -1609,6 +1780,8 @@ esac
 
     #[test]
     fn test_auth_status_token_migration_failure_preserves_disk_tokens() {
+        // Reaches the daemon socket of the current XDG_RUNTIME_DIR.
+        let _env = crate::env_lock();
         use std::fs;
 
         let dir = tempdir().unwrap();
@@ -1656,6 +1829,8 @@ esac
 
     #[test]
     fn test_auth_status_custom_server_url_precedence() {
+        // Reaches the daemon socket of the current XDG_RUNTIME_DIR.
+        let _env = crate::env_lock();
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         use std::fs;
@@ -1806,6 +1981,8 @@ esac
 
     #[test]
     fn test_login_password_persists_email_to_config_based_on_remember_email() {
+        // Reaches the daemon socket of the current XDG_RUNTIME_DIR.
+        let _env = crate::env_lock();
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::thread;
@@ -1824,8 +2001,8 @@ esac
         let email = "user@example.com";
         let password = "password123";
         let master_key =
-            derive_master_key(email, password, KdfType::Pbkdf2Sha256, 5000, None, None).unwrap();
-        let sym_key = SymmetricCryptoKey::from_master_key(&master_key);
+            derive_master_key(email, password, KdfType::Pbkdf2Sha256, 100_000, None, None).unwrap();
+        let sym_key = SymmetricCryptoKey::stretch_master_key(&master_key).unwrap();
 
         let iv = [1u8; 16];
         let plaintext = [2u8; 64];
@@ -1864,7 +2041,7 @@ esac
                 if req.contains("POST /identity/accounts/prelogin")
                     || req.contains("POST /api/accounts/prelogin")
                 {
-                    let body = r#"{"kdf":0,"kdfIterations":5000}"#;
+                    let body = r#"{"kdf":0,"kdfIterations":100000}"#;
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
@@ -1937,8 +2114,9 @@ esac
 
         let email2 = "other@example.com";
         let master_key2 =
-            derive_master_key(email2, password, KdfType::Pbkdf2Sha256, 5000, None, None).unwrap();
-        let sym_key2 = SymmetricCryptoKey::from_master_key(&master_key2);
+            derive_master_key(email2, password, KdfType::Pbkdf2Sha256, 100_000, None, None)
+                .unwrap();
+        let sym_key2 = SymmetricCryptoKey::stretch_master_key(&master_key2).unwrap();
         let enc2 = Aes256CbcEnc::new_from_slices(&sym_key2.enc_key, &iv).unwrap();
         let mut buf2 = vec![0u8; 128];
         let ct_len2 = enc2
@@ -1972,7 +2150,7 @@ esac
                 if req.contains("POST /identity/accounts/prelogin")
                     || req.contains("POST /api/accounts/prelogin")
                 {
-                    let body = r#"{"kdf":0,"kdfIterations":5000}"#;
+                    let body = r#"{"kdf":0,"kdfIterations":100000}"#;
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
@@ -2028,6 +2206,8 @@ esac
 
     #[test]
     fn test_login_keyring_unavailable_fails_closed() {
+        // Reaches the daemon socket of the current XDG_RUNTIME_DIR.
+        let _env = crate::env_lock();
         let dir = tempdir().unwrap();
         let storage_path = dir.path().join("data_unavailable.json");
         let storage_mgr = StorageManager::new(storage_path.clone());
@@ -2073,6 +2253,8 @@ esac
 
     #[test]
     fn test_login_password_keyring_store_failure_fails_closed() {
+        // Reaches the daemon socket of the current XDG_RUNTIME_DIR.
+        let _env = crate::env_lock();
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -2100,8 +2282,8 @@ esac
         let email = "test@example.com";
         let password = "password";
         let master_key =
-            derive_master_key(email, password, KdfType::Pbkdf2Sha256, 5000, None, None).unwrap();
-        let sym_key = SymmetricCryptoKey::from_master_key(&master_key);
+            derive_master_key(email, password, KdfType::Pbkdf2Sha256, 100_000, None, None).unwrap();
+        let sym_key = SymmetricCryptoKey::stretch_master_key(&master_key).unwrap();
         let iv = [1u8; 16];
         let enc = Aes256CbcEnc::new_from_slices(&sym_key.enc_key, &iv).unwrap();
         let mut buf = vec![0u8; 128];
@@ -2140,7 +2322,7 @@ esac
                 if req.contains("POST /identity/accounts/prelogin")
                     || req.contains("POST /api/accounts/prelogin")
                 {
-                    let body = r#"{"kdf":0,"kdfIterations":5000}"#;
+                    let body = r#"{"kdf":0,"kdfIterations":100000}"#;
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
@@ -2282,8 +2464,8 @@ esac
         let email = "daemon_test@example.com";
         let password = "password123";
         let master_key =
-            derive_master_key(email, password, KdfType::Pbkdf2Sha256, 5000, None, None).unwrap();
-        let sym_key = SymmetricCryptoKey::from_master_key(&master_key);
+            derive_master_key(email, password, KdfType::Pbkdf2Sha256, 100_000, None, None).unwrap();
+        let sym_key = SymmetricCryptoKey::stretch_master_key(&master_key).unwrap();
 
         let iv = [3u8; 16];
         let plaintext = [4u8; 64];
@@ -2322,7 +2504,7 @@ esac
                 if req.contains("POST /identity/accounts/prelogin")
                     || req.contains("POST /api/accounts/prelogin")
                 {
-                    let body = r#"{"kdf":0,"kdfIterations":5000}"#;
+                    let body = r#"{"kdf":0,"kdfIterations":100000}"#;
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
@@ -2356,6 +2538,10 @@ esac
         let dir = tempdir().unwrap();
         let runtime_dir = dir.path().join("runtime");
         std::fs::create_dir_all(&runtime_dir).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let old_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
 
@@ -2438,6 +2624,8 @@ esac
 
     #[test]
     fn test_login_password_new_device_verification_flow() {
+        // Reaches the daemon socket of the current XDG_RUNTIME_DIR.
+        let _env = crate::env_lock();
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::thread;
@@ -2455,7 +2643,7 @@ esac
                 if req.contains("POST /identity/accounts/prelogin")
                     || req.contains("POST /api/accounts/prelogin")
                 {
-                    let body = r#"{"kdf":0,"kdfIterations":5000}"#;
+                    let body = r#"{"kdf":0,"kdfIterations":100000}"#;
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
@@ -2500,6 +2688,8 @@ esac
 
     #[test]
     fn test_login_password_email_two_factor_flow() {
+        // Reaches the daemon socket of the current XDG_RUNTIME_DIR.
+        let _env = crate::env_lock();
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::thread;
@@ -2517,7 +2707,7 @@ esac
                 if req.contains("POST /identity/accounts/prelogin")
                     || req.contains("POST /api/accounts/prelogin")
                 {
-                    let body = r#"{"kdf":0,"kdfIterations":5000}"#;
+                    let body = r#"{"kdf":0,"kdfIterations":100000}"#;
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),

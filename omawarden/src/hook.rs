@@ -63,8 +63,16 @@ pub fn get_lock_hook_script(helper_path: &str) -> String {
 # Auto-lock Bitwarden vault on system lock
 {} auth lock >/dev/null 2>&1 || true
 "#,
-        helper_path
+        shell_single_quote(helper_path)
     )
+}
+
+/// Quotes `text` as one shell word: wrapped in single quotes, with every
+/// embedded single quote written as `'\''` (close, escaped quote, reopen).
+/// Nothing inside single quotes is interpreted by the shell, so spaces,
+/// `$`, backticks and quotes in the helper path stay literal.
+pub fn shell_single_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 /// Installs a system-lock hook script into `~/.config/omarchy/hooks/system-lock.d/`.
@@ -113,7 +121,42 @@ mod tests {
     fn test_get_lock_hook_script() {
         let script = get_lock_hook_script("/usr/local/bin/omawarden");
         assert!(script.starts_with("#!/usr/bin/env bash"));
-        assert!(script.contains("/usr/local/bin/omawarden auth lock"));
+        assert!(script.contains("'/usr/local/bin/omawarden' auth lock"));
+    }
+
+    #[test]
+    fn test_shell_single_quote_escapes_embedded_quotes() {
+        assert_eq!(
+            shell_single_quote("/usr/bin/omawarden"),
+            "'/usr/bin/omawarden'"
+        );
+        assert_eq!(shell_single_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_single_quote(""), "''");
+    }
+
+    #[test]
+    fn test_lock_hook_script_runs_a_helper_path_with_spaces_and_quotes() {
+        let dir = tempdir().unwrap();
+        let helper_dir = dir.path().join("my dir with 'quotes' and $HOME `x`");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let helper = helper_dir.join("omawarden helper");
+        let record = dir.path().join("invocation.txt");
+        crate::write_test_executable(
+            &helper,
+            format!("#!/bin/sh\nprintf '%s|' \"$@\" > '{}'\n", record.display()),
+        );
+        let script_path = dir.path().join("hook.sh");
+        fs::write(&script_path, get_lock_hook_script(helper.to_str().unwrap())).unwrap();
+        let status = std::process::Command::new("bash")
+            .arg(&script_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            fs::read_to_string(&record).unwrap(),
+            "auth|lock|",
+            "the quoted path must run the helper with exactly two arguments"
+        );
     }
 
     #[test]
@@ -128,6 +171,6 @@ mod tests {
         assert_eq!(perms.mode() & 0o777, 0o755);
 
         let content = fs::read_to_string(&hook_file).unwrap();
-        assert!(content.contains("/usr/bin/omawarden auth lock"));
+        assert!(content.contains("'/usr/bin/omawarden' auth lock"));
     }
 }

@@ -3,6 +3,8 @@
 ## Status
 Accepted. Shipped on branch `feat/288-quick-unlock-polkit` (issue #288): polkit check via `pkcheck`, retained key in the daemon's locked memory, policy file shipped by the packages.
 
+Amended by [ADR 0027](0027-redacted-item-access-and-per-field-secret-release.md): suspend is handled with a logind delay inhibitor and an event-driven PrepareForSleep monitor, so the retained key is wiped before the machine sleeps.
+
 ## Context
 The vault locks on screen lock, suspend, idle timeout and the maximum session lifetime (Security Handbook Rule 3, Rule 9), and unlocking always takes the master password. On Omarchy the screen locks after a few minutes idle, so with the SSH agent (ADR 0024) a normal working day means typing the master password into the overlay many times, usually because `ssh` or `git` needed a key.
 

@@ -3,6 +3,8 @@
 ## Status
 Superseded by [ADR 0003](0003-omawarden-rust-native-helper-and-daemon-architecture.md) & [Security Rule 11 (Zero-Argv & Zero-Environ Principle)](../agents/security.md#rule-11-zero-argv--zero-environ-principle-for-sensitive-credentials) (Reverted to pure ADR 0003 resident daemon architecture with 0600 socket + SO_PEERCRED peer credential model and max lifetime watchdog; ephemeral session token mechanism and environment variable propagation (`OMAWARDEN_SESSION` / `BW_SESSION`) completely eliminated to uphold Zero-Environ + Zero-Argv principles).
 
+Amended by [ADR 0027](0027-redacted-item-access-and-per-field-secret-release.md): caller verification also compares executables, the client `touch` override is removed, and `list` / `search` / `get_item` return redacted items.
+
 ## Context
 
 In `omarchy-bitwarden`, the background daemon (`omawarden daemon`) maintains decrypted vault items in physical memory (`LockedKey32` / `LockedKey64`) to provide sub-millisecond response times for search, auto-fill, clipboard copying, and TOTP generation across desktop workflows.

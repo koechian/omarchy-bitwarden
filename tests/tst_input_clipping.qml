@@ -47,13 +47,6 @@ Item {
     enableMtlsChecked: true
   }
 
-  Components.SshKeyModal {
-    id: sshKeyModal
-    width: 600
-    height: 700
-    active: true
-  }
-
   Component.onCompleted: {
     console.log("Running Input Clipping Tests...")
 
@@ -73,15 +66,6 @@ Item {
       var sInput = settingsInputs[j]
       var sTextVal = sInput.text ? sInput.text : (sInput.placeholderText || "input_" + j)
       check(sInput.clip === true, "SettingsModal TextInput (" + sTextVal + ") must have clip: true")
-    }
-
-    var sshInputs = []
-    findTextInputs(sshKeyModal, sshInputs)
-    console.log("Found", sshInputs.length, "TextInput(s) in SshKeyModal")
-    for (var k = 0; k < sshInputs.length; k++) {
-      var kInput = sshInputs[k]
-      var kTextVal = kInput.text ? kInput.text : (kInput.placeholderText || "input_" + k)
-      check(kInput.clip === true, "SshKeyModal TextInput (" + kTextVal + ") must have clip: true")
     }
 
     if (failures > 0) {

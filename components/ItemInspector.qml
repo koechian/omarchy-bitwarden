@@ -1,45 +1,70 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
-import "./IconPolicy.js" as IconPolicy
 import "./CardFormatter.js" as CardFormatter
+import "./SecretFieldCatalog.js" as SecretFieldCatalog
+import "./UriPolicy.js" as UriPolicy
 import qs.Commons
 import qs.Commons as Commons
 
+// Details of one redacted vault item (contracts.md 3.2). Secrets are shown
+// as masked placeholders where the item's `has_*` flag is true and are
+// omitted where it is false. A secret appears only after the user reveals it:
+// the inspector asks for it with revealToggleRequested() and displays the
+// value the release controller passes back in `revealedValues`. Secret copies
+// are requested by field identifier (secretCopyRequested), never by value.
 ScrollView {
   id: inspectorRoot
 
-  property string serverUrl: ""
-
   property var item: null
-  property var currentTotp: ({ code: "", ttl: 30, period: 30 })
-  property bool showPasswordRevealed: false
-  property bool showPrivateKeyRevealed: false
-  property bool showCardNumberRevealed: false
-  property bool showCardCodeRevealed: false
-  property bool showCustomHiddenRevealed: false
-  property var activeAttachmentPreview: null
-  property string loadingAttachmentId: ""
+  property var revealedValues: ({})
+  property var requestedFields: ({})
+  property int totpSecondsRemaining: 0
+  property int totpPeriod: 30
   property color foreground: Commons.Color.foreground
   property color accent: Commons.Color.accent
   property color muted: Commons.Color.muted
   property color borderColor: Commons.Color.menu.border
   property string fontFamily: ""
-  property bool showWebsiteIcons: false
   readonly property int keyPixelSize: Style.font.caption
   readonly property int valuePixelSize: Style.font.body
+  readonly property int totpWarningSeconds: 5
+  readonly property string passwordMask: "••••••••••••••••"
+  readonly property string totpMask: "••• •••"
+  readonly property string cardCodeMask: "•••"
 
+  readonly property QtObject strings: Commons.Translations {
+    directory: Qt.resolvedUrl("../i18n")
+  }
+  readonly property string retrievingText: inspectorRoot.strings.t("inspector.retrieving", "Retrieving…")
+  readonly property var uriEntries: UriPolicy.itemUris(inspectorRoot.item)
+  readonly property var customFields: SecretFieldCatalog.customFieldsWithValue(inspectorRoot.item)
+
+  // Non-secret values only (usernames, URIs, names, dates).
   signal copyRequested(string text, bool isSensitive, string label)
-  signal viewAttachmentRequested(var item, var att)
-  signal downloadAttachmentRequested(var item, var att)
-  signal exportSshKeyRequested(var item)
-  signal closePreviewRequested()
-  signal togglePasswordRevealed()
-  signal togglePrivateKeyRevealed()
-  signal toggleCardNumberRevealed()
-  signal toggleCardCodeRevealed()
-  signal toggleCustomHiddenRevealed()
+  signal secretCopyRequested(string field, string label)
+  signal revealToggleRequested(string field)
+  signal openUriRequested(string uri)
   signal passwordHistoryRequested(var item)
+
+  // A secret row bound to this inspector's revealed values and signals.
+  component InspectorSecretRow: SecretFieldRow {
+    property var inspector: null
+    property string copyLabel: ""
+    visible: Boolean(inspector) && SecretFieldCatalog.isPresent(inspector.item, field)
+    revealedValues: inspector ? inspector.revealedValues : ({})
+    requestedFields: inspector ? inspector.requestedFields : ({})
+    pendingText: inspector ? inspector.retrievingText : ""
+    foreground: inspector ? inspector.foreground : Commons.Color.foreground
+    muted: inspector ? inspector.muted : Commons.Color.muted
+    fontFamily: inspector ? inspector.fontFamily : ""
+    keyPixelSize: inspector ? inspector.keyPixelSize : Style.font.caption
+    valuePixelSize: inspector ? inspector.valuePixelSize : Style.font.body
+    revealTooltip: (revealed ? "Hide " : "Show ") + copyLabel
+    copyTooltip: "Copy " + copyLabel
+    onRevealToggled: inspector.revealToggleRequested(field)
+    onCopyRequested: inspector.secretCopyRequested(field, copyLabel)
+  }
 
   clip: true
   ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
@@ -53,206 +78,81 @@ ScrollView {
     }
   }
 
-  function isAppScheme(uri) {
-    if (!uri) return false
-    var str = String(uri).trim()
-    var match = str.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/i)
-    if (match) {
-      var scheme = match[1].toLowerCase()
-      return scheme !== "http" && scheme !== "https"
-    }
-    return false
+  function hasSecret(field) {
+    return SecretFieldCatalog.isPresent(inspectorRoot.item, field)
   }
 
-  function formatSchemeHost(uri) {
-    if (!uri) return ""
-    var str = String(uri).trim()
-    var schemeMatch = str.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(.*)$/i)
-    if (schemeMatch) {
-      var scheme = schemeMatch[1].toLowerCase()
-      var rest = schemeMatch[2]
-      var atIdx = rest.indexOf("@")
-      if (atIdx !== -1) {
-        rest = rest.substring(atIdx + 1)
-      }
-      var endMatch = rest.match(/^([^/?#]+)/)
-      var host = endMatch ? endMatch[1] : rest
-      return scheme + "://" + host
-    }
-    var singleColonMatch = str.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):(.*)$/i)
-    if (singleColonMatch) {
-      var s = singleColonMatch[1].toLowerCase()
-      if (s !== "http" && s !== "https") {
-        var r = singleColonMatch[2]
-        var em = r.match(/^([^/?#]+)/)
-        return s + ":" + (em ? em[1] : r)
-      }
-    }
-    var clean = str.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//i, "")
-    var at = clean.indexOf("@")
-    if (at !== -1) {
-      clean = clean.substring(at + 1)
-    }
-    var m = clean.match(/^([^/?#]+)/)
-    var hostOnly = m ? m[1] : clean
-    return "https://" + hostOnly
+  function isRevealed(field) {
+    return Boolean(inspectorRoot.revealedValues) && Object.prototype.hasOwnProperty.call(inspectorRoot.revealedValues, field)
   }
 
-  function getHostname(uri) {
-    if (!uri || isAppScheme(uri)) return ""
-    var str = String(uri).trim()
-    var match = str.match(/^(?:https?:\/\/)?(?:[^@\n]+@)?(?:www\.)?([^:\/\n?#]+)/i)
-    return match ? match[1] : ""
+  function isPending(field) {
+    return !inspectorRoot.isRevealed(field) && Boolean(inspectorRoot.requestedFields) && inspectorRoot.requestedFields[field] === true
   }
 
-  function getFaviconUrl(item) {
-    if (!showWebsiteIcons) return ""
-    if (!item) return ""
-    if (item.type_name !== "login" && item.category !== "login") return ""
-    if (!item.login || !item.login.uris || item.login.uris.length === 0) return ""
-    for (var i = 0; i < item.login.uris.length; i++) {
-      var u = item.login.uris[i]
-      var uriStr = (typeof u === "string") ? u : (u && u.uri ? u.uri : "")
-      if (!uriStr || isAppScheme(uriStr)) continue
-      var domain = getHostname(uriStr)
-      if (domain && domain.indexOf(".") !== -1) {
-        return IconPolicy.resolveIconUrl(inspectorRoot.serverUrl, domain)
-      }
-    }
-    return ""
+  // Revealed text, the retrieving notice, or the mask.
+  function secretDisplayText(field, mask) {
+    if (inspectorRoot.isRevealed(field)) return String(inspectorRoot.revealedValues[field])
+    return inspectorRoot.isPending(field) ? inspectorRoot.retrievingText : mask
   }
 
-  function getProcessedUris(item) {
-    if (!item || !item.login || !item.login.uris || item.login.uris.length === 0) return []
+  function sectionText(sectionName, key) {
+    var section = inspectorRoot.item ? inspectorRoot.item[sectionName] : null
+    var value = section ? section[key] : null
+    return (value === undefined || value === null) ? "" : String(value)
+  }
 
-    var webList = []
-    var appList = []
+  function joinedSectionText(sectionName, keys, separator) {
+    return keys.map(function(key) { return inspectorRoot.sectionText(sectionName, key) }).filter(Boolean).join(separator)
+  }
 
-    for (var i = 0; i < item.login.uris.length; i++) {
-      var uObj = item.login.uris[i]
-      var raw = (typeof uObj === "string") ? uObj : (uObj && uObj.uri ? uObj.uri : "")
-      if (!raw) continue
-      var rawTrimmed = String(raw).trim()
-      if (!rawTrimmed) continue
+  function identityFullName() {
+    return inspectorRoot.joinedSectionText("identity", ["title", "firstName", "middleName", "lastName"], " ")
+  }
 
-      var isApp = isAppScheme(rawTrimmed)
-      var formatted = formatSchemeHost(rawTrimmed)
+  function identityAddress() {
+    return inspectorRoot.joinedSectionText("identity", ["address1", "address2", "city", "state", "postalCode", "country"], ", ")
+  }
 
-      var entry = {
-        isApp: isApp,
-        label: isApp ? "App Scheme" : "Website",
-        displayUri: formatted,
-        rawUri: rawTrimmed,
-        targetUri: rawTrimmed
-      }
+  function cardExpiry(separator) {
+    return inspectorRoot.sectionText("card", "expMonth") + separator + inspectorRoot.sectionText("card", "expYear")
+  }
 
-      if (isApp) {
-        appList.push(entry)
-      } else {
-        webList.push(entry)
-      }
-    }
+  function formatRevealedCardNumber(number) {
+    return CardFormatter.formatRevealedCardNumber(number, inspectorRoot.sectionText("card", "brand"))
+  }
 
-    var resultWeb = []
-    var seenWeb = {}
-    for (var w = 0; w < webList.length; w++) {
-      var keyW = webList[w].displayUri
-      if (!seenWeb[keyW]) {
-        seenWeb[keyW] = true
-        resultWeb.push(webList[w])
-      }
-    }
-
-    var resultApp = []
-    var seenApp = {}
-    for (var a = 0; a < appList.length; a++) {
-      var keyA = appList[a].displayUri
-      if (!seenApp[keyA]) {
-        seenApp[keyA] = true
-        resultApp.push(appList[a])
-      }
-    }
-
-    return resultWeb.concat(resultApp)
+  function passwordHistoryCount() {
+    var count = inspectorRoot.item && inspectorRoot.item.login ? Number(inspectorRoot.item.login.password_history_count) : 0
+    return count > 0 ? count : 0
   }
 
   function getItemIcon(item) {
-    if (!item) return "\uf084"
-    if (item.type_name === "card") return "\uf09d"
-    if (item.type_name === "identity") return "\uf2c2"
-    if (item.type_name === "note") return "\uf0f6"
-    if (item.type_name === "ssh_key" || item.category === "ssh_key") return "\uf084"
-    return "\uf084"
+    if (!item) return ""
+    if (item.type_name === "card") return ""
+    if (item.type_name === "identity") return ""
+    if (item.type_name === "note") return ""
+    return ""
   }
+
+  readonly property var categoryLabels: ({ "login": "Login", "card": "Card", "identity": "Identity", "note": "Secure Note", "secure_note": "Secure Note" })
 
   function getItemCategoryLabel(item) {
     if (!item) return ""
-    var type = item.type_name || item.category || ""
-    switch (type) {
-      case "login": return "Login"
-      case "card": return "Card"
-      case "identity": return "Identity"
-      case "note":
-      case "secure_note":
-        return "Secure Note"
-      case "ssh_key": return "SSH Key"
-      default: return item.sub_title || item.type_name || "Item"
-    }
-  }
-
-  function formatMaskedCardNumber(num) {
-    var brand = (inspectorRoot.item && inspectorRoot.item.card) ? inspectorRoot.item.card.brand : ""
-    return CardFormatter.formatMaskedCardNumber(num, brand)
-  }
-
-  function formatRevealedCardNumber(num) {
-    var brand = (inspectorRoot.item && inspectorRoot.item.card) ? inspectorRoot.item.card.brand : ""
-    return CardFormatter.formatRevealedCardNumber(num, brand)
-  }
-
-  function isAttachmentPreviewable(filename) {
-    if (!filename) return false
-    var dotIdx = filename.lastIndexOf(".")
-    if (dotIdx === -1) return false
-    var ext = filename.slice(dotIdx + 1).toLowerCase()
-    var previewableExts = [
-      "png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "ico",
-      "txt", "md", "markdown", "json", "yaml", "yml", "toml", "csv", "tsv", "log",
-      "sh", "bash", "zsh", "py", "js", "ts", "jsx", "tsx", "html", "htm", "css", "scss", "sass", "less",
-      "xml", "conf", "config", "ini", "env", "pem", "key", "pub", "crt", "cer",
-      "diff", "patch", "sql", "lua", "c", "cpp", "cc", "cxx", "h", "hpp", "rs", "go", "java", "kt", "kts", "rb", "php"
-    ]
-    return previewableExts.indexOf(ext) !== -1
-  }
-
-  function getAttachmentIcon(filename) {
-    if (!filename) return "\uf15b"
-    var ext = filename.split(".").pop().toLowerCase()
-    if (["png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "ico"].indexOf(ext) !== -1) return "\uf03e"
-    if (["txt", "md", "json", "yaml", "yml", "toml", "csv", "log", "sh", "py", "js", "ts", "html", "css", "xml", "conf", "ini", "env", "sql", "rs", "go", "c", "cpp"].indexOf(ext) !== -1) return "\uf0f6"
-    if (["pdf"].indexOf(ext) !== -1) return "\uf1c1"
-    if (["zip", "tar", "gz", "7z", "rar"].indexOf(ext) !== -1) return "\uf1c6"
-    return "\uf15b"
-  }
-
-  function formatFileSize(bytes) {
-    if (!bytes || bytes === 0) return "0 B"
-    var k = 1024
-    var sizes = ["B", "KB", "MB", "GB"]
-    var i = Math.floor(Math.log(bytes) / Math.log(k))
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i]
+    var label = inspectorRoot.categoryLabels[item.type_name || item.category || ""]
+    return label || item.sub_title || item.type_name || "Item"
   }
 
   function formatDateTime(dateStr) {
     if (!dateStr) return ""
     try {
-      var d = new Date(dateStr)
+      let d = new Date(dateStr)
       if (!isNaN(d.getTime())) {
-        var year = d.getFullYear()
-        var month = String(d.getMonth() + 1).padStart(2, '0')
-        var day = String(d.getDate()).padStart(2, '0')
-        var hours = String(d.getHours()).padStart(2, '0')
-        var minutes = String(d.getMinutes()).padStart(2, '0')
+        let year = d.getFullYear()
+        let month = String(d.getMonth() + 1).padStart(2, '0')
+        let day = String(d.getDate()).padStart(2, '0')
+        let hours = String(d.getHours()).padStart(2, '0')
+        let minutes = String(d.getMinutes()).padStart(2, '0')
         return year + "-" + month + "-" + day + " " + hours + ":" + minutes
       }
     } catch (e) {}
@@ -264,217 +164,10 @@ ScrollView {
     spacing: 12
 
     // ----------------------------------------------------
-    // 1. ATTACHMENT FULL PREVIEW OVERLAY (If active)
+    // ITEM INSPECTOR VIEW
     // ----------------------------------------------------
     ColumnLayout {
-      visible: inspectorRoot.activeAttachmentPreview !== null
-      Layout.fillWidth: true
-      spacing: 10
-
-      // Preview Toolbar
-      RowLayout {
-        Layout.fillWidth: true
-        spacing: 8
-
-        Rectangle {
-          implicitHeight: 24
-          implicitWidth: backBtnRow.implicitWidth + 10
-          radius: 4
-          color: backMouse.containsMouse ? Qt.rgba(inspectorRoot.foreground.r, inspectorRoot.foreground.g, inspectorRoot.foreground.b, 0.1) : Qt.rgba(inspectorRoot.foreground.r, inspectorRoot.foreground.g, inspectorRoot.foreground.b, 0.05)
-          border.color: inspectorRoot.borderColor
-          border.width: 1
-
-          RowLayout {
-            id: backBtnRow
-            anchors.centerIn: parent
-            spacing: 4
-            Text {
-              text: "\uf060"
-              font.family: inspectorRoot.fontFamily
-              color: inspectorRoot.foreground
-              font.pixelSize: Style.font.caption
-            }
-            Text { text: "Back to Item"; color: inspectorRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
-          }
-          MouseArea {
-            id: backMouse
-            anchors.fill: parent
-            hoverEnabled: true
-            cursorShape: Qt.PointingHandCursor
-            onClicked: inspectorRoot.closePreviewRequested()
-          }
-        }
-
-        Text {
-          text: inspectorRoot.getAttachmentIcon(inspectorRoot.activeAttachmentPreview ? inspectorRoot.activeAttachmentPreview.filename : "")
-          font.family: inspectorRoot.fontFamily
-          font.pixelSize: Style.font.title
-          color: inspectorRoot.accent
-        }
-
-        Text {
-          text: inspectorRoot.activeAttachmentPreview ? (inspectorRoot.activeAttachmentPreview.filename || "Attachment") : ""
-          color: inspectorRoot.foreground
-          font.pixelSize: Style.font.body
-          font.weight: Font.Medium
-          elide: Text.ElideRight
-          Layout.fillWidth: true
-          Layout.preferredWidth: 0
-        }
-
-        // Open Externally
-        GhostIconButton {
-          iconText: "\uf08e"
-          tooltip: "Open file externally"
-          onClicked: {
-            if (inspectorRoot.activeAttachmentPreview && inspectorRoot.activeAttachmentPreview.path) {
-              Qt.openUrlExternally("file://" + inspectorRoot.activeAttachmentPreview.path)
-            }
-          }
-        }
-      }
-
-      Rectangle { Layout.fillWidth: true; height: 1; color: inspectorRoot.borderColor }
-
-      // Preview Content: Image
-      Item {
-        visible: Boolean(inspectorRoot.activeAttachmentPreview && inspectorRoot.activeAttachmentPreview.is_image)
-        Layout.fillWidth: true
-        Layout.preferredHeight: 320
-
-        Image {
-          anchors.fill: parent
-          anchors.margins: 4
-          fillMode: Image.PreserveAspectFit
-          source: (inspectorRoot.activeAttachmentPreview && inspectorRoot.activeAttachmentPreview.is_image) ? ("file://" + inspectorRoot.activeAttachmentPreview.path) : ""
-          smooth: true
-          asynchronous: true
-        }
-      }
-
-      // Preview Content: Text / Code
-      ColumnLayout {
-        visible: Boolean(inspectorRoot.activeAttachmentPreview && !inspectorRoot.activeAttachmentPreview.is_image && inspectorRoot.activeAttachmentPreview.is_text)
-        Layout.fillWidth: true
-        spacing: 6
-
-        RowLayout {
-          Layout.fillWidth: true
-          Text {
-            text: "Text Content Preview"
-            color: inspectorRoot.muted
-            font.pixelSize: Style.font.bodySmall
-          }
-          Item { Layout.fillWidth: true }
-          GhostIconButton {
-            iconText: "\uf0c5"
-            tooltip: "Copy text"
-            onClicked: {
-              if (inspectorRoot.activeAttachmentPreview && inspectorRoot.activeAttachmentPreview.text_content) {
-                inspectorRoot.copyRequested(inspectorRoot.activeAttachmentPreview.text_content, false, "attachment text")
-              }
-            }
-          }
-        }
-
-        Rectangle {
-          Layout.fillWidth: true
-          Layout.preferredHeight: 240
-          radius: 4
-          color: Commons.Color.popups.background
-          border.color: inspectorRoot.borderColor
-          border.width: 1
-
-          ScrollView {
-            anchors.fill: parent
-            anchors.margins: 8
-            clip: true
-            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-
-            TextArea {
-              readOnly: true
-              wrapMode: Text.WrapAnywhere
-              color: inspectorRoot.foreground
-              font.pixelSize: Style.font.bodySmall
-              font.family: "monospace"
-              text: (inspectorRoot.activeAttachmentPreview && inspectorRoot.activeAttachmentPreview.text_content) ? inspectorRoot.activeAttachmentPreview.text_content : ""
-              background: null
-            }
-          }
-        }
-      }
-
-      // Preview Content: Binary / Non-previewable fallback
-      ColumnLayout {
-        visible: Boolean(inspectorRoot.activeAttachmentPreview && !inspectorRoot.activeAttachmentPreview.is_image && !inspectorRoot.activeAttachmentPreview.is_text)
-        Layout.fillWidth: true
-        spacing: 12
-        Layout.topMargin: 20
-        Layout.bottomMargin: 20
-
-        Text {
-          Layout.alignment: Qt.AlignHCenter
-          text: "\uf15b"
-          font.family: inspectorRoot.fontFamily
-          font.pixelSize: Style.fontPx(3.0)
-          color: inspectorRoot.muted
-        }
-
-        Text {
-          Layout.alignment: Qt.AlignHCenter
-          text: "Preview not available for this file format"
-          color: inspectorRoot.muted
-          font.pixelSize: Style.font.body
-          font.weight: Font.Medium
-        }
-
-        Rectangle {
-          Layout.alignment: Qt.AlignHCenter
-          implicitHeight: 28
-          implicitWidth: dlRow.implicitWidth + 20
-          radius: 4
-          color: dlMouse.containsMouse ? Qt.rgba(inspectorRoot.accent.r, inspectorRoot.accent.g, inspectorRoot.accent.b, 0.3) : Qt.rgba(inspectorRoot.accent.r, inspectorRoot.accent.g, inspectorRoot.accent.b, 0.15)
-          border.color: inspectorRoot.accent
-          border.width: 1
-
-          RowLayout {
-            id: dlRow
-            anchors.centerIn: parent
-            spacing: 6
-            Text {
-              text: "\uf019"
-              font.family: inspectorRoot.fontFamily
-              color: inspectorRoot.accent
-              font.pixelSize: Style.font.body
-            }
-            Text {
-              text: "Open or Save File"
-              color: inspectorRoot.foreground
-              font.pixelSize: Style.font.bodySmall
-              font.weight: Font.Medium
-            }
-          }
-
-          MouseArea {
-            id: dlMouse
-            anchors.fill: parent
-            hoverEnabled: true
-            cursorShape: Qt.PointingHandCursor
-            onClicked: {
-              if (inspectorRoot.activeAttachmentPreview && inspectorRoot.activeAttachmentPreview.path) {
-                Qt.openUrlExternally("file://" + inspectorRoot.activeAttachmentPreview.path)
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // ----------------------------------------------------
-    // 2. NORMAL ITEM INSPECTOR VIEW
-    // ----------------------------------------------------
-    ColumnLayout {
-      visible: inspectorRoot.activeAttachmentPreview === null && inspectorRoot.item !== null
+      visible: inspectorRoot.item !== null
       Layout.fillWidth: true
       spacing: 8
 
@@ -488,21 +181,9 @@ ScrollView {
           Layout.preferredWidth: 24
           Layout.preferredHeight: 24
 
-          property string favUrl: inspectorRoot.getFaviconUrl(inspectorRoot.item)
-
-          Image {
-            id: inspFaviconImg
-            anchors.fill: parent
-            asynchronous: true
-            cache: true
-            fillMode: Image.PreserveAspectFit
-            source: inspIconContainer.favUrl
-            visible: inspIconContainer.favUrl !== "" && status === Image.Ready
-          }
-
           Text {
+            textFormat: Text.PlainText
             anchors.centerIn: parent
-            visible: !inspFaviconImg.visible
             text: inspectorRoot.getItemIcon(inspectorRoot.item)
             font.family: inspectorRoot.fontFamily
             font.pixelSize: Style.font.title
@@ -521,6 +202,8 @@ ScrollView {
             spacing: 6
 
             Text {
+              objectName: "inspectorItemName"
+              textFormat: Text.PlainText
               text: inspectorRoot.item ? (inspectorRoot.item.name || "Untitled") : ""
               color: inspectorRoot.foreground
               font.pixelSize: Style.font.body
@@ -545,12 +228,14 @@ ScrollView {
                 anchors.centerIn: parent
                 spacing: 3
                 Text {
-                  text: "\uf005"
+                  textFormat: Text.PlainText
+                  text: ""
                   font.family: inspectorRoot.fontFamily
                   font.pixelSize: Style.fontPx(0.75)
                   color: inspectorRoot.muted
                 }
                 Text {
+                  textFormat: Text.PlainText
                   text: "Favorite"
                   color: inspectorRoot.muted
                   font.pixelSize: Style.font.caption
@@ -571,8 +256,9 @@ ScrollView {
 
               Text {
                 id: orgText
+                textFormat: Text.PlainText
                 anchors.centerIn: parent
-                text: "\uf1ad " + (inspectorRoot.item ? (inspectorRoot.item.organization_name || "") : "")
+                text: " " + (inspectorRoot.item ? (inspectorRoot.item.organization_name || "") : "")
                 font.family: inspectorRoot.fontFamily
                 color: StatusPalette.organization
                 font.pixelSize: Style.font.caption
@@ -592,8 +278,9 @@ ScrollView {
 
               Text {
                 id: folderText
+                textFormat: Text.PlainText
                 anchors.centerIn: parent
-                text: "\uf07b " + (inspectorRoot.item ? (inspectorRoot.item.folder_name || "") : "")
+                text: " " + (inspectorRoot.item ? (inspectorRoot.item.folder_name || "") : "")
                 font.family: inspectorRoot.fontFamily
                 color: StatusPalette.folder
                 font.pixelSize: Style.font.caption
@@ -603,6 +290,7 @@ ScrollView {
           }
 
           Text {
+            textFormat: Text.PlainText
             text: inspectorRoot.item ? inspectorRoot.getItemCategoryLabel(inspectorRoot.item) : ""
             color: inspectorRoot.muted
             font.pixelSize: Style.font.bodySmall
@@ -633,7 +321,7 @@ ScrollView {
 
           // Username
           RowLayout {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.login && inspectorRoot.item.login.username)
+            visible: inspectorRoot.sectionText("login", "username") !== ""
             Layout.fillWidth: true
             spacing: 8
 
@@ -641,9 +329,10 @@ ScrollView {
               Layout.fillWidth: true
               Layout.preferredWidth: 0
               spacing: 2
-              Text { text: "Username"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
+              Text { textFormat: Text.PlainText; text: "Username"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
               Text {
-                text: (inspectorRoot.item && inspectorRoot.item.login) ? (inspectorRoot.item.login.username || "") : ""
+                textFormat: Text.PlainText
+                text: inspectorRoot.sectionText("login", "username")
                 color: inspectorRoot.foreground
                 font.pixelSize: inspectorRoot.valuePixelSize
                 font.weight: Font.Medium
@@ -654,83 +343,53 @@ ScrollView {
             }
 
             GhostIconButton {
-              iconText: "\uf0c5"
+              iconText: ""
               tooltip: "Copy username"
-              onClicked: inspectorRoot.copyRequested(inspectorRoot.item.login.username, false, "username")
+              onClicked: inspectorRoot.copyRequested(inspectorRoot.sectionText("login", "username"), false, "username")
             }
           }
 
-          // Divider (if username and password)
           Rectangle {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.login && inspectorRoot.item.login.username && inspectorRoot.item.login.password)
+            visible: inspectorRoot.sectionText("login", "username") !== "" && inspectorRoot.hasSecret(SecretFieldCatalog.LOGIN_PASSWORD)
             Layout.fillWidth: true
-            height: 1
+            implicitHeight: 1
             color: inspectorRoot.borderColor
           }
 
-          // Password
-          RowLayout {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.login && inspectorRoot.item.login.password)
-            Layout.fillWidth: true
-            spacing: 8
-
-            ColumnLayout {
-              Layout.fillWidth: true
-              Layout.preferredWidth: 0
-              spacing: 2
-              Text { text: "Password"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
-              Text {
-                text: inspectorRoot.showPasswordRevealed ? (inspectorRoot.item.login.password || "") : "••••••••••••••••"
-                color: inspectorRoot.foreground
-                font.pixelSize: inspectorRoot.valuePixelSize
-                font.family: inspectorRoot.showPasswordRevealed ? "monospace" : "sans-serif"
-                font.weight: Font.Medium
-                elide: Text.ElideRight
-                Layout.fillWidth: true
-                Layout.preferredWidth: 0
-              }
-            }
-
-            GhostIconButton {
-              iconText: inspectorRoot.showPasswordRevealed ? "\uf070" : "\uf06e"
-              tooltip: inspectorRoot.showPasswordRevealed ? "Hide password" : "Show password"
-              onClicked: inspectorRoot.togglePasswordRevealed()
-            }
-            GhostIconButton {
-              iconText: "\uf0c5"
-              tooltip: "Copy password"
-              onClicked: inspectorRoot.copyRequested(inspectorRoot.item.login.password, true, "password")
-            }
+          // Password (masked until revealed)
+          InspectorSecretRow {
+            inspector: inspectorRoot
+            field: SecretFieldCatalog.LOGIN_PASSWORD
+            label: "Password"
+            copyLabel: "password"
+            maskText: inspectorRoot.passwordMask
           }
 
-          // Divider (if password/username and uris)
           Rectangle {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.login && (inspectorRoot.item.login.password || inspectorRoot.item.login.username) && inspectorRoot.getProcessedUris(inspectorRoot.item).length > 0)
+            visible: (inspectorRoot.sectionText("login", "username") !== "" || inspectorRoot.hasSecret(SecretFieldCatalog.LOGIN_PASSWORD)) && inspectorRoot.uriEntries.length > 0
             Layout.fillWidth: true
-            height: 1
+            implicitHeight: 1
             color: inspectorRoot.borderColor
           }
 
-          // Websites / App Schemes list
+          // URIs: the full value is shown; only http and https open.
           Repeater {
-            model: inspectorRoot.getProcessedUris(inspectorRoot.item)
+            model: inspectorRoot.uriEntries
 
             ColumnLayout {
               id: uriWrapper
               Layout.fillWidth: true
               spacing: 8
 
-              property var entryData: modelData
-              property string labelText: (modelData && modelData.label) ? modelData.label : "Website"
-              property string displayUri: (modelData && modelData.displayUri) ? modelData.displayUri : ""
-              property string rawUri: (modelData && modelData.rawUri) ? modelData.rawUri : ""
-              property string targetUri: (modelData && modelData.targetUri) ? modelData.targetUri : ""
-              property bool isApp: Boolean(modelData && modelData.isApp)
+              required property int index
+              required property var modelData
+              readonly property bool isOpenable: Boolean(modelData && modelData.isOpenable)
+              readonly property string uri: (modelData && modelData.uri) ? modelData.uri : ""
 
               Rectangle {
-                visible: index > 0
+                visible: uriWrapper.index > 0
                 Layout.fillWidth: true
-                height: 1
+                implicitHeight: 1
                 color: inspectorRoot.borderColor
               }
 
@@ -742,9 +401,16 @@ ScrollView {
                   Layout.fillWidth: true
                   Layout.preferredWidth: 0
                   spacing: 2
-                  Text { text: uriWrapper.labelText; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
                   Text {
-                    text: uriWrapper.displayUri
+                    textFormat: Text.PlainText
+                    text: uriWrapper.isOpenable ? "Website" : inspectorRoot.strings.t("inspector.label.uri", "URI")
+                    color: inspectorRoot.muted
+                    font.pixelSize: inspectorRoot.keyPixelSize
+                  }
+                  Text {
+                    objectName: "inspectorUriValue"
+                    textFormat: Text.PlainText
+                    text: uriWrapper.uri
                     color: inspectorRoot.foreground
                     font.pixelSize: inspectorRoot.valuePixelSize
                     font.weight: Font.Medium
@@ -755,35 +421,32 @@ ScrollView {
                 }
 
                 GhostIconButton {
-                  iconText: "\uf08e"
-                  tooltip: uriWrapper.isApp ? "Open app scheme" : "Open website"
-                  onClicked: {
-                    var u = uriWrapper.targetUri
-                    if (!uriWrapper.isApp && !u.match(/^https?:\/\//i)) u = "https://" + u
-                    Qt.openUrlExternally(u)
-                  }
+                  objectName: "inspectorUriOpenButton"
+                  iconText: ""
+                  enabled: uriWrapper.isOpenable
+                  tooltip: uriWrapper.isOpenable ? "Open website" : "Only http and https links can be opened"
+                  onClicked: inspectorRoot.openUriRequested(uriWrapper.uri)
                 }
 
                 GhostIconButton {
-                  iconText: "\uf0c5"
-                  tooltip: uriWrapper.isApp ? "Copy app scheme" : "Copy website URL"
-                  onClicked: inspectorRoot.copyRequested(uriWrapper.displayUri, false, uriWrapper.isApp ? "app scheme" : "website URL")
+                  iconText: ""
+                  tooltip: "Copy URI"
+                  onClicked: inspectorRoot.copyRequested(uriWrapper.uri, false, uriWrapper.isOpenable ? "website URL" : "URI")
                 }
               }
             }
           }
 
-          // Divider (if totp)
           Rectangle {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.login && (inspectorRoot.item.login.totp || inspectorRoot.item.login.has_totp))
+            visible: inspectorRoot.hasSecret(SecretFieldCatalog.LOGIN_TOTP)
             Layout.fillWidth: true
-            height: 1
+            implicitHeight: 1
             color: inspectorRoot.borderColor
           }
 
-          // TOTP Countdown & Verification Code
+          // TOTP: masked until revealed; a revealed code counts down locally.
           ColumnLayout {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.login && (inspectorRoot.item.login.totp || inspectorRoot.item.login.has_totp))
+            visible: inspectorRoot.hasSecret(SecretFieldCatalog.LOGIN_TOTP)
             Layout.fillWidth: true
             spacing: 4
 
@@ -798,17 +461,21 @@ ScrollView {
 
                 RowLayout {
                   spacing: 6
-                  Text { text: "TOTP Code"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
+                  Text { textFormat: Text.PlainText; text: "TOTP Code"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
                   Text {
-                    text: (inspectorRoot.currentTotp.ttl || 30) + "s"
-                    color: (inspectorRoot.currentTotp.ttl > 5) ? inspectorRoot.muted : StatusPalette.danger
+                    visible: inspectorRoot.isRevealed(SecretFieldCatalog.LOGIN_TOTP)
+                    textFormat: Text.PlainText
+                    text: inspectorRoot.strings.t("inspector.totp_period_remaining", "%1 s").arg(inspectorRoot.totpSecondsRemaining)
+                    color: (inspectorRoot.totpSecondsRemaining > inspectorRoot.totpWarningSeconds) ? inspectorRoot.muted : StatusPalette.danger
                     font.pixelSize: inspectorRoot.keyPixelSize
                   }
                 }
 
                 Text {
-                  text: inspectorRoot.currentTotp.code || "Generating..."
-                  color: inspectorRoot.accent
+                  objectName: "inspectorTotpValue"
+                  textFormat: Text.PlainText
+                  text: inspectorRoot.secretDisplayText(SecretFieldCatalog.LOGIN_TOTP, inspectorRoot.totpMask)
+                  color: inspectorRoot.isRevealed(SecretFieldCatalog.LOGIN_TOTP) ? inspectorRoot.accent : inspectorRoot.foreground
                   font.pixelSize: Style.font.title
                   font.family: "monospace"
                   font.weight: Font.Bold
@@ -819,33 +486,39 @@ ScrollView {
               }
 
               GhostIconButton {
-                iconText: "\uf0c5"
+                iconText: (inspectorRoot.isRevealed(SecretFieldCatalog.LOGIN_TOTP) || inspectorRoot.isPending(SecretFieldCatalog.LOGIN_TOTP)) ? "" : ""
+                tooltip: "Show TOTP code"
+                onClicked: inspectorRoot.revealToggleRequested(SecretFieldCatalog.LOGIN_TOTP)
+              }
+
+              GhostIconButton {
+                iconText: ""
                 tooltip: "Copy TOTP code"
-                onClicked: inspectorRoot.copyRequested(inspectorRoot.currentTotp.code, true, "TOTP code")
+                onClicked: inspectorRoot.secretCopyRequested(SecretFieldCatalog.LOGIN_TOTP, "TOTP code")
               }
             }
 
             // Progress Bar
             Rectangle {
+              visible: inspectorRoot.isRevealed(SecretFieldCatalog.LOGIN_TOTP)
               Layout.fillWidth: true
-              height: 3
+              implicitHeight: 3
               radius: 2
               color: Qt.rgba(inspectorRoot.foreground.r, inspectorRoot.foreground.g, inspectorRoot.foreground.b, 0.1)
 
               Rectangle {
                 height: parent.height
                 radius: 2
-                width: parent.width * ((inspectorRoot.currentTotp.ttl || 30) / (inspectorRoot.currentTotp.period || 30))
-                color: (inspectorRoot.currentTotp.ttl > 5) ? inspectorRoot.accent : StatusPalette.danger
+                width: parent.width * Math.min(1, inspectorRoot.totpSecondsRemaining / Math.max(1, inspectorRoot.totpPeriod))
+                color: (inspectorRoot.totpSecondsRemaining > inspectorRoot.totpWarningSeconds) ? inspectorRoot.accent : StatusPalette.danger
               }
             }
           }
 
-          // Divider (if passkey)
           Rectangle {
             visible: Boolean(inspectorRoot.item && inspectorRoot.item.login && inspectorRoot.item.login.has_passkey)
             Layout.fillWidth: true
-            height: 1
+            implicitHeight: 1
             color: inspectorRoot.borderColor
           }
 
@@ -860,9 +533,10 @@ ScrollView {
               Layout.preferredWidth: 0
               spacing: 2
 
-              Text { text: "Passkey"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
+              Text { textFormat: Text.PlainText; text: "Passkey"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
               Text {
-                text: (inspectorRoot.item && inspectorRoot.item.login && inspectorRoot.item.login.passkey_created_at) ? ("Created " + inspectorRoot.formatDateTime(inspectorRoot.item.login.passkey_created_at)) : "Stored in vault"
+                textFormat: Text.PlainText
+                text: inspectorRoot.sectionText("login", "passkey_created_at") ? ("Created " + inspectorRoot.formatDateTime(inspectorRoot.sectionText("login", "passkey_created_at"))) : "Stored in vault"
                 color: inspectorRoot.foreground
                 font.pixelSize: inspectorRoot.valuePixelSize
                 elide: Text.ElideRight
@@ -894,7 +568,7 @@ ScrollView {
 
           // Cardholder
           RowLayout {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.card && inspectorRoot.item.card.cardholderName)
+            visible: inspectorRoot.sectionText("card", "cardholderName") !== ""
             Layout.fillWidth: true
             spacing: 8
 
@@ -902,9 +576,10 @@ ScrollView {
               Layout.fillWidth: true
               Layout.preferredWidth: 0
               spacing: 2
-              Text { text: "Cardholder"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
+              Text { textFormat: Text.PlainText; text: "Cardholder"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
               Text {
-                text: (inspectorRoot.item && inspectorRoot.item.card) ? (inspectorRoot.item.card.cardholderName || "") : ""
+                textFormat: Text.PlainText
+                text: inspectorRoot.sectionText("card", "cardholderName")
                 color: inspectorRoot.foreground
                 font.pixelSize: inspectorRoot.valuePixelSize
                 font.weight: Font.Medium
@@ -915,23 +590,22 @@ ScrollView {
             }
 
             GhostIconButton {
-              iconText: "\uf0c5"
+              iconText: ""
               tooltip: "Copy cardholder"
-              onClicked: inspectorRoot.copyRequested(inspectorRoot.item.card.cardholderName, false, "cardholder name")
+              onClicked: inspectorRoot.copyRequested(inspectorRoot.sectionText("card", "cardholderName"), false, "cardholder name")
             }
           }
 
-          // Divider
           Rectangle {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.card && inspectorRoot.item.card.cardholderName && inspectorRoot.item.card.brand)
+            visible: inspectorRoot.sectionText("card", "cardholderName") !== "" && inspectorRoot.sectionText("card", "brand") !== ""
             Layout.fillWidth: true
-            height: 1
+            implicitHeight: 1
             color: inspectorRoot.borderColor
           }
 
           // Card Brand
           RowLayout {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.card && inspectorRoot.item.card.brand)
+            visible: inspectorRoot.sectionText("card", "brand") !== ""
             Layout.fillWidth: true
             spacing: 8
 
@@ -939,9 +613,10 @@ ScrollView {
               Layout.fillWidth: true
               Layout.preferredWidth: 0
               spacing: 2
-              Text { text: "Brand"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
+              Text { textFormat: Text.PlainText; text: "Brand"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
               Text {
-                text: (inspectorRoot.item && inspectorRoot.item.card) ? (inspectorRoot.item.card.brand || "") : ""
+                textFormat: Text.PlainText
+                text: inspectorRoot.sectionText("card", "brand")
                 color: inspectorRoot.foreground
                 font.pixelSize: inspectorRoot.valuePixelSize
                 font.weight: Font.Medium
@@ -952,60 +627,34 @@ ScrollView {
             }
           }
 
-          // Divider
           Rectangle {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.card && inspectorRoot.item.card.number)
+            visible: inspectorRoot.hasSecret(SecretFieldCatalog.CARD_NUMBER)
             Layout.fillWidth: true
-            height: 1
+            implicitHeight: 1
             color: inspectorRoot.borderColor
           }
 
-          // Card Number (Protected)
-          RowLayout {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.card && inspectorRoot.item.card.number)
-            Layout.fillWidth: true
-            spacing: 8
-
-            ColumnLayout {
-              Layout.fillWidth: true
-              Layout.preferredWidth: 0
-              spacing: 2
-              Text { text: "Card Number"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
-              Text {
-                text: (inspectorRoot.item && inspectorRoot.item.card) ? (inspectorRoot.showCardNumberRevealed ? inspectorRoot.formatRevealedCardNumber(inspectorRoot.item.card.number) : inspectorRoot.formatMaskedCardNumber(inspectorRoot.item.card.number)) : ""
-                color: inspectorRoot.foreground
-                font.pixelSize: inspectorRoot.valuePixelSize
-                font.family: "monospace"
-                font.weight: Font.Medium
-                elide: Text.ElideRight
-                Layout.fillWidth: true
-                Layout.preferredWidth: 0
-              }
-            }
-
-            GhostIconButton {
-              iconText: inspectorRoot.showCardNumberRevealed ? "\uf070" : "\uf06e"
-              tooltip: inspectorRoot.showCardNumberRevealed ? "Hide card number" : "Show card number"
-              onClicked: inspectorRoot.toggleCardNumberRevealed()
-            }
-            GhostIconButton {
-              iconText: "\uf0c5"
-              tooltip: "Copy card number"
-              onClicked: inspectorRoot.copyRequested(CardFormatter.sanitizeCardNumberForCopy(inspectorRoot.item.card.number), true, "card number")
-            }
+          // Card Number: last four digits until revealed
+          InspectorSecretRow {
+            objectName: "inspectorCardNumberRow"
+            inspector: inspectorRoot
+            field: SecretFieldCatalog.CARD_NUMBER
+            label: "Card Number"
+            copyLabel: "card number"
+            maskText: CardFormatter.formatMaskedLastFour(inspectorRoot.sectionText("card", "number_last_four"))
+            revealedFormatter: inspectorRoot.formatRevealedCardNumber
           }
 
-          // Divider
           Rectangle {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.card && (inspectorRoot.item.card.expMonth || inspectorRoot.item.card.expYear))
+            visible: inspectorRoot.sectionText("card", "expMonth") !== "" || inspectorRoot.sectionText("card", "expYear") !== ""
             Layout.fillWidth: true
-            height: 1
+            implicitHeight: 1
             color: inspectorRoot.borderColor
           }
 
           // Expires
           RowLayout {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.card && (inspectorRoot.item.card.expMonth || inspectorRoot.item.card.expYear))
+            visible: inspectorRoot.sectionText("card", "expMonth") !== "" || inspectorRoot.sectionText("card", "expYear") !== ""
             Layout.fillWidth: true
             spacing: 8
 
@@ -1013,9 +662,10 @@ ScrollView {
               Layout.fillWidth: true
               Layout.preferredWidth: 0
               spacing: 2
-              Text { text: "Expires"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
+              Text { textFormat: Text.PlainText; text: "Expires"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
               Text {
-                text: (inspectorRoot.item && inspectorRoot.item.card) ? ((inspectorRoot.item.card.expMonth || "") + " / " + (inspectorRoot.item.card.expYear || "")) : ""
+                textFormat: Text.PlainText
+                text: inspectorRoot.cardExpiry(" / ")
                 color: inspectorRoot.foreground
                 font.pixelSize: inspectorRoot.valuePixelSize
                 font.family: "monospace"
@@ -1027,53 +677,26 @@ ScrollView {
             }
 
             GhostIconButton {
-              iconText: "\uf0c5"
+              iconText: ""
               tooltip: "Copy expiration date"
-              onClicked: inspectorRoot.copyRequested((inspectorRoot.item.card.expMonth || "") + "/" + (inspectorRoot.item.card.expYear || ""), false, "expiration date")
+              onClicked: inspectorRoot.copyRequested(inspectorRoot.cardExpiry("/"), false, "expiration date")
             }
           }
 
-          // Divider
           Rectangle {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.card && inspectorRoot.item.card.code)
+            visible: inspectorRoot.hasSecret(SecretFieldCatalog.CARD_CODE)
             Layout.fillWidth: true
-            height: 1
+            implicitHeight: 1
             color: inspectorRoot.borderColor
           }
 
-          // Security Code / CVV (Protected)
-          RowLayout {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.card && inspectorRoot.item.card.code)
-            Layout.fillWidth: true
-            spacing: 8
-
-            ColumnLayout {
-              Layout.fillWidth: true
-              Layout.preferredWidth: 0
-              spacing: 2
-              Text { text: "Security Code"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
-              Text {
-                text: (inspectorRoot.item && inspectorRoot.item.card) ? (inspectorRoot.showCardCodeRevealed ? (inspectorRoot.item.card.code || "") : "•••") : ""
-                color: inspectorRoot.foreground
-                font.pixelSize: inspectorRoot.valuePixelSize
-                font.family: "monospace"
-                font.weight: Font.Medium
-                elide: Text.ElideRight
-                Layout.fillWidth: true
-                Layout.preferredWidth: 0
-              }
-            }
-
-            GhostIconButton {
-              iconText: inspectorRoot.showCardCodeRevealed ? "\uf070" : "\uf06e"
-              tooltip: inspectorRoot.showCardCodeRevealed ? "Hide CVV" : "Show CVV"
-              onClicked: inspectorRoot.toggleCardCodeRevealed()
-            }
-            GhostIconButton {
-              iconText: "\uf0c5"
-              tooltip: "Copy CVV"
-              onClicked: inspectorRoot.copyRequested(inspectorRoot.item.card.code, true, "CVV")
-            }
+          // Security Code
+          InspectorSecretRow {
+            inspector: inspectorRoot
+            field: SecretFieldCatalog.CARD_CODE
+            label: "Security Code"
+            copyLabel: "security code"
+            maskText: inspectorRoot.cardCodeMask
           }
         }
       }
@@ -1097,7 +720,7 @@ ScrollView {
           spacing: 8
 
           RowLayout {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.identity && (inspectorRoot.item.identity.firstName || inspectorRoot.item.identity.lastName))
+            visible: inspectorRoot.sectionText("identity", "firstName") !== "" || inspectorRoot.sectionText("identity", "lastName") !== ""
             Layout.fillWidth: true
             spacing: 8
 
@@ -1105,9 +728,10 @@ ScrollView {
               Layout.fillWidth: true
               Layout.preferredWidth: 0
               spacing: 2
-              Text { text: "Full Name"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
+              Text { textFormat: Text.PlainText; text: "Full Name"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
               Text {
-                text: (inspectorRoot.item && inspectorRoot.item.identity) ? [inspectorRoot.item.identity.title, inspectorRoot.item.identity.firstName, inspectorRoot.item.identity.middleName, inspectorRoot.item.identity.lastName].filter(Boolean).join(" ") : ""
+                textFormat: Text.PlainText
+                text: inspectorRoot.identityFullName()
                 color: inspectorRoot.foreground
                 font.pixelSize: inspectorRoot.valuePixelSize
                 font.weight: Font.Medium
@@ -1118,24 +742,21 @@ ScrollView {
             }
 
             GhostIconButton {
-              iconText: "\uf0c5"
+              iconText: ""
               tooltip: "Copy full name"
-              onClicked: {
-                var n = [inspectorRoot.item.identity.title, inspectorRoot.item.identity.firstName, inspectorRoot.item.identity.middleName, inspectorRoot.item.identity.lastName].filter(Boolean).join(" ")
-                inspectorRoot.copyRequested(n, false, "full name")
-              }
+              onClicked: inspectorRoot.copyRequested(inspectorRoot.identityFullName(), false, "full name")
             }
           }
 
           Rectangle {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.identity && inspectorRoot.item.identity.email)
+            visible: inspectorRoot.sectionText("identity", "email") !== ""
             Layout.fillWidth: true
-            height: 1
+            implicitHeight: 1
             color: inspectorRoot.borderColor
           }
 
           RowLayout {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.identity && inspectorRoot.item.identity.email)
+            visible: inspectorRoot.sectionText("identity", "email") !== ""
             Layout.fillWidth: true
             spacing: 8
 
@@ -1143,9 +764,10 @@ ScrollView {
               Layout.fillWidth: true
               Layout.preferredWidth: 0
               spacing: 2
-              Text { text: "Email"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
+              Text { textFormat: Text.PlainText; text: "Email"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
               Text {
-                text: (inspectorRoot.item && inspectorRoot.item.identity) ? (inspectorRoot.item.identity.email || "") : ""
+                textFormat: Text.PlainText
+                text: inspectorRoot.sectionText("identity", "email")
                 color: inspectorRoot.foreground
                 font.pixelSize: inspectorRoot.valuePixelSize
                 font.weight: Font.Medium
@@ -1156,21 +778,21 @@ ScrollView {
             }
 
             GhostIconButton {
-              iconText: "\uf0c5"
+              iconText: ""
               tooltip: "Copy email"
-              onClicked: { if (inspectorRoot.item && inspectorRoot.item.identity) inspectorRoot.copyRequested(inspectorRoot.item.identity.email, false, "email") }
+              onClicked: inspectorRoot.copyRequested(inspectorRoot.sectionText("identity", "email"), false, "email")
             }
           }
 
           Rectangle {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.identity && inspectorRoot.item.identity.phone)
+            visible: inspectorRoot.sectionText("identity", "phone") !== ""
             Layout.fillWidth: true
-            height: 1
+            implicitHeight: 1
             color: inspectorRoot.borderColor
           }
 
           RowLayout {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.identity && inspectorRoot.item.identity.phone)
+            visible: inspectorRoot.sectionText("identity", "phone") !== ""
             Layout.fillWidth: true
             spacing: 8
 
@@ -1178,9 +800,10 @@ ScrollView {
               Layout.fillWidth: true
               Layout.preferredWidth: 0
               spacing: 2
-              Text { text: "Phone"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
+              Text { textFormat: Text.PlainText; text: "Phone"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
               Text {
-                text: (inspectorRoot.item && inspectorRoot.item.identity) ? (inspectorRoot.item.identity.phone || "") : ""
+                textFormat: Text.PlainText
+                text: inspectorRoot.sectionText("identity", "phone")
                 color: inspectorRoot.foreground
                 font.pixelSize: inspectorRoot.valuePixelSize
                 font.weight: Font.Medium
@@ -1191,21 +814,21 @@ ScrollView {
             }
 
             GhostIconButton {
-              iconText: "\uf0c5"
+              iconText: ""
               tooltip: "Copy phone"
-              onClicked: { if (inspectorRoot.item && inspectorRoot.item.identity) inspectorRoot.copyRequested(inspectorRoot.item.identity.phone, false, "phone number") }
+              onClicked: inspectorRoot.copyRequested(inspectorRoot.sectionText("identity", "phone"), false, "phone number")
             }
           }
 
           Rectangle {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.identity && (inspectorRoot.item.identity.address1 || inspectorRoot.item.identity.city))
+            visible: inspectorRoot.identityAddress() !== ""
             Layout.fillWidth: true
-            height: 1
+            implicitHeight: 1
             color: inspectorRoot.borderColor
           }
 
           RowLayout {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.identity && (inspectorRoot.item.identity.address1 || inspectorRoot.item.identity.city))
+            visible: inspectorRoot.identityAddress() !== ""
             Layout.fillWidth: true
             spacing: 8
 
@@ -1213,9 +836,10 @@ ScrollView {
               Layout.fillWidth: true
               Layout.preferredWidth: 0
               spacing: 2
-              Text { text: "Address"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
+              Text { textFormat: Text.PlainText; text: "Address"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
               Text {
-                text: (inspectorRoot.item && inspectorRoot.item.identity) ? [inspectorRoot.item.identity.address1, inspectorRoot.item.identity.address2, inspectorRoot.item.identity.city, inspectorRoot.item.identity.state, inspectorRoot.item.identity.postalCode, inspectorRoot.item.identity.country].filter(Boolean).join(", ") : ""
+                textFormat: Text.PlainText
+                text: inspectorRoot.identityAddress()
                 color: inspectorRoot.foreground
                 font.pixelSize: inspectorRoot.valuePixelSize
                 font.weight: Font.Medium
@@ -1226,153 +850,61 @@ ScrollView {
             }
 
             GhostIconButton {
-              iconText: "\uf0c5"
+              iconText: ""
               tooltip: "Copy address"
-              onClicked: {
-                var a = [inspectorRoot.item.identity.address1, inspectorRoot.item.identity.address2, inspectorRoot.item.identity.city, inspectorRoot.item.identity.state, inspectorRoot.item.identity.postalCode, inspectorRoot.item.identity.country].filter(Boolean).join(", ")
-                inspectorRoot.copyRequested(a, false, "address")
-              }
+              onClicked: inspectorRoot.copyRequested(inspectorRoot.identityAddress(), false, "address")
             }
+          }
+
+          Rectangle {
+            visible: inspectorRoot.hasSecret(SecretFieldCatalog.IDENTITY_SSN)
+            Layout.fillWidth: true
+            implicitHeight: 1
+            color: inspectorRoot.borderColor
+          }
+
+          InspectorSecretRow {
+            inspector: inspectorRoot
+            field: SecretFieldCatalog.IDENTITY_SSN
+            label: inspectorRoot.strings.t("inspector.label.ssn", "Social Security Number")
+            copyLabel: "social security number"
+          }
+
+          Rectangle {
+            visible: inspectorRoot.hasSecret(SecretFieldCatalog.IDENTITY_PASSPORT_NUMBER)
+            Layout.fillWidth: true
+            implicitHeight: 1
+            color: inspectorRoot.borderColor
+          }
+
+          InspectorSecretRow {
+            inspector: inspectorRoot
+            field: SecretFieldCatalog.IDENTITY_PASSPORT_NUMBER
+            label: inspectorRoot.strings.t("inspector.label.passport_number", "Passport Number")
+            copyLabel: "passport number"
+          }
+
+          Rectangle {
+            visible: inspectorRoot.hasSecret(SecretFieldCatalog.IDENTITY_LICENSE_NUMBER)
+            Layout.fillWidth: true
+            implicitHeight: 1
+            color: inspectorRoot.borderColor
+          }
+
+          InspectorSecretRow {
+            inspector: inspectorRoot
+            field: SecretFieldCatalog.IDENTITY_LICENSE_NUMBER
+            label: inspectorRoot.strings.t("inspector.label.license_number", "License Number")
+            copyLabel: "license number"
           }
         }
       }
 
       // --------------------------------------------------
-      // SSH KEY SECTION
+      // SECURE NOTE SECTION (masked until revealed)
       // --------------------------------------------------
       Rectangle {
-        visible: Boolean(inspectorRoot.item && inspectorRoot.item.ssh_key)
-        Layout.fillWidth: true
-        implicitHeight: sshKeyColumnLayout.implicitHeight + 20
-        radius: 6
-        color: Commons.Color.popups.background
-        border.color: inspectorRoot.borderColor
-        border.width: 1
-
-        ColumnLayout {
-          id: sshKeyColumnLayout
-          anchors.fill: parent
-          anchors.margins: 10
-          spacing: 8
-
-          RowLayout {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.ssh_key && inspectorRoot.item.ssh_key.private_key)
-            Layout.fillWidth: true
-            spacing: 8
-
-            ColumnLayout {
-              Layout.fillWidth: true
-              Layout.preferredWidth: 0
-              spacing: 2
-              Text { text: "Private Key"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
-              Text {
-                text: (inspectorRoot.item && inspectorRoot.item.ssh_key) ? (inspectorRoot.showPrivateKeyRevealed ? (inspectorRoot.item.ssh_key.private_key || "") : "••••••••••••••••") : ""
-                color: inspectorRoot.foreground
-                font.pixelSize: inspectorRoot.valuePixelSize
-                font.family: "monospace"
-                font.weight: Font.Medium
-                wrapMode: Text.WrapAnywhere
-                Layout.fillWidth: true
-                Layout.preferredWidth: 0
-              }
-            }
-
-            GhostIconButton {
-              iconText: inspectorRoot.showPrivateKeyRevealed ? "\uf070" : "\uf06e"
-              tooltip: inspectorRoot.showPrivateKeyRevealed ? "Hide private key" : "Show private key"
-              onClicked: inspectorRoot.togglePrivateKeyRevealed()
-            }
-            GhostIconButton {
-              iconText: "\uf0c5"
-              tooltip: "Copy private key"
-              onClicked: { if (inspectorRoot.item && inspectorRoot.item.ssh_key) inspectorRoot.copyRequested(inspectorRoot.item.ssh_key.private_key, true, "SSH private key") }
-            }
-            GhostIconButton {
-              iconText: "\uf093"
-              tooltip: "Export SSH key to ~/.ssh"
-              onClicked: { if (inspectorRoot.item) inspectorRoot.exportSshKeyRequested(inspectorRoot.item) }
-            }
-          }
-
-          Rectangle {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.ssh_key && inspectorRoot.item.ssh_key.private_key && (inspectorRoot.item.ssh_key.public_key || inspectorRoot.item.ssh_key.fingerprint))
-            Layout.fillWidth: true
-            height: 1
-            color: inspectorRoot.borderColor
-          }
-
-          RowLayout {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.ssh_key && inspectorRoot.item.ssh_key.public_key)
-            Layout.fillWidth: true
-            spacing: 8
-
-            ColumnLayout {
-              Layout.fillWidth: true
-              Layout.preferredWidth: 0
-              spacing: 2
-              Text { text: "Public Key"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
-              Text {
-                text: (inspectorRoot.item && inspectorRoot.item.ssh_key) ? (inspectorRoot.item.ssh_key.public_key || "") : ""
-                color: inspectorRoot.foreground
-                font.pixelSize: inspectorRoot.valuePixelSize
-                font.family: "monospace"
-                font.weight: Font.Medium
-                wrapMode: Text.WrapAnywhere
-                Layout.fillWidth: true
-                Layout.preferredWidth: 0
-              }
-            }
-
-            GhostIconButton {
-              iconText: "\uf0c5"
-              tooltip: "Copy public key"
-              onClicked: { if (inspectorRoot.item && inspectorRoot.item.ssh_key) inspectorRoot.copyRequested(inspectorRoot.item.ssh_key.public_key, false, "SSH public key") }
-            }
-          }
-
-          Rectangle {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.ssh_key && inspectorRoot.item.ssh_key.public_key && inspectorRoot.item.ssh_key.fingerprint)
-            Layout.fillWidth: true
-            height: 1
-            color: inspectorRoot.borderColor
-          }
-
-          RowLayout {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.ssh_key && inspectorRoot.item.ssh_key.fingerprint)
-            Layout.fillWidth: true
-            spacing: 8
-
-            ColumnLayout {
-              Layout.fillWidth: true
-              Layout.preferredWidth: 0
-              spacing: 2
-              Text { text: "Fingerprint"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
-              Text {
-                text: (inspectorRoot.item && inspectorRoot.item.ssh_key) ? (inspectorRoot.item.ssh_key.fingerprint || "") : ""
-                color: inspectorRoot.foreground
-                font.pixelSize: inspectorRoot.valuePixelSize
-                font.family: "monospace"
-                font.weight: Font.Medium
-                wrapMode: Text.WrapAnywhere
-                Layout.fillWidth: true
-                Layout.preferredWidth: 0
-              }
-            }
-
-            GhostIconButton {
-              iconText: "\uf0c5"
-              tooltip: "Copy fingerprint"
-              onClicked: { if (inspectorRoot.item && inspectorRoot.item.ssh_key) inspectorRoot.copyRequested(inspectorRoot.item.ssh_key.fingerprint, false, "fingerprint") }
-            }
-          }
-        }
-      }
-
-      // --------------------------------------------------
-      // SECURE NOTE SECTION
-      // --------------------------------------------------
-      Rectangle {
-        visible: Boolean(inspectorRoot.item && inspectorRoot.item.notes)
+        visible: inspectorRoot.hasSecret(SecretFieldCatalog.NOTES)
         Layout.fillWidth: true
         implicitHeight: notesColumnLayout.implicitHeight + 20
         radius: 6
@@ -1388,21 +920,27 @@ ScrollView {
 
           RowLayout {
             Layout.fillWidth: true
-            Text { text: "Notes"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
+            Text { textFormat: Text.PlainText; text: "Notes"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
             Item { Layout.fillWidth: true }
             GhostIconButton {
-              iconText: "\uf0c5"
+              iconText: (inspectorRoot.isRevealed(SecretFieldCatalog.NOTES) || inspectorRoot.isPending(SecretFieldCatalog.NOTES)) ? "" : ""
+              tooltip: "Show notes"
+              onClicked: inspectorRoot.revealToggleRequested(SecretFieldCatalog.NOTES)
+            }
+            GhostIconButton {
+              iconText: ""
               tooltip: "Copy notes"
-              onClicked: { if (inspectorRoot.item) inspectorRoot.copyRequested(inspectorRoot.item.notes, false, "notes") }
+              onClicked: inspectorRoot.secretCopyRequested(SecretFieldCatalog.NOTES, "notes")
             }
           }
 
-          Rectangle { Layout.fillWidth: true; height: 1; color: inspectorRoot.borderColor }
+          Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: inspectorRoot.borderColor }
 
           Text {
+            objectName: "inspectorNotesValue"
             Layout.fillWidth: true
             Layout.preferredWidth: 0
-            text: inspectorRoot.item ? (inspectorRoot.item.notes || "") : ""
+            text: inspectorRoot.secretDisplayText(SecretFieldCatalog.NOTES, inspectorRoot.passwordMask)
             color: inspectorRoot.foreground
             font.pixelSize: inspectorRoot.valuePixelSize
             lineHeight: 1.35
@@ -1414,9 +952,9 @@ ScrollView {
 
       // Empty Secure Note Placeholder
       Rectangle {
-        visible: Boolean(inspectorRoot.item && inspectorRoot.item.type_name === "note" && !inspectorRoot.item.notes && (!inspectorRoot.item.fields || inspectorRoot.item.fields.length === 0) && (!inspectorRoot.item.attachments || inspectorRoot.item.attachments.length === 0))
+        visible: Boolean(inspectorRoot.item && inspectorRoot.item.type_name === "note" && !inspectorRoot.hasSecret(SecretFieldCatalog.NOTES) && inspectorRoot.customFields.length === 0)
         Layout.fillWidth: true
-        height: 60
+        Layout.preferredHeight: 60
         radius: 6
         color: Commons.Color.popups.background
         border.color: inspectorRoot.borderColor
@@ -1426,12 +964,14 @@ ScrollView {
           anchors.centerIn: parent
           spacing: 6
           Text {
-            text: "\uf0f6"
+            textFormat: Text.PlainText
+            text: ""
             font.family: inspectorRoot.fontFamily
             color: inspectorRoot.muted
             font.pixelSize: Style.font.body
           }
           Text {
+            textFormat: Text.PlainText
             text: "This secure note has no text or custom fields."
             color: inspectorRoot.muted
             font.pixelSize: Style.font.bodySmall
@@ -1440,10 +980,10 @@ ScrollView {
       }
 
       // --------------------------------------------------
-      // CUSTOM FIELDS SECTION
+      // CUSTOM FIELDS SECTION (rows without a value are hidden)
       // --------------------------------------------------
       Rectangle {
-        visible: Boolean(inspectorRoot.item && inspectorRoot.item.fields && inspectorRoot.item.fields.length > 0)
+        visible: inspectorRoot.customFields.length > 0
         Layout.fillWidth: true
         implicitHeight: customFieldsColumnLayout.implicitHeight + 20
         radius: 6
@@ -1458,30 +998,45 @@ ScrollView {
           spacing: 8
 
           Text {
+            textFormat: Text.PlainText
             text: "Custom Fields"
             color: inspectorRoot.muted
             font.pixelSize: inspectorRoot.keyPixelSize
           }
 
           Repeater {
-            model: (inspectorRoot.item && inspectorRoot.item.fields) ? inspectorRoot.item.fields : []
+            model: inspectorRoot.customFields
 
             ColumnLayout {
               id: customFieldRow
               Layout.fillWidth: true
               spacing: 8
 
-              property bool isHiddenField: Boolean(modelData && modelData.type === 1)
-              property bool itemRevealed: false
-              property bool isRevealed: itemRevealed || inspectorRoot.showCustomHiddenRevealed
+              required property var modelData
+              readonly property string field: SecretFieldCatalog.customFieldIdentifier(modelData.index)
+              readonly property string fieldName: modelData.name ? String(modelData.name) : "Field"
+              readonly property bool isHiddenField: SecretFieldCatalog.isHiddenCustomField(modelData)
 
               Rectangle {
                 Layout.fillWidth: true
-                height: 1
+                implicitHeight: 1
                 color: inspectorRoot.borderColor
               }
 
+              // Hidden field: masked until revealed
+              InspectorSecretRow {
+                visible: customFieldRow.isHiddenField
+                inspector: inspectorRoot
+                field: customFieldRow.field
+                label: customFieldRow.fieldName
+                copyLabel: customFieldRow.fieldName
+                maskText: inspectorRoot.passwordMask
+              }
+
+              // Text, boolean or other field: the redacted item shows text and
+              // boolean values; copying still goes through copy-field.
               RowLayout {
+                visible: !customFieldRow.isHiddenField
                 Layout.fillWidth: true
                 spacing: 8
 
@@ -1491,7 +1046,8 @@ ScrollView {
                   spacing: 2
 
                   Text {
-                    text: modelData.name || "Field"
+                    textFormat: Text.PlainText
+                    text: customFieldRow.fieldName
                     color: inspectorRoot.muted
                     font.pixelSize: inspectorRoot.keyPixelSize
                     elide: Text.ElideRight
@@ -1500,10 +1056,10 @@ ScrollView {
                   }
 
                   Text {
-                    text: (modelData.type === 1 && !customFieldRow.isRevealed) ? "••••••••••••••••" : (modelData.value || "")
+                    textFormat: Text.PlainText
+                    text: SecretFieldCatalog.hasPublicCustomValue(customFieldRow.modelData) ? String(customFieldRow.modelData.value === undefined || customFieldRow.modelData.value === null ? "" : customFieldRow.modelData.value) : inspectorRoot.passwordMask
                     color: inspectorRoot.foreground
                     font.pixelSize: inspectorRoot.valuePixelSize
-                    font.family: (modelData.type === 1 && !customFieldRow.isRevealed) ? "monospace" : "sans-serif"
                     font.weight: Font.Medium
                     elide: Text.ElideRight
                     Layout.fillWidth: true
@@ -1511,114 +1067,10 @@ ScrollView {
                   }
                 }
 
-                // Ghost Reveal Button (for hidden custom fields)
                 GhostIconButton {
-                  visible: modelData.type === 1
-                  iconText: customFieldRow.isRevealed ? "\uf070" : "\uf06e"
-                  tooltip: customFieldRow.isRevealed ? "Hide field" : "Show field"
-                  onClicked: {
-                    if (inspectorRoot.showCustomHiddenRevealed) {
-                      customFieldRow.itemRevealed = false
-                    } else {
-                      customFieldRow.itemRevealed = !customFieldRow.itemRevealed
-                    }
-                  }
-                }
-
-                // Ghost Copy Button
-                GhostIconButton {
-                  iconText: "\uf0c5"
+                  iconText: ""
                   tooltip: "Copy field value"
-                  onClicked: inspectorRoot.copyRequested(modelData.value || "", modelData.type === 1, modelData.name || "field")
-                }
-              }
-            }
-          }
-        }
-      }
-
-      // --------------------------------------------------
-      // ATTACHMENTS LIST SECTION
-      // --------------------------------------------------
-      Rectangle {
-        visible: Boolean(inspectorRoot.item && inspectorRoot.item.attachments && inspectorRoot.item.attachments.length > 0)
-        Layout.fillWidth: true
-        implicitHeight: attachmentsColumnLayout.implicitHeight + 20
-        radius: 6
-        color: Commons.Color.popups.background
-        border.color: inspectorRoot.borderColor
-        border.width: 1
-
-        ColumnLayout {
-          id: attachmentsColumnLayout
-          anchors.fill: parent
-          anchors.margins: 10
-          spacing: 8
-
-          Text {
-            text: "Attachments (" + (inspectorRoot.item ? (inspectorRoot.item.attachments ? inspectorRoot.item.attachments.length : 0) : 0) + ")"
-            color: inspectorRoot.muted
-            font.pixelSize: inspectorRoot.keyPixelSize
-          }
-
-          Repeater {
-            model: (inspectorRoot.item && inspectorRoot.item.attachments) ? inspectorRoot.item.attachments : []
-
-            ColumnLayout {
-              Layout.fillWidth: true
-              spacing: 8
-
-              Rectangle {
-                Layout.fillWidth: true
-                height: 1
-                color: inspectorRoot.borderColor
-              }
-
-              RowLayout {
-                Layout.fillWidth: true
-                spacing: 8
-
-                Text {
-                  text: inspectorRoot.getAttachmentIcon(modelData.fileName)
-                  font.family: inspectorRoot.fontFamily
-                  font.pixelSize: Style.font.title
-                  color: inspectorRoot.muted
-                }
-
-                ColumnLayout {
-                  Layout.fillWidth: true
-                  Layout.preferredWidth: 0
-                  spacing: 1
-
-                  Text {
-                    text: modelData.fileName || "attachment"
-                    color: inspectorRoot.foreground
-                    font.pixelSize: Style.font.bodySmall
-                    font.weight: Font.Medium
-                    elide: Text.ElideRight
-                    Layout.fillWidth: true
-                    Layout.preferredWidth: 0
-                  }
-                  Text {
-                    text: modelData.sizeName || inspectorRoot.formatFileSize(modelData.size)
-                    color: inspectorRoot.muted
-                    font.pixelSize: Style.font.caption
-                  }
-                }
-
-                // View / Preview Ghost Button (Only for previewable attachments)
-                GhostIconButton {
-                  visible: inspectorRoot.isAttachmentPreviewable(modelData.fileName)
-                  iconText: (inspectorRoot.loadingAttachmentId === (modelData.id || modelData.fileName)) ? "\uf021" : "\uf06e"
-                  tooltip: "Preview attachment"
-                  onClicked: inspectorRoot.viewAttachmentRequested(inspectorRoot.item, modelData)
-                }
-
-                // Download Ghost Button
-                GhostIconButton {
-                  iconText: "\uf019"
-                  tooltip: "Download attachment"
-                  onClicked: inspectorRoot.downloadAttachmentRequested(inspectorRoot.item, modelData)
+                  onClicked: inspectorRoot.secretCopyRequested(customFieldRow.field, customFieldRow.fieldName)
                 }
               }
             }
@@ -1630,7 +1082,7 @@ ScrollView {
       // ITEM HISTORY SECTION
       // --------------------------------------------------
       Rectangle {
-        visible: Boolean(inspectorRoot.item && (inspectorRoot.item.created_at || inspectorRoot.item.updated_at))
+        visible: Boolean(inspectorRoot.item && (inspectorRoot.item.created_at || inspectorRoot.item.updated_at || inspectorRoot.hasSecret(SecretFieldCatalog.PASSWORD_HISTORY)))
         Layout.fillWidth: true
         implicitHeight: historyColumnLayout.implicitHeight + 20
         radius: 6
@@ -1645,6 +1097,7 @@ ScrollView {
           spacing: 8
 
           Text {
+            textFormat: Text.PlainText
             text: "Item history"
             color: inspectorRoot.muted
             font.pixelSize: inspectorRoot.keyPixelSize
@@ -1658,7 +1111,7 @@ ScrollView {
 
             Rectangle {
               Layout.fillWidth: true
-              height: 1
+              implicitHeight: 1
               color: inspectorRoot.borderColor
             }
 
@@ -1670,8 +1123,9 @@ ScrollView {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 spacing: 2
-                Text { text: "Created"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
+                Text { textFormat: Text.PlainText; text: "Created"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
                 Text {
+                  textFormat: Text.PlainText
                   text: (inspectorRoot.item && inspectorRoot.item.created_at) ? inspectorRoot.formatDateTime(inspectorRoot.item.created_at) : ""
                   color: inspectorRoot.foreground
                   font.pixelSize: inspectorRoot.valuePixelSize
@@ -1691,9 +1145,8 @@ ScrollView {
             spacing: 8
 
             Rectangle {
-              visible: Boolean(inspectorRoot.item && inspectorRoot.item.created_at)
               Layout.fillWidth: true
-              height: 1
+              implicitHeight: 1
               color: inspectorRoot.borderColor
             }
 
@@ -1705,8 +1158,9 @@ ScrollView {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 spacing: 2
-                Text { text: "Updated"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
+                Text { textFormat: Text.PlainText; text: "Updated"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
                 Text {
+                  textFormat: Text.PlainText
                   text: (inspectorRoot.item && inspectorRoot.item.updated_at) ? inspectorRoot.formatDateTime(inspectorRoot.item.updated_at) : ""
                   color: inspectorRoot.foreground
                   font.pixelSize: inspectorRoot.valuePixelSize
@@ -1719,15 +1173,15 @@ ScrollView {
             }
           }
 
-          // Password History Entry Button (Only for Login items with history)
+          // Password History entry (login items whose flag is set)
           ColumnLayout {
-            visible: Boolean(inspectorRoot.item && inspectorRoot.item.login && inspectorRoot.item.login.password_history && inspectorRoot.item.login.password_history.length > 0)
+            visible: inspectorRoot.hasSecret(SecretFieldCatalog.PASSWORD_HISTORY)
             Layout.fillWidth: true
             spacing: 8
 
             Rectangle {
               Layout.fillWidth: true
-              height: 1
+              implicitHeight: 1
               color: inspectorRoot.borderColor
             }
 
@@ -1739,9 +1193,10 @@ ScrollView {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 spacing: 2
-                Text { text: "Password History"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
+                Text { textFormat: Text.PlainText; text: "Password History"; color: inspectorRoot.muted; font.pixelSize: inspectorRoot.keyPixelSize }
                 Text {
-                  text: (inspectorRoot.item && inspectorRoot.item.login && inspectorRoot.item.login.password_history) ? (inspectorRoot.item.login.password_history.length + " previous password(s)") : ""
+                  textFormat: Text.PlainText
+                  text: inspectorRoot.strings.tn("inspector.password_history_count", inspectorRoot.passwordHistoryCount()).arg(inspectorRoot.passwordHistoryCount())
                   color: inspectorRoot.foreground
                   font.pixelSize: inspectorRoot.valuePixelSize
                   font.weight: Font.Medium
@@ -1751,9 +1206,8 @@ ScrollView {
                 }
               }
 
-              // View Password History Ghost Button
               GhostIconButton {
-                iconText: "\uf1da"
+                iconText: ""
                 tooltip: "View password history (Ctrl+H)"
                 onClicked: inspectorRoot.passwordHistoryRequested(inspectorRoot.item)
               }
@@ -1764,4 +1218,3 @@ ScrollView {
     }
   }
 }
-

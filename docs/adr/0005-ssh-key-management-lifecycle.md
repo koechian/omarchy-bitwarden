@@ -1,5 +1,7 @@
 # ADR 0005: Omawarden SSH Key Automated Lifecycle, Generation, Import, and Export
 
+> **Removed in this fork.** koechian/omarchy-bitwarden no longer includes SSH key management (generation, import and export). This record is kept for history only.
+
 ## Status
 Accepted
 

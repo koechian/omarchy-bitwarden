@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::ops::RangeInclusive;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
@@ -15,6 +16,16 @@ pub struct TotpParams {
     pub algorithm: String, // "SHA1", "SHA256", "SHA512"
     pub digits: u32,
     pub period: u64,
+}
+
+/// Accepted TOTP step lengths in seconds. Zero would divide by zero.
+pub const TOTP_PERIOD_RANGE: RangeInclusive<u64> = 1..=3600;
+/// Accepted TOTP code lengths. The dynamic truncation yields a 31-bit value,
+/// so more than 10 digits carries no additional information.
+pub const TOTP_DIGITS_RANGE: RangeInclusive<u32> = 1..=10;
+
+fn has_valid_totp_parameters(digits: u32, period: u64) -> bool {
+    TOTP_DIGITS_RANGE.contains(&digits) && TOTP_PERIOD_RANGE.contains(&period)
 }
 
 pub fn parse_totp_params(secret_or_uri: &str) -> Option<TotpParams> {
@@ -113,6 +124,9 @@ pub fn generate_totp(
     } else {
         default_period
     };
+    if !has_valid_totp_parameters(digits, period) {
+        return None;
+    }
 
     let now = timestamp.unwrap_or_else(|| {
         SystemTime::now()
@@ -176,8 +190,8 @@ pub fn generate_totp(
         result[offset + 3],
     ]);
 
-    let modulus = 10u32.pow(digits);
-    let code_val = code_int % modulus;
+    let modulus = 10u64.pow(digits);
+    let code_val = u64::from(code_int) % modulus;
     let code_str = format!("{:0width$}", code_val, width = digits as usize);
 
     crate::log_info!(
@@ -237,5 +251,45 @@ mod tests {
         assert_eq!(res.code.len(), 8);
         assert_eq!(res.period, 60);
         assert_eq!(res.ttl, 1);
+    }
+
+    #[test]
+    fn test_generate_totp_rejects_invalid_period_and_digits() {
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        let invalid_uris = [
+            "period=0",
+            "period=3601",
+            "period=18446744073709551615",
+            "digits=0",
+            "digits=11",
+            "digits=4294967295",
+        ];
+        for query in invalid_uris {
+            let uri = format!("otpauth://totp/Test:user?secret={secret}&{query}");
+            assert_eq!(generate_totp(&uri, Some(59), 6, 30), None, "{query}");
+            let compact = format!("{secret}?{query}");
+            assert_eq!(generate_totp(&compact, Some(59), 6, 30), None, "{query}");
+        }
+        assert_eq!(generate_totp(secret, Some(59), 6, 0), None);
+        assert_eq!(generate_totp(secret, Some(59), 12, 30), None);
+    }
+
+    #[test]
+    fn test_generate_totp_accepts_boundary_parameters() {
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        let ten_digits = generate_totp(&format!("{secret}?digits=10"), Some(59), 6, 30).unwrap();
+        assert_eq!(ten_digits.code.len(), 10);
+        // RFC 6238 gives 94287082 as the 8-digit SHA-1 code at T=59.
+        assert!(ten_digits.code.ends_with("94287082"), "{}", ten_digits.code);
+
+        let one_digit = generate_totp(&format!("{secret}?digits=1"), Some(59), 6, 30).unwrap();
+        assert_eq!(one_digit.code, "2");
+
+        let one_second = generate_totp(&format!("{secret}?period=1"), Some(59), 6, 30).unwrap();
+        assert_eq!(one_second.period, 1);
+        assert_eq!(one_second.ttl, 1);
+
+        let one_hour = generate_totp(&format!("{secret}?period=3600"), Some(59), 6, 30).unwrap();
+        assert_eq!(one_hour.ttl, 3541);
     }
 }

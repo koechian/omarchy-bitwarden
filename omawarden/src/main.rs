@@ -1,18 +1,11 @@
 use clap::{Parser, Subcommand};
-use omawarden::attachment::get_attachment;
 use omawarden::auth::AuthManager;
 use omawarden::clipboard::ClipboardManager;
 use omawarden::config::{ConfigManager, ConfigUpdateOptions};
-use omawarden::daemon::{
-    ensure_daemon_running, run_daemon_server, send_daemon_request, DaemonState,
-};
+use omawarden::daemon::{run_daemon_server, send_daemon_request, DaemonState};
 use omawarden::health::check_system_health;
 use omawarden::hook::install_lock_hook;
 use omawarden::keyring::KeyringManager;
-use omawarden::ssh::{
-    generate_keypair, parse_private_key, write_keypair_files, write_keypair_files_named,
-    SshAlgorithm,
-};
 use omawarden::storage::StorageManager;
 use omawarden::totp::generate_totp;
 use omawarden::vault::VaultManager;
@@ -21,6 +14,7 @@ use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 /// Strict boolean for CLI flags: anything outside true/false/1/0/yes/no is a
 /// parse error instead of silently becoming `false`. `--quick-unlock ture`
@@ -110,9 +104,9 @@ enum Commands {
         totp: bool,
         #[arg(long, help = "Copy notes")]
         notes: bool,
-        #[arg(long, help = "Copy SSH private key or card security code")]
+        #[arg(long, help = "Copy card security code")]
         private_key: bool,
-        #[arg(long, help = "Copy SSH public key or card number")]
+        #[arg(long, help = "Copy card number")]
         public_key: bool,
         #[arg(long, help = "Auto-clear timeout in seconds (default: config value)")]
         timeout: Option<i64>,
@@ -125,17 +119,15 @@ enum Commands {
         #[arg(
             long,
             hide = true,
-            help = "Internal worker: expected clipboard generation"
+            help = "Internal worker: PID of the wl-copy process serving the offer"
         )]
-        expected_gen: Option<u64>,
-        #[arg(long, hide = true, help = "Internal worker: wl-copy binary path")]
-        wl_copy_path: Option<String>,
+        owner_pid: Option<u32>,
         #[arg(
             long,
             hide = true,
-            help = "Internal worker: custom generation file path"
+            help = "Internal worker: start time of the wl-copy process serving the offer"
         )]
-        gen_path: Option<std::path::PathBuf>,
+        owner_start_time: Option<u64>,
     },
     #[command(about = "Generate TOTP verification code from vault item ID/name, or via STDIN")]
     Totp {
@@ -151,21 +143,6 @@ enum Commands {
         stdin: bool,
         #[arg(long, help = "Copy generated code directly to clipboard")]
         copy: bool,
-    },
-    #[command(about = "Manage vault item attachments")]
-    Attachment {
-        #[command(subcommand)]
-        action: AttachmentAction,
-    },
-    #[command(about = "SSH key lifecycle management (generate, import, export)")]
-    SshKey {
-        #[command(subcommand)]
-        action: SshKeyAction,
-    },
-    #[command(name = "ssh-agent", about = "SSH agent backed by the vault's SSH keys")]
-    SshAgent {
-        #[command(subcommand)]
-        action: SshAgentAction,
     },
     #[command(about = "Run omawarden background daemon")]
     Daemon {
@@ -236,23 +213,6 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
-enum SshAgentAction {
-    #[command(about = "Show whether the agent is enabled and running, and its socket (JSON)")]
-    Status,
-    #[command(about = "List signatures waiting for confirmation (JSON)")]
-    Pending,
-    #[command(about = "Answer a pending confirmation")]
-    Reply {
-        #[arg(help = "Prompt id from `ssh-agent pending`")]
-        id: u64,
-        #[arg(long, conflicts_with = "deny", required_unless_present = "deny")]
-        allow: bool,
-        #[arg(long)]
-        deny: bool,
-    },
-}
-
-#[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum ConfigAction {
     #[command(about = "Get current configuration or a specific key")]
@@ -267,8 +227,6 @@ enum ConfigAction {
         #[arg(long)]
         identity_url: Option<String>,
         #[arg(long)]
-        download_dir: Option<String>,
-        #[arg(long)]
         auto_lock: Option<i64>,
         #[arg(long)]
         clipboard_clear: Option<i64>,
@@ -277,15 +235,9 @@ enum ConfigAction {
         #[arg(long)]
         remember_email: Option<String>,
         #[arg(long)]
-        check_updates: Option<String>,
-        #[arg(long)]
         log_level: Option<String>,
         #[arg(long)]
-        show_website_icons: Option<String>,
-        #[arg(long)]
         remember_last_search: Option<String>,
-        #[arg(long, help = "Maximum allowed attachment size in MB (default: 500)")]
-        max_attachment_size: Option<u64>,
         #[arg(
             long,
             help = "Path to client certificate PEM file for mTLS (pass \"\" to clear)"
@@ -293,14 +245,6 @@ enum ConfigAction {
         client_cert: Option<String>,
         #[arg(long, help = "Path to separate client private key PEM file for mTLS")]
         client_key: Option<String>,
-        #[arg(
-            long,
-            value_parser = parse_cli_bool,
-            help = "Serve vault SSH keys as an SSH agent (true/false)"
-        )]
-        ssh_agent: Option<bool>,
-        #[arg(long, help = "Confirm SSH signatures: always, first-use or never")]
-        ssh_agent_confirm: Option<String>,
         #[arg(
             long,
             value_parser = parse_cli_bool,
@@ -376,80 +320,49 @@ enum VaultAction {
         #[arg(long = "filter")]
         category: Option<String>,
     },
-}
-
-#[derive(Subcommand)]
-enum AttachmentAction {
-    #[command(about = "Download or view an attachment")]
-    Download {
-        #[arg(long, required = true)]
-        item_id: String,
-        #[arg(long, required = true)]
-        attachment_id: String,
-        #[arg(long, required = true)]
-        filename: String,
-        #[arg(long)]
-        output_dir: Option<String>,
-        #[arg(long)]
-        open: bool,
-        #[arg(long)]
-        preview: bool,
+    #[command(about = "Print one secret field of one item (counted against the release budget)")]
+    Reveal {
+        #[arg(long, help = "Vault item ID")]
+        id: String,
+        #[arg(
+            long,
+            help = "login.password, login.totp, notes, card.number, card.code, identity.ssn, identity.passport_number, identity.license_number, custom.<index> or password_history"
+        )]
+        field: String,
     },
-    #[command(about = "Clean temporary preview attachments")]
-    Clean {
-        #[arg(long)]
-        item_id: Option<String>,
+    #[command(
+        about = "Copy one secret field of one item to the clipboard from the daemon (counted against the release budget)"
+    )]
+    CopyField {
+        #[arg(long, help = "Vault item ID")]
+        id: String,
+        #[arg(
+            long,
+            help = "Field identifier, as for 'vault reveal' (except password_history)"
+        )]
+        field: String,
+        #[arg(long, help = "Seconds until the clipboard is cleared (1-3600)")]
+        clear_after: Option<u64>,
     },
-}
-
-#[derive(Subcommand)]
-enum SshKeyAction {
-    #[command(about = "Generate a new SSH keypair and store it in Bitwarden")]
-    Create {
-        #[arg(long, required = true)]
-        name: String,
-        #[arg(long, default_value = "ed25519")]
-        algorithm: SshAlgorithm,
-        #[arg(long)]
-        comment: Option<String>,
-        #[arg(long)]
-        notes: Option<String>,
-        #[arg(long)]
-        folder: Option<String>,
-        #[arg(long)]
-        out_dir: Option<PathBuf>,
-    },
-    #[command(about = "Import an existing SSH private key file or STDIN into Bitwarden")]
-    Import {
-        #[arg(long, required = true)]
-        name: String,
-        #[arg(long)]
-        private_key: Option<PathBuf>,
-        #[arg(long)]
-        public_key: Option<PathBuf>,
-        #[arg(long)]
-        stdin: bool,
-        #[arg(long)]
-        notes: Option<String>,
-        #[arg(long)]
-        folder: Option<String>,
-    },
-    #[command(about = "Export an SSH key to local file or standard output")]
-    Export {
-        #[arg(index = 1, required = true)]
-        query: String,
-        #[arg(long)]
-        out_dir: Option<PathBuf>,
-        #[arg(long)]
-        private_key_file: Option<String>,
-        #[arg(long)]
-        public_key_file: Option<String>,
-        #[arg(long)]
-        stdout: bool,
-        #[arg(long)]
-        public_only: bool,
-        #[arg(long)]
-        private_only: bool,
+    #[command(
+        about = "Stage several secret fields of one item on the clipboard from the daemon, one per paste, in order (counted against the release budget, one release per field)"
+    )]
+    CopySequence {
+        #[arg(long, help = "Vault item ID")]
+        id: String,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            num_args = 1..,
+            required = true,
+            help = "Comma-separated field identifiers in paste order, as for 'vault copy-field' (for example login.password,login.totp)"
+        )]
+        fields: Vec<String>,
+        #[arg(
+            long,
+            help = "Seconds until any stage not yet pasted is withdrawn from the clipboard (1-3600)"
+        )]
+        clear_after: Option<u64>,
     },
 }
 
@@ -486,65 +399,616 @@ fn read_clipboard_stdin() -> String {
     String::new()
 }
 
-fn parse_auth_payload(raw: &str) -> (String, Option<String>, Option<i32>, Option<String>) {
-    let trimmed = raw.trim_end_matches(&['\r', '\n'][..]).trim();
-    if trimmed.is_empty() {
-        return (String::new(), None, None, None);
-    }
+/// Master password, 2FA code, 2FA provider, new-device OTP.
+type AuthPayload = (
+    Zeroizing<String>,
+    Option<String>,
+    Option<i32>,
+    Option<String>,
+);
 
-    if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-        if let Some(map) = val.as_object() {
-            let pwd = map
-                .get("password")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let code_val = map
-                .get("code")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let two_factor_provider = map
-                .get("two_factor_provider")
-                .or_else(|| map.get("twoFactorProvider"))
-                .or_else(|| map.get("provider"))
-                .and_then(|v| {
-                    if let Some(n) = v.as_i64() {
-                        Some(n as i32)
-                    } else if let Some(s) = v.as_str() {
-                        s.parse::<i32>().ok()
-                    } else {
-                        None
-                    }
-                });
-            let new_device_otp = map
-                .get("new_device_otp")
-                .or_else(|| map.get("newDeviceOtp"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            return (pwd, code_val, two_factor_provider, new_device_otp);
-        }
-    }
-
-    let mut pwd = trimmed.to_string();
-    if pwd.starts_with('"') && pwd.ends_with('"') && pwd.len() >= 2 {
-        if let Ok(unescaped) = serde_json::from_str::<String>(&pwd) {
-            pwd = unescaped;
-        }
-    }
-
-    (pwd, None, None, None)
+fn empty_auth_payload() -> AuthPayload {
+    (Zeroizing::new(String::new()), None, None, None)
 }
 
-fn read_auth_payload() -> (String, Option<String>, Option<i32>, Option<String>) {
+fn parse_two_factor_provider(value: &Value) -> Option<i32> {
+    if let Some(number) = value.as_i64() {
+        return Some(number as i32);
+    }
+    value.as_str().and_then(|text| text.parse::<i32>().ok())
+}
+
+fn parse_auth_payload_object(map: &serde_json::Map<String, Value>) -> AuthPayload {
+    let password = Zeroizing::new(
+        map.get("password")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    );
+    let code = map
+        .get("code")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let two_factor_provider = map
+        .get("two_factor_provider")
+        .or_else(|| map.get("twoFactorProvider"))
+        .or_else(|| map.get("provider"))
+        .and_then(parse_two_factor_provider);
+    let new_device_otp = map
+        .get("new_device_otp")
+        .or_else(|| map.get("newDeviceOtp"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    (password, code, two_factor_provider, new_device_otp)
+}
+
+/// A plain-text password, unquoted when it was sent as a JSON string.
+fn parse_plain_password(trimmed: &str) -> Zeroizing<String> {
+    let quoted = trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"');
+    if quoted {
+        if let Ok(unescaped) = serde_json::from_str::<String>(trimmed) {
+            return Zeroizing::new(unescaped);
+        }
+    }
+    Zeroizing::new(trimmed.to_string())
+}
+
+/// Parses the stdin authentication payload: a JSON object with `password`
+/// and optional 2FA fields, or the password as plain text. The parsed JSON
+/// is zeroized before it is dropped because it holds the master password.
+fn parse_auth_payload(raw: &str) -> AuthPayload {
+    let trimmed = raw.trim_end_matches(&['\r', '\n'][..]).trim();
+    if trimmed.is_empty() {
+        return empty_auth_payload();
+    }
+    if let Ok(mut value) = serde_json::from_str::<Value>(trimmed) {
+        let parsed = value.as_object().map(parse_auth_payload_object);
+        omawarden::secret_memory::zeroize_json_value(&mut value);
+        if let Some(payload) = parsed {
+            return payload;
+        }
+    }
+    (parse_plain_password(trimmed), None, None, None)
+}
+
+fn read_auth_payload() -> AuthPayload {
     let stdin = io::stdin();
     if stdin.is_terminal() {
-        return (String::new(), None, None, None);
+        return empty_auth_payload();
     }
-    let mut buffer = String::new();
+    let mut buffer = Zeroizing::new(String::new());
     if stdin.lock().read_line(&mut buffer).is_err() {
-        return (String::new(), None, None, None);
+        return empty_auth_payload();
     }
     parse_auth_payload(&buffer)
+}
+
+/// Reads the master password from the terminal prompt, or the first line of
+/// stdin when it is not a terminal, into memory that is zeroized on drop.
+fn read_master_password() -> Zeroizing<String> {
+    let stdin = io::stdin();
+    if stdin.is_terminal() {
+        return Zeroizing::new(
+            rpassword::prompt_password("Enter Master Password: ").unwrap_or_default(),
+        );
+    }
+    let mut buffer = Zeroizing::new(String::new());
+    if stdin.lock().read_line(&mut buffer).is_err() {
+        return Zeroizing::new(String::new());
+    }
+    while buffer.ends_with(['\r', '\n']) {
+        buffer.pop();
+    }
+    buffer
+}
+
+fn print_pretty(value: &Value) {
+    println!("{}", serde_json::to_string_pretty(value).unwrap());
+}
+
+fn print_failure(message: &str) -> ExitCode {
+    print_pretty(&json!({ "ok": false, "error": message }));
+    ExitCode::FAILURE
+}
+
+fn response_succeeded(response: &Value) -> bool {
+    response.get("ok").and_then(Value::as_bool) == Some(true)
+}
+
+fn response_error(response: &Value) -> String {
+    response
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("The omawarden daemon rejected the request.")
+        .to_string()
+}
+
+const DAEMON_UNAVAILABLE: &str = "omawarden daemon is not running.";
+
+fn daemon_reports_unlocked() -> bool {
+    send_daemon_request(&json!({ "action": "status" }))
+        .and_then(|status| status.get("is_unlocked").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// Unlocks the daemon with a master password from stdin when it is locked,
+/// so scripted callers (`echo pw | omawarden copy …`) keep working. The
+/// secret is then released by the daemon, never decrypted by the CLI.
+fn ensure_daemon_unlocked() -> Result<(), String> {
+    if daemon_reports_unlocked() {
+        return Ok(());
+    }
+    let (password, ..) = read_auth_payload();
+    if password.is_empty() {
+        return Err("Vault is locked. Please unlock the vault first using 'omawarden auth unlock' or provide Master Password.".to_string());
+    }
+    let response = omawarden::daemon::send_unlock_request(&password)
+        .ok_or_else(|| DAEMON_UNAVAILABLE.to_string())?;
+    if response_succeeded(&response) {
+        return Ok(());
+    }
+    Err(response_error(&response))
+}
+
+/// Resolves an item ID or name to its redacted view through the daemon.
+fn resolve_redacted_item(query: &str) -> Result<Value, String> {
+    omawarden::daemon::ensure_daemon_running();
+    ensure_daemon_unlocked()?;
+    let response = send_daemon_request(&json!({ "action": "get_item", "query": query }))
+        .ok_or_else(|| DAEMON_UNAVAILABLE.to_string())?;
+    if !response_succeeded(&response) {
+        return Err(response_error(&response));
+    }
+    response
+        .get("item")
+        .cloned()
+        .ok_or_else(|| format!("Item '{}' not found in vault", query))
+}
+
+fn item_text<'a>(item: &'a Value, key: &str) -> &'a str {
+    item.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// Sends `reveal_field` or `copy_field` for one field of one item. These
+/// releases are counted by the daemon's release budget (ADR 0027).
+fn request_field_release(
+    action: &str,
+    item_id: &str,
+    field: &str,
+    clear_after_seconds: Option<u64>,
+) -> Result<Value, String> {
+    let mut request = json!({ "action": action, "id": item_id, "field": field });
+    if let Some(seconds) = clear_after_seconds {
+        request["clear_after_seconds"] = json!(seconds);
+    }
+    let response = send_daemon_request(&request).ok_or_else(|| DAEMON_UNAVAILABLE.to_string())?;
+    if response_succeeded(&response) {
+        return Ok(response);
+    }
+    Err(response_error(&response))
+}
+
+/// Which field `omawarden copy` copies.
+#[derive(Debug, PartialEq)]
+enum CopyTarget {
+    /// Not a secret: copied by the CLI itself without the sensitive hint.
+    Username,
+    /// A secret: copied by the daemon through `copy_field`.
+    Secret {
+        field: &'static str,
+        label: &'static str,
+    },
+}
+
+/// The flags of `omawarden copy` that choose a field.
+#[derive(Debug, Default)]
+struct CopySelection {
+    password: bool,
+    username: bool,
+    totp: bool,
+    notes: bool,
+    card_code: bool,
+    card_number: bool,
+}
+
+fn default_copy_target(type_name: &str) -> CopyTarget {
+    match type_name {
+        "card" => CopyTarget::Secret {
+            field: "card.number",
+            label: "card_number",
+        },
+        "note" => CopyTarget::Secret {
+            field: "notes",
+            label: "notes",
+        },
+        _ => CopyTarget::Secret {
+            field: "login.password",
+            label: "password",
+        },
+    }
+}
+
+/// The explicitly flagged field (first flag wins, in the historical order),
+/// or the default field of the item type.
+fn select_copy_target(selection: &CopySelection, type_name: &str) -> CopyTarget {
+    if selection.username {
+        return CopyTarget::Username;
+    }
+    let flagged = [
+        (selection.totp, "login.totp", "totp"),
+        (selection.notes, "notes", "notes"),
+        (selection.card_number, "card.number", "public_key"),
+        (selection.card_code, "card.code", "private_key"),
+        (selection.password, "login.password", "password"),
+    ];
+    flagged
+        .iter()
+        .find(|(chosen, ..)| *chosen)
+        .map(|(_, field, label)| CopyTarget::Secret { field, label })
+        .unwrap_or_else(|| default_copy_target(type_name))
+}
+
+/// The username of a redacted item: login username, then identity
+/// username, then identity email.
+fn redacted_username(item: &Value) -> String {
+    [
+        ("login", "username"),
+        ("identity", "username"),
+        ("identity", "email"),
+    ]
+    .iter()
+    .find_map(|(section, key)| item.get(*section)?.get(*key)?.as_str())
+    .unwrap_or_default()
+    .to_string()
+}
+
+fn copy_username(item: &Value, clip_mgr: &ClipboardManager, timeout_val: i64) -> ExitCode {
+    let name = item_text(item, "name");
+    let username = redacted_username(item);
+    if username.is_empty() {
+        return print_failure(&format!("Field 'username' is empty for item '{}'", name));
+    }
+    if !clip_mgr.copy(&username, false, timeout_val) {
+        return print_failure("Failed to copy content to clipboard");
+    }
+    print_pretty(&json!({ "ok": true, "name": name, "copied": "username", "timeout": 0 }));
+    ExitCode::SUCCESS
+}
+
+fn copy_secret_field(item: &Value, field: &str, label: &str, timeout_val: i64) -> ExitCode {
+    let clear_after = u64::try_from(timeout_val)
+        .ok()
+        .filter(|seconds| omawarden::secret_access::COPY_CLEAR_SECONDS_RANGE.contains(seconds));
+    match request_field_release("copy_field", item_text(item, "id"), field, clear_after) {
+        Ok(response) => {
+            print_pretty(&json!({
+                "ok": true,
+                "name": item_text(item, "name"),
+                "copied": label,
+                "timeout": response.get("clear_after_seconds").cloned().unwrap_or(json!(0)),
+            }));
+            ExitCode::SUCCESS
+        }
+        Err(error) => print_failure(&error),
+    }
+}
+
+/// `omawarden copy <query>`: secrets are copied by the daemon itself.
+fn copy_item_field(
+    query: Option<String>,
+    selection: CopySelection,
+    timeout_val: i64,
+    clip_mgr: &ClipboardManager,
+) -> ExitCode {
+    let Some(query) = query.filter(|q| !q.trim().is_empty()) else {
+        return print_failure(
+            "Missing item query or action flag (--clear / --stdin). See 'omawarden copy --help'.",
+        );
+    };
+    let item = match resolve_redacted_item(&query) {
+        Ok(item) => item,
+        Err(error) => return print_failure(&error),
+    };
+    match select_copy_target(&selection, item_text(&item, "type_name")) {
+        CopyTarget::Username => copy_username(&item, clip_mgr, timeout_val),
+        CopyTarget::Secret { field, label } => copy_secret_field(&item, field, label, timeout_val),
+    }
+}
+
+/// Hidden `copy --clear-after` worker: at the deadline, withdraws the
+/// clipboard offer served by the given wl-copy process if that exact process
+/// is still running (it exits by itself when another client takes the
+/// selection), so content copied elsewhere in the meantime is never cleared.
+fn run_clipboard_clear_worker(
+    secs: u64,
+    owner_pid: Option<u32>,
+    owner_start_time: Option<u64>,
+) -> ExitCode {
+    let (Some(pid), Some(start_time)) = (owner_pid, owner_start_time) else {
+        return ExitCode::SUCCESS;
+    };
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+    omawarden::clipboard::withdraw_offer_if_still_owned(omawarden::clipboard::OfferOwner {
+        pid,
+        start_time,
+    });
+    ExitCode::SUCCESS
+}
+
+/// The parsed `omawarden copy` invocation (worker flags excluded).
+struct CopyCommand {
+    query: Option<String>,
+    clear: bool,
+    stdin: bool,
+    sensitive: bool,
+    selection: CopySelection,
+    timeout_val: i64,
+}
+
+fn exit_code_for(ok: bool) -> ExitCode {
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// `omawarden copy`: clear the clipboard, copy stdin text the caller
+/// supplies, or copy one field of a vault item (secrets via the daemon).
+fn run_copy_command(request: CopyCommand) -> ExitCode {
+    let clip_mgr = ClipboardManager::default();
+    if !clip_mgr.is_available() {
+        return print_failure(
+            "Wayland clipboard utility 'wl-copy' not found. Please install 'wl-clipboard'.",
+        );
+    }
+    if request.clear {
+        let ok = clip_mgr.clear();
+        print_pretty(&json!({ "ok": ok }));
+        return exit_code_for(ok);
+    }
+    if request.stdin {
+        let text_val = read_clipboard_stdin();
+        let ok = clip_mgr.copy(&text_val, request.sensitive, request.timeout_val);
+        print_pretty(&json!({
+            "ok": ok,
+            "copied": "stdin",
+            "timeout": if request.sensitive { request.timeout_val } else { 0 }
+        }));
+        return exit_code_for(ok);
+    }
+    omawarden::daemon::ensure_daemon_running();
+    copy_item_field(
+        request.query,
+        request.selection,
+        request.timeout_val,
+        &clip_mgr,
+    )
+}
+
+/// A TOTP code and, for a vault item, its (id, name).
+type TotpOutcome = (omawarden::totp::TotpResult, Option<(String, String)>);
+
+/// Where `omawarden totp` takes its code from.
+#[derive(Debug, PartialEq)]
+enum TotpSource {
+    Seed(String),
+    Item(String),
+    Missing,
+}
+
+fn totp_source_from_stdin(stdin_val: String) -> TotpSource {
+    if stdin_val.is_empty() {
+        return TotpSource::Missing;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(&stdin_val) else {
+        return TotpSource::Seed(stdin_val);
+    };
+    if let Some(secret) = value.get("secret").and_then(Value::as_str) {
+        return TotpSource::Seed(secret.to_string());
+    }
+    match value
+        .get("query")
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+    {
+        Some(query) => TotpSource::Item(query.to_string()),
+        None => TotpSource::Seed(stdin_val),
+    }
+}
+
+fn seed_totp(seed: &str) -> Option<TotpOutcome> {
+    generate_totp(seed, None, 6, 30).map(|result| (result, None))
+}
+
+/// The current code of an item, released through `reveal_field`.
+fn item_totp(query: &str) -> Result<TotpOutcome, String> {
+    let item = resolve_redacted_item(query)?;
+    let id = item_text(&item, "id").to_string();
+    let response = request_field_release("reveal_field", &id, "login.totp", None)?;
+    let result = omawarden::totp::TotpResult {
+        code: item_text(&response, "value").to_string(),
+        ttl: response
+            .get("seconds_remaining")
+            .and_then(Value::as_u64)
+            .unwrap_or(30),
+        period: response.get("period").and_then(Value::as_u64).unwrap_or(30),
+    };
+    Ok((result, Some((id, item_text(&item, "name").to_string()))))
+}
+
+/// Item lookup first; an argument that names no item is tried as a seed,
+/// as before.
+fn item_or_seed_totp(query: &str) -> Option<TotpOutcome> {
+    item_totp(query).ok().or_else(|| seed_totp(query))
+}
+
+fn print_totp_outcome(outcome: TotpOutcome, copy: bool, clip_mgr: &ClipboardManager) -> ExitCode {
+    let (result, item_info) = outcome;
+    let copied = copy && clip_mgr.copy(&result.code, true, 30);
+    let mut resp = json!({
+        "ok": !copy || copied,
+        "code": result.code,
+        "ttl": result.ttl,
+        "period": result.period,
+    });
+    if copy {
+        resp["copied"] = json!(true);
+    }
+    if let Some((id, name)) = item_info {
+        resp["id"] = json!(id);
+        resp["name"] = json!(name);
+    }
+    print_pretty(&resp);
+    if !copy || copied {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn is_otpauth_uri(text: &str) -> bool {
+    text.starts_with("otpauth://") || text.starts_with("otpauth-migration://")
+}
+
+/// `omawarden totp`: from a seed on stdin, or from a vault item whose code
+/// is released by the daemon through `reveal_field` (budgeted).
+fn run_totp_command(query: Option<String>, stdin: bool, copy: bool) -> ExitCode {
+    let clip_mgr = ClipboardManager::default();
+    let source = match query.filter(|_| !stdin) {
+        Some(q) if is_otpauth_uri(&q) => {
+            eprintln!(
+                "Error: Passing otpauth URIs or secrets in CLI arguments is forbidden (violates Zero-Argv security policy).\nPipe secret via STDIN instead: echo '<otpauth_uri>' | omawarden totp --stdin"
+            );
+            return ExitCode::FAILURE;
+        }
+        Some(q) => {
+            omawarden::daemon::ensure_daemon_running();
+            return match item_or_seed_totp(&q) {
+                Some(outcome) => print_totp_outcome(outcome, copy, &clip_mgr),
+                None => {
+                    print_failure("Failed to generate TOTP: item not found or secret is invalid")
+                }
+            };
+        }
+        None => totp_source_from_stdin(read_secret_stdin()),
+    };
+    let outcome = match source {
+        TotpSource::Seed(seed) => seed_totp(&seed),
+        TotpSource::Item(q) => item_totp(&q).ok(),
+        TotpSource::Missing => None,
+    };
+    match outcome {
+        Some(outcome) => print_totp_outcome(outcome, copy, &clip_mgr),
+        None => print_failure("Failed to generate TOTP: item not found or secret is invalid"),
+    }
+}
+
+/// `vault sync`: through the daemon, or directly when no daemon answers.
+fn run_vault_sync(cfg: &omawarden::config::Config) -> ExitCode {
+    let client_ctx = omawarden::api::resolve_effective_client_context(None);
+    omawarden::daemon::ensure_daemon_running();
+    let mut sync_req = json!({ "action": "sync" });
+    if let Some(ref ctx) = client_ctx {
+        sync_req["client"] = json!(ctx);
+    }
+    if let Some(response) = send_daemon_request(&sync_req) {
+        print_pretty(&response);
+        return exit_code_for(response_succeeded(&response));
+    }
+    let vault_mgr =
+        VaultManager::with_identity_url(&cfg.server_url, cfg.identity_url.as_deref(), None, None);
+    match vault_mgr.sync_with_client(client_ctx.as_ref()) {
+        Ok(_) => {
+            print_pretty(&json!({ "ok": true }));
+            ExitCode::SUCCESS
+        }
+        Err(e) => print_failure(&e),
+    }
+}
+
+/// `vault reveal` / `vault copy-field`: prints the daemon's response to
+/// `reveal_field` / `copy_field` unchanged. Never reads stdin, so a caller
+/// that leaves stdin open is not blocked; a locked vault is reported as the
+/// daemon's `vault_locked` error.
+fn run_field_release(action: &str, id: &str, field: &str, clear_after: Option<u64>) -> ExitCode {
+    let request = json!({ "action": action, "id": id, "field": field });
+    run_release_request(request, clear_after)
+}
+
+/// `vault copy-sequence`: prints the daemon's response to `copy_sequence`
+/// unchanged. The daemon answers once the first field is on the clipboard;
+/// the later fields are staged by the daemon as the user pastes.
+fn run_sequence_release(id: &str, fields: &[String], clear_after: Option<u64>) -> ExitCode {
+    let request = json!({ "action": "copy_sequence", "id": id, "fields": fields });
+    run_release_request(request, clear_after)
+}
+
+/// Sends a release request with the optional `clear_after_seconds` and
+/// prints the daemon's response unchanged.
+fn run_release_request(mut request: Value, clear_after: Option<u64>) -> ExitCode {
+    omawarden::daemon::ensure_daemon_running();
+    if let Some(seconds) = clear_after {
+        request["clear_after_seconds"] = json!(seconds);
+    }
+    let Some(mut response) = send_daemon_request(&request) else {
+        return print_failure(DAEMON_UNAVAILABLE);
+    };
+    let text = Zeroizing::new(serde_json::to_string_pretty(&response).unwrap());
+    println!("{}", text.as_str());
+    let ok = response_succeeded(&response);
+    omawarden::secret_memory::zeroize_json_value(&mut response);
+    exit_code_for(ok)
+}
+
+fn run_vault_command(action: VaultAction, cfg: &omawarden::config::Config) -> ExitCode {
+    match action {
+        VaultAction::Sync => run_vault_sync(cfg),
+        VaultAction::List { category } => {
+            run_vault_listing(json!({ "action": "list", "category": category }))
+        }
+        VaultAction::Search { query, category } => run_vault_listing(json!({
+            "action": "search",
+            "query": query,
+            "category": category
+        })),
+        VaultAction::Reveal { id, field } => run_field_release("reveal_field", &id, &field, None),
+        VaultAction::CopyField {
+            id,
+            field,
+            clear_after,
+        } => run_field_release("copy_field", &id, &field, clear_after),
+        VaultAction::CopySequence {
+            id,
+            fields,
+            clear_after,
+        } => run_sequence_release(&id, &fields, clear_after),
+    }
+}
+
+/// `vault list` / `vault search`: prints the daemon's redacted items.
+fn run_vault_listing(request: Value) -> ExitCode {
+    omawarden::daemon::ensure_daemon_running();
+    let Some(response) = send_daemon_request(&request) else {
+        return print_failure(
+            "Vault is locked. Please unlock using 'omawarden auth unlock' first.",
+        );
+    };
+    print_pretty(&response);
+    if response.get("ok") == Some(&Value::Bool(false)) {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// `config set --auto-lock` must be inside the daemon's accepted range.
+fn validate_auto_lock_option(minutes: Option<i64>) -> Result<(), String> {
+    let Some(minutes) = minutes else {
+        return Ok(());
+    };
+    let seconds = u64::try_from(minutes).unwrap_or(0).saturating_mul(60);
+    omawarden::daemon_actions::validate_auto_lock(seconds).map(|_| ())
 }
 
 fn main() -> ExitCode {
@@ -561,7 +1025,13 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
     let config_mgr = ConfigManager::new(cli.config.as_deref());
-    let mut cfg = config_mgr.load();
+    let mut cfg = match config_mgr.try_load() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("{}", e);
+            return ExitCode::FAILURE;
+        }
+    };
 
     match cli.command {
         Commands::Daemon { auto_lock } => {
@@ -602,20 +1072,14 @@ fn main() -> ExitCode {
                     match k.as_str() {
                         "server_url" => println!("{}", cfg.server_url),
                         "identity_url" => println!("{}", cfg.identity_url.as_deref().unwrap_or("")),
-                        "download_dir" => println!("{}", cfg.download_dir),
                         "auto_lock_minutes" | "auto_lock" => println!("{}", cfg.auto_lock_minutes),
                         "clipboard_clear_seconds" | "clipboard_clear" => {
                             println!("{}", cfg.clipboard_clear_seconds)
                         }
                         "email" => println!("{}", cfg.email),
                         "remember_email" => println!("{}", cfg.remember_email),
-                        "check_updates" => println!("{}", cfg.check_updates),
                         "log_level" => println!("{}", cfg.log_level),
-                        "show_website_icons" => println!("{}", cfg.show_website_icons),
                         "remember_last_search" => println!("{}", cfg.remember_last_search),
-                        "max_attachment_size_mb" | "max_attachment_size" => {
-                            println!("{}", cfg.max_attachment_size_mb)
-                        }
                         "client_cert_path" | "client_cert" => {
                             println!("{}", cfg.client_cert_path.as_deref().unwrap_or(""))
                         }
@@ -625,9 +1089,7 @@ fn main() -> ExitCode {
                         "client_cert_server" => {
                             println!("{}", cfg.client_cert_server.as_deref().unwrap_or(""))
                         }
-                        "ssh_agent_enabled" | "ssh_agent" => println!("{}", cfg.ssh_agent_enabled),
                         "quick_unlock" => println!("{}", cfg.quick_unlock),
-                        "ssh_agent_confirm" => println!("{}", cfg.ssh_agent_confirm),
                         _ => {
                             eprintln!("Unknown configuration key: {}", k);
                             return ExitCode::FAILURE;
@@ -641,20 +1103,14 @@ fn main() -> ExitCode {
             ConfigAction::Set {
                 server_url,
                 identity_url,
-                download_dir,
                 auto_lock,
                 clipboard_clear,
                 email,
                 remember_email,
-                check_updates,
                 log_level,
-                show_website_icons,
                 remember_last_search,
-                max_attachment_size,
                 client_cert,
                 client_key,
-                ssh_agent,
-                ssh_agent_confirm,
                 quick_unlock,
             } => {
                 let storage_mgr = match cli.config.as_deref() {
@@ -670,21 +1126,15 @@ fn main() -> ExitCode {
                     None => StorageManager::default(),
                 };
                 let keyring_mgr = KeyringManager::default();
+                if let Err(e) = validate_auto_lock_option(auto_lock) {
+                    eprintln!("Error: {}", e);
+                    return ExitCode::FAILURE;
+                }
 
                 let parsed_remember_email = remember_email.map(|v| {
                     let lower = v.trim().to_lowercase();
                     matches!(lower.as_str(), "true" | "1" | "yes")
                 });
-                let parsed_check_updates = check_updates.map(|v| {
-                    let lower = v.trim().to_lowercase();
-                    matches!(lower.as_str(), "true" | "1" | "yes")
-                });
-
-                let parsed_show_website_icons = show_website_icons.map(|v| {
-                    let lower = v.trim().to_lowercase();
-                    matches!(lower.as_str(), "true" | "1" | "yes")
-                });
-
                 let parsed_remember_last_search = remember_last_search.map(|v| {
                     let lower = v.trim().to_lowercase();
                     matches!(lower.as_str(), "true" | "1" | "yes")
@@ -742,20 +1192,14 @@ fn main() -> ExitCode {
                 let options = ConfigUpdateOptions {
                     server_url,
                     identity_url,
-                    download_dir,
                     auto_lock_minutes: auto_lock,
                     clipboard_clear_seconds: clipboard_clear,
                     email,
                     remember_email: parsed_remember_email,
-                    check_updates: parsed_check_updates,
                     log_level,
-                    show_website_icons: parsed_show_website_icons,
                     remember_last_search: parsed_remember_last_search,
-                    max_attachment_size_mb: max_attachment_size,
                     client_cert_path: client_cert,
                     client_key_path: client_key,
-                    ssh_agent_enabled: ssh_agent,
-                    ssh_agent_confirm: ssh_agent_confirm.clone(),
                     quick_unlock,
                 };
 
@@ -768,10 +1212,6 @@ fn main() -> ExitCode {
                         }
                     };
                 cfg = updated_cfg;
-                if ssh_agent.is_some() {
-                    // Start or stop the agent in the running daemon (no restart, so no lock).
-                    let _ = send_daemon_request(&json!({ "action": "ssh_agent_apply" }));
-                }
                 if let Some(lock_mins) = auto_lock {
                     let _ = send_daemon_request(&json!({
                         "action": "set_auto_lock",
@@ -828,39 +1268,6 @@ fn main() -> ExitCode {
             }
         },
 
-        Commands::SshAgent { action } => {
-            let request = match action {
-                SshAgentAction::Status => json!({ "action": "ssh_agent_status" }),
-                SshAgentAction::Pending => json!({ "action": "ssh_agent_pending" }),
-                SshAgentAction::Reply { id, allow, deny: _ } => {
-                    json!({ "action": "ssh_agent_reply", "id": id, "approve": allow })
-                }
-            };
-            ensure_daemon_running();
-            match send_daemon_request(&request) {
-                Some(mut resp) => {
-                    if let Some(obj) = resp.as_object_mut() {
-                        obj.insert("enabled".into(), json!(cfg.ssh_agent_enabled));
-                        obj.insert("confirm".into(), json!(cfg.ssh_agent_confirm));
-                    }
-                    println!("{}", serde_json::to_string_pretty(&resp).unwrap());
-                    let delivered = resp
-                        .get("delivered")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true);
-                    if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) && delivered {
-                        ExitCode::SUCCESS
-                    } else {
-                        ExitCode::FAILURE
-                    }
-                }
-                None => {
-                    eprintln!("The omawarden daemon is not responding.");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-
         Commands::Health => {
             let status = check_system_health(&cfg.server_url);
             println!("{}", serde_json::to_string_pretty(&status).unwrap());
@@ -890,7 +1297,7 @@ fn main() -> ExitCode {
                         if io::stdin().is_terminal() {
                             let p = rpassword::prompt_password("Enter Master Password: ")
                                 .unwrap_or_default();
-                            (p, None, None, None)
+                            (Zeroizing::new(p), None, None, None)
                         } else {
                             read_auth_payload()
                         };
@@ -1010,14 +1417,15 @@ fn main() -> ExitCode {
                         if let Some(ref rem) = remember_email {
                             let should_remember =
                                 matches!(rem.to_lowercase().as_str(), "true" | "1" | "yes");
-                            let mut latest_cfg = config_mgr.load();
-                            latest_cfg.remember_email = should_remember;
-                            if should_remember {
-                                latest_cfg.email = email.trim().to_lowercase();
-                            } else {
-                                latest_cfg.email.clear();
+                            if let Ok(mut latest_cfg) = config_mgr.try_load() {
+                                latest_cfg.remember_email = should_remember;
+                                if should_remember {
+                                    latest_cfg.email = email.trim().to_lowercase();
+                                } else {
+                                    latest_cfg.email.clear();
+                                }
+                                let _ = config_mgr.save(&latest_cfg);
                             }
-                            let _ = config_mgr.save(&latest_cfg);
                         }
                     }
                     print_json_redacting_session(&res);
@@ -1054,7 +1462,7 @@ fn main() -> ExitCode {
                     let (pwd, _, _, _) = if io::stdin().is_terminal() {
                         let p = rpassword::prompt_password("Enter Master Password: ")
                             .unwrap_or_default();
-                        (p, None, None, None)
+                        (Zeroizing::new(p), None, None, None)
                     } else {
                         read_auth_payload()
                     };
@@ -1096,11 +1504,7 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 AuthAction::Unlock => {
-                    let pwd = if io::stdin().is_terminal() {
-                        rpassword::prompt_password("Enter Master Password: ").unwrap_or_default()
-                    } else {
-                        read_secret_stdin()
-                    };
+                    let pwd = read_master_password();
                     omawarden::daemon::ensure_daemon_running();
                     let res = auth_mgr.unlock(&pwd);
                     print_json_redacting_session(&res);
@@ -1198,140 +1602,7 @@ fn main() -> ExitCode {
             },
         },
 
-        Commands::Vault { action } => {
-            let vault_mgr = VaultManager::with_identity_url(
-                &cfg.server_url,
-                cfg.identity_url.as_deref(),
-                None,
-                None,
-            );
-            match action {
-                VaultAction::Sync => {
-                    let client_ctx = omawarden::api::resolve_effective_client_context(None);
-                    omawarden::daemon::ensure_daemon_running();
-                    let mut sync_req = json!({ "action": "sync" });
-                    if let Some(ref ctx) = client_ctx {
-                        sync_req["client"] = json!(ctx);
-                    }
-                    let resp = send_daemon_request(&sync_req);
-                    if let Some(resp_val) = resp {
-                        let ok = resp_val
-                            .get("ok")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        println!("{}", serde_json::to_string_pretty(&resp_val).unwrap());
-                        if ok {
-                            ExitCode::SUCCESS
-                        } else {
-                            ExitCode::FAILURE
-                        }
-                    } else {
-                        match vault_mgr.sync_with_client(client_ctx.as_ref()) {
-                            Ok(_) => {
-                                println!(
-                                    "{}",
-                                    serde_json::to_string_pretty(&json!({ "ok": true })).unwrap()
-                                );
-                                ExitCode::SUCCESS
-                            }
-                            Err(e) => {
-                                println!(
-                                    "{}",
-                                    serde_json::to_string_pretty(
-                                        &json!({ "ok": false, "error": e })
-                                    )
-                                    .unwrap()
-                                );
-                                ExitCode::FAILURE
-                            }
-                        }
-                    }
-                }
-                VaultAction::List { category } => {
-                    omawarden::daemon::ensure_daemon_running();
-                    let st = send_daemon_request(&json!({ "action": "status" }));
-                    let is_unlocked = st
-                        .as_ref()
-                        .and_then(|v| v.get("is_unlocked"))
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    if !is_unlocked && !vault_mgr.is_unlocked() {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&json!({
-                                "ok": false,
-                                "error": "Vault is locked. Please unlock using 'omawarden auth unlock' first."
-                            }))
-                            .unwrap()
-                        );
-                        return ExitCode::FAILURE;
-                    }
-                    if is_unlocked && !vault_mgr.is_unlocked() {
-                        if let Some(daemon_resp) = send_daemon_request(&json!({ "action": "list" }))
-                        {
-                            if daemon_resp.get("ok") == Some(&Value::Bool(false)) {
-                                println!("{}", serde_json::to_string_pretty(&daemon_resp).unwrap());
-                                return ExitCode::FAILURE;
-                            }
-                            if let Ok(items) = serde_json::from_value::<
-                                Vec<omawarden::vault::VaultItem>,
-                            >(daemon_resp)
-                            {
-                                let filtered = vault_mgr.search(&items, "", category.as_deref());
-                                println!("{}", serde_json::to_string_pretty(&filtered).unwrap());
-                                return ExitCode::SUCCESS;
-                            }
-                        }
-                    }
-                    let items = vault_mgr.get_items();
-                    let filtered = vault_mgr.search(&items, "", category.as_deref());
-                    println!("{}", serde_json::to_string_pretty(&filtered).unwrap());
-                    ExitCode::SUCCESS
-                }
-                VaultAction::Search { query, category } => {
-                    omawarden::daemon::ensure_daemon_running();
-                    let st = send_daemon_request(&json!({ "action": "status" }));
-                    let is_unlocked = st
-                        .as_ref()
-                        .and_then(|v| v.get("is_unlocked"))
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    if !is_unlocked && !vault_mgr.is_unlocked() {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&json!({
-                                "ok": false,
-                                "error": "Vault is locked. Please unlock using 'omawarden auth unlock' first."
-                            }))
-                            .unwrap()
-                        );
-                        return ExitCode::FAILURE;
-                    }
-                    if is_unlocked && !vault_mgr.is_unlocked() {
-                        if let Some(daemon_resp) = send_daemon_request(&json!({
-                            "action": "search",
-                            "query": query,
-                            "category": category
-                        })) {
-                            if daemon_resp.get("ok") == Some(&Value::Bool(false)) {
-                                println!("{}", serde_json::to_string_pretty(&daemon_resp).unwrap());
-                                return ExitCode::FAILURE;
-                            }
-                            if let Ok(items) = serde_json::from_value::<
-                                Vec<omawarden::vault::VaultItem>,
-                            >(daemon_resp)
-                            {
-                                println!("{}", serde_json::to_string_pretty(&items).unwrap());
-                                return ExitCode::SUCCESS;
-                            }
-                        }
-                    }
-                    let results = vault_mgr.search_items(&query, category.as_deref());
-                    println!("{}", serde_json::to_string_pretty(&results).unwrap());
-                    ExitCode::SUCCESS
-                }
-            }
-        }
+        Commands::Vault { action } => run_vault_command(action, &cfg),
 
         Commands::Copy {
             query,
@@ -1346,969 +1617,31 @@ fn main() -> ExitCode {
             public_key,
             timeout,
             clear_after,
-            expected_gen,
-            wl_copy_path,
-            gen_path,
+            owner_pid,
+            owner_start_time,
         } => {
             if let Some(secs) = clear_after {
-                std::thread::sleep(std::time::Duration::from_secs(secs));
-                let copy_path = wl_copy_path.as_deref().unwrap_or("wl-copy");
-                let mut mgr = ClipboardManager::new(copy_path).without_detached_worker();
-                if let Some(p) = gen_path {
-                    mgr = mgr.with_generation_path(p.clone());
-                }
-                if let Some(exp) = expected_gen {
-                    if mgr.current_generation() != exp {
-                        return ExitCode::SUCCESS;
-                    }
-                }
-                mgr.clear();
-                return ExitCode::SUCCESS;
+                return run_clipboard_clear_worker(secs, owner_pid, owner_start_time);
             }
-
-            let clip_mgr = ClipboardManager::default();
-            if !clip_mgr.is_available() {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "ok": false,
-                        "error": "Wayland clipboard utility 'wl-copy' not found. Please install 'wl-clipboard'."
-                    }))
-                    .unwrap()
-                );
-                return ExitCode::FAILURE;
-            }
-
-            if clear {
-                let ok = clip_mgr.clear();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({ "ok": ok })).unwrap()
-                );
-                return if ok {
-                    ExitCode::SUCCESS
-                } else {
-                    ExitCode::FAILURE
-                };
-            }
-
-            if stdin {
-                let text_val = read_clipboard_stdin();
-                let timeout_val = timeout.unwrap_or(cfg.clipboard_clear_seconds);
-                let ok = clip_mgr.copy(&text_val, sensitive, timeout_val);
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "ok": ok,
-                        "copied": "stdin",
-                        "timeout": if sensitive { timeout_val } else { 0 }
-                    }))
-                    .unwrap()
-                );
-                return if ok {
-                    ExitCode::SUCCESS
-                } else {
-                    ExitCode::FAILURE
-                };
-            }
-
-            let query = match query {
-                Some(q) if !q.trim().is_empty() => q,
-                _ => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&json!({
-                            "ok": false,
-                            "error": "Missing item query or action flag (--clear / --stdin). See 'omawarden copy --help'."
-                        }))
-                        .unwrap()
-                    );
-                    return ExitCode::FAILURE;
-                }
-            };
-
-            omawarden::daemon::ensure_daemon_running();
-            let st = send_daemon_request(&json!({ "action": "status" }));
-            let is_unlocked = st
-                .as_ref()
-                .and_then(|v| v.get("is_unlocked"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-            let vault_mgr = VaultManager::with_identity_url(
-                &cfg.server_url,
-                cfg.identity_url.as_deref(),
-                None,
-                None,
-            );
-            let item: Option<omawarden::vault::VaultItem> = if is_unlocked {
-                let daemon_res = send_daemon_request(&json!({
-                    "action": "get_item",
-                    "query": query
-                }));
-                daemon_res
-                    .filter(|r| r.get("ok").and_then(|v| v.as_bool()) == Some(true))
-                    .and_then(|res| {
-                        res.get("item")
-                            .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    })
-            } else {
-                match ensure_unlocked_user_key(&vault_mgr, &cfg.server_url) {
-                    Ok(user_key) => {
-                        let storage = vault_mgr.storage_mgr.load();
-                        let items = omawarden::api::decrypt_sync_ciphers_with_context(
-                            &storage.ciphers,
-                            &storage.folders,
-                            &storage.organizations,
-                            &user_key,
-                            storage.enc_private_key.as_deref(),
-                        );
-                        let lower = query.to_lowercase();
-                        items.into_iter().find(|i| {
-                            i.id == query
-                                || i.name.eq_ignore_ascii_case(&query)
-                                || i.name.to_lowercase().contains(&lower)
-                        })
-                    }
-                    Err(e) => {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&json!({ "ok": false, "error": e }))
-                                .unwrap()
-                        );
-                        return ExitCode::FAILURE;
-                    }
-                }
-            };
-
-            let item = match item {
-                Some(i) => i,
-                None => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&json!({
-                            "ok": false,
-                            "error": format!("Item '{}' not found in vault", query)
-                        }))
-                        .unwrap()
-                    );
-                    return ExitCode::FAILURE;
-                }
-            };
-
-            let (field_name, text_to_copy, is_sensitive) = if username {
-                let u = item
-                    .login
-                    .as_ref()
-                    .and_then(|l| l.get("username"))
-                    .and_then(|v| v.as_str())
-                    .or_else(|| {
-                        item.identity
-                            .as_ref()
-                            .and_then(|id| id.get("username"))
-                            .and_then(|v| v.as_str())
-                    })
-                    .or_else(|| {
-                        item.identity
-                            .as_ref()
-                            .and_then(|id| id.get("email"))
-                            .and_then(|v| v.as_str())
-                    })
-                    .unwrap_or_default()
-                    .to_string();
-                ("username", u, false)
-            } else if totp {
-                let seed = item
-                    .login
-                    .as_ref()
-                    .and_then(|l| l.get("totp"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                if let Some(t_res) = omawarden::totp::generate_totp(seed, None, 6, 30) {
-                    ("totp", t_res.code, true)
-                } else {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&json!({
-                            "ok": false,
-                            "error": "Item has no valid TOTP configuration"
-                        }))
-                        .unwrap()
-                    );
-                    return ExitCode::FAILURE;
-                }
-            } else if notes {
-                ("notes", item.notes.clone().unwrap_or_default(), false)
-            } else if public_key {
-                let pk = item
-                    .ssh_key
-                    .as_ref()
-                    .and_then(|s| s.public_key.as_deref())
-                    .or_else(|| {
-                        item.card
-                            .as_ref()
-                            .and_then(|c| c.get("number"))
-                            .and_then(|v| v.as_str())
-                    })
-                    .unwrap_or_default()
-                    .to_string();
-                ("public_key", pk, false)
-            } else if private_key {
-                let privk = item
-                    .ssh_key
-                    .as_ref()
-                    .and_then(|s| s.private_key.as_deref())
-                    .or_else(|| {
-                        item.card
-                            .as_ref()
-                            .and_then(|c| c.get("code"))
-                            .and_then(|v| v.as_str())
-                    })
-                    .unwrap_or_default()
-                    .to_string();
-                ("private_key", privk, true)
-            } else if password {
-                let pwd = item
-                    .login
-                    .as_ref()
-                    .and_then(|l| l.get("password"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                ("password", pwd, true)
-            } else {
-                match item.type_name.as_str() {
-                    "login" => {
-                        let pwd = item
-                            .login
-                            .as_ref()
-                            .and_then(|l| l.get("password"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        ("password", pwd, true)
-                    }
-                    "ssh_key" => {
-                        let privk = item
-                            .ssh_key
-                            .as_ref()
-                            .and_then(|s| s.private_key.as_deref())
-                            .unwrap_or_default()
-                            .to_string();
-                        ("private_key", privk, true)
-                    }
-                    "card" => {
-                        let num = item
-                            .card
-                            .as_ref()
-                            .and_then(|c| c.get("number"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        ("card_number", num, true)
-                    }
-                    "note" => ("notes", item.notes.clone().unwrap_or_default(), false),
-                    _ => {
-                        let val = item
-                            .login
-                            .as_ref()
-                            .and_then(|l| l.get("password"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        ("password", val, true)
-                    }
-                }
-            };
-
-            if text_to_copy.is_empty() {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "ok": false,
-                        "error": format!("Field '{}' is empty for item '{}'", field_name, item.name)
-                    }))
-                    .unwrap()
-                );
-                return ExitCode::FAILURE;
-            }
-
-            let timeout_val = timeout.unwrap_or(cfg.clipboard_clear_seconds);
-            let ok = clip_mgr.copy(&text_to_copy, is_sensitive, timeout_val);
-            if ok {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "ok": true,
-                        "name": item.name,
-                        "copied": field_name,
-                        "timeout": if is_sensitive { timeout_val } else { 0 }
-                    }))
-                    .unwrap()
-                );
-                ExitCode::SUCCESS
-            } else {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "ok": false,
-                        "error": "Failed to copy content to clipboard"
-                    }))
-                    .unwrap()
-                );
-                ExitCode::FAILURE
-            }
-        }
-
-        Commands::Totp { query, stdin, copy } => {
-            let clip_mgr = ClipboardManager::default();
-
-            let (totp_res, item_info) = if stdin {
-                let stdin_val = read_secret_stdin();
-                if stdin_val.is_empty() {
-                    (None, None)
-                } else if let Ok(val) = serde_json::from_str::<Value>(&stdin_val) {
-                    if let Some(sec) = val.get("secret").and_then(|v| v.as_str()) {
-                        (generate_totp(sec, None, 6, 30), None)
-                    } else if let Some(q) = val
-                        .get("query")
-                        .or_else(|| val.get("id"))
-                        .and_then(|v| v.as_str())
-                    {
-                        let daemon_res = send_daemon_request(&json!({
-                            "action": "totp",
-                            "query": q
-                        }));
-                        if let Some(res) = daemon_res {
-                            if res.get("ok").and_then(|v| v.as_bool()) == Some(true) {
-                                let code = res
-                                    .get("code")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string();
-                                let ttl = res.get("ttl").and_then(|v| v.as_u64()).unwrap_or(30);
-                                let period =
-                                    res.get("period").and_then(|v| v.as_u64()).unwrap_or(30);
-                                let name =
-                                    res.get("name").and_then(|v| v.as_str()).map(String::from);
-                                let id = res.get("id").and_then(|v| v.as_str()).map(String::from);
-                                (
-                                    Some(omawarden::totp::TotpResult { code, ttl, period }),
-                                    if let (Some(id), Some(name)) = (id, name) {
-                                        Some((id, name))
-                                    } else {
-                                        None
-                                    },
-                                )
-                            } else {
-                                (None, None)
-                            }
-                        } else {
-                            (None, None)
-                        }
-                    } else {
-                        (generate_totp(&stdin_val, None, 6, 30), None)
-                    }
-                } else {
-                    (generate_totp(&stdin_val, None, 6, 30), None)
-                }
-            } else if let Some(q) = query {
-                let is_uri = q.starts_with("otpauth://") || q.starts_with("otpauth-migration://");
-                if is_uri {
-                    eprintln!(
-                        "Error: Passing otpauth URIs or secrets in CLI arguments is forbidden (violates Zero-Argv security policy).\nPipe secret via STDIN instead: echo '<otpauth_uri>' | omawarden totp --stdin"
-                    );
-                    return ExitCode::FAILURE;
-                } else {
-                    omawarden::daemon::ensure_daemon_running();
-                    let st = send_daemon_request(&json!({ "action": "status" }));
-                    let is_unlocked = st
-                        .as_ref()
-                        .and_then(|v| v.get("is_unlocked"))
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-
-                    let vault_mgr = VaultManager::with_identity_url(
-                        &cfg.server_url,
-                        cfg.identity_url.as_deref(),
-                        None,
-                        None,
-                    );
-                    let item: Option<omawarden::vault::VaultItem> = if is_unlocked {
-                        let daemon_res = send_daemon_request(&json!({
-                            "action": "get_item",
-                            "query": q,
-                            "touch": false
-                        }));
-                        daemon_res
-                            .filter(|r| r.get("ok").and_then(|v| v.as_bool()) == Some(true))
-                            .and_then(|res| {
-                                res.get("item")
-                                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                            })
-                    } else {
-                        match ensure_unlocked_user_key(&vault_mgr, &cfg.server_url) {
-                            Ok(user_key) => {
-                                let storage = vault_mgr.storage_mgr.load();
-                                let items = omawarden::api::decrypt_sync_ciphers_with_context(
-                                    &storage.ciphers,
-                                    &storage.folders,
-                                    &storage.organizations,
-                                    &user_key,
-                                    storage.enc_private_key.as_deref(),
-                                );
-                                let lower = q.to_lowercase();
-                                items.into_iter().find(|i| {
-                                    i.id == q
-                                        || i.name.eq_ignore_ascii_case(&q)
-                                        || i.name.to_lowercase().contains(&lower)
-                                })
-                            }
-                            Err(_) => None,
-                        }
-                    };
-
-                    if let Some(it) = item {
-                        let seed = it
-                            .login
-                            .as_ref()
-                            .and_then(|l| l.get("totp"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default();
-                        (generate_totp(seed, None, 6, 30), Some((it.id, it.name)))
-                    } else {
-                        (generate_totp(&q, None, 6, 30), None)
-                    }
-                }
-            } else {
-                let stdin_val = read_secret_stdin();
-                if stdin_val.is_empty() {
-                    (None, None)
-                } else if let Ok(val) = serde_json::from_str::<Value>(&stdin_val) {
-                    if let Some(sec) = val.get("secret").and_then(|v| v.as_str()) {
-                        (generate_totp(sec, None, 6, 30), None)
-                    } else if let Some(q) = val
-                        .get("query")
-                        .or_else(|| val.get("id"))
-                        .and_then(|v| v.as_str())
-                    {
-                        let daemon_res = send_daemon_request(&json!({
-                            "action": "totp",
-                            "query": q
-                        }));
-                        if let Some(res) = daemon_res {
-                            if res.get("ok").and_then(|v| v.as_bool()) == Some(true) {
-                                let code = res
-                                    .get("code")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string();
-                                let ttl = res.get("ttl").and_then(|v| v.as_u64()).unwrap_or(30);
-                                let period =
-                                    res.get("period").and_then(|v| v.as_u64()).unwrap_or(30);
-                                let name =
-                                    res.get("name").and_then(|v| v.as_str()).map(String::from);
-                                let id = res.get("id").and_then(|v| v.as_str()).map(String::from);
-                                (
-                                    Some(omawarden::totp::TotpResult { code, ttl, period }),
-                                    if let (Some(id), Some(name)) = (id, name) {
-                                        Some((id, name))
-                                    } else {
-                                        None
-                                    },
-                                )
-                            } else {
-                                (None, None)
-                            }
-                        } else {
-                            (None, None)
-                        }
-                    } else {
-                        (generate_totp(&stdin_val, None, 6, 30), None)
-                    }
-                } else {
-                    (generate_totp(&stdin_val, None, 6, 30), None)
-                }
-            };
-
-            match totp_res {
-                Some(res) => {
-                    if copy {
-                        let ok = clip_mgr.copy(&res.code, true, 30);
-                        let mut resp = json!({
-                            "ok": ok,
-                            "code": res.code,
-                            "ttl": res.ttl,
-                            "period": res.period,
-                            "copied": true
-                        });
-                        if let Some((id, name)) = item_info {
-                            resp["id"] = json!(id);
-                            resp["name"] = json!(name);
-                        }
-                        println!("{}", serde_json::to_string_pretty(&resp).unwrap());
-                        if ok {
-                            ExitCode::SUCCESS
-                        } else {
-                            ExitCode::FAILURE
-                        }
-                    } else {
-                        let mut resp = json!({
-                            "ok": true,
-                            "code": res.code,
-                            "ttl": res.ttl,
-                            "period": res.period
-                        });
-                        if let Some((id, name)) = item_info {
-                            resp["id"] = json!(id);
-                            resp["name"] = json!(name);
-                        }
-                        println!("{}", serde_json::to_string_pretty(&resp).unwrap());
-                        ExitCode::SUCCESS
-                    }
-                }
-                None => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&json!({
-                            "ok": false,
-                            "error": "Failed to generate TOTP: item not found or secret is invalid"
-                        }))
-                        .unwrap()
-                    );
-                    ExitCode::FAILURE
-                }
-            }
-        }
-
-        Commands::Attachment { action } => match action {
-            AttachmentAction::Download {
-                item_id,
-                attachment_id,
-                filename,
-                output_dir,
-                open,
-                preview,
-            } => {
-                let res = get_attachment(
-                    &item_id,
-                    &attachment_id,
-                    &filename,
-                    output_dir.as_deref(),
-                    open,
-                    preview,
-                    None,
-                    None,
-                    true,
-                );
-                println!("{}", serde_json::to_string_pretty(&res).unwrap());
-                if res.ok {
-                    ExitCode::SUCCESS
-                } else {
-                    ExitCode::FAILURE
-                }
-            }
-            AttachmentAction::Clean { item_id } => {
-                omawarden::attachment::clear_preview_attachments(item_id.as_deref());
-                println!("{}", serde_json::json!({ "ok": true, "status": "cleaned" }));
-                ExitCode::SUCCESS
-            }
-        },
-
-        Commands::SshKey { action } => {
-            let vault_mgr = VaultManager::with_identity_url(
-                &cfg.server_url,
-                cfg.identity_url.as_deref(),
-                None,
-                None,
-            );
-            match action {
-                SshKeyAction::Create {
-                    name,
-                    algorithm,
-                    comment,
+            let request = CopyCommand {
+                query,
+                clear,
+                stdin,
+                sensitive,
+                selection: CopySelection {
+                    password,
+                    username,
+                    totp,
                     notes,
-                    folder,
-                    out_dir,
-                } => {
-                    omawarden::daemon::ensure_daemon_running();
-                    let keypair = match generate_keypair(algorithm, comment.as_deref()) {
-                        Ok(k) => k,
-                        Err(e) => {
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&json!({ "ok": false, "error": e }))
-                                    .unwrap()
-                            );
-                            return ExitCode::FAILURE;
-                        }
-                    };
-
-                    let daemon_req = json!({
-                        "action": "ssh_key_create",
-                        "name": name,
-                        "private_key": keypair.private_key,
-                        "public_key": keypair.public_key,
-                        "fingerprint": keypair.fingerprint,
-                        "notes": notes,
-                        "folder_id": folder,
-                    });
-
-                    let daemon_res = send_daemon_request(&daemon_req);
-                    let item_val = if let Some(res) =
-                        daemon_res.filter(|r| r.get("ok").and_then(|v| v.as_bool()) == Some(true))
-                    {
-                        res.get("item").cloned()
-                    } else {
-                        match ensure_unlocked_user_key(&vault_mgr, &cfg.server_url) {
-                            Ok(user_key) => {
-                                match vault_mgr.create_ssh_key_with_client(
-                                    &name,
-                                    &keypair,
-                                    notes.as_deref(),
-                                    folder.as_deref(),
-                                    &user_key,
-                                    omawarden::api::resolve_effective_client_context(None).as_ref(),
-                                ) {
-                                    Ok(item) => Some(json!(item)),
-                                    Err(e) => {
-                                        println!(
-                                            "{}",
-                                            serde_json::to_string_pretty(&json!({
-                                                "ok": false,
-                                                "error": e
-                                            }))
-                                            .unwrap()
-                                        );
-                                        return ExitCode::FAILURE;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                println!(
-                                    "{}",
-                                    serde_json::to_string_pretty(&json!({
-                                        "ok": false,
-                                        "error": e
-                                    }))
-                                    .unwrap()
-                                );
-                                return ExitCode::FAILURE;
-                            }
-                        }
-                    };
-
-                    let mut files_json = json!(null);
-                    if let Some(ref dest_dir) = out_dir {
-                        match write_keypair_files(
-                            dest_dir,
-                            algorithm.default_filename_prefix(),
-                            &keypair.private_key,
-                            &keypair.public_key,
-                        ) {
-                            Ok((priv_p, pub_p)) => {
-                                files_json = json!({
-                                    "private_key_path": priv_p.to_string_lossy(),
-                                    "public_key_path": pub_p.to_string_lossy(),
-                                });
-                            }
-                            Err(e) => {
-                                omawarden::log_warn!(
-                                    "omawarden:ssh",
-                                    "Failed to write exported files to {:?}: {}",
-                                    dest_dir,
-                                    e
-                                );
-                            }
-                        }
-                    }
-
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&json!({
-                            "ok": true,
-                            "item": item_val,
-                            "files": files_json,
-                        }))
-                        .unwrap()
-                    );
-                    ExitCode::SUCCESS
-                }
-
-                SshKeyAction::Import {
-                    name,
-                    private_key,
-                    public_key,
-                    stdin,
-                    notes,
-                    folder,
-                } => {
-                    omawarden::daemon::ensure_daemon_running();
-                    let raw_priv = if stdin || private_key.is_none() {
-                        let mut buffer = String::new();
-                        let _ = io::stdin().read_to_string(&mut buffer);
-                        buffer
-                    } else if let Some(ref p) = private_key {
-                        match std::fs::read_to_string(p) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                println!(
-                                    "{}",
-                                    serde_json::to_string_pretty(&json!({
-                                        "ok": false,
-                                        "error": e.to_string()
-                                    }))
-                                    .unwrap()
-                                );
-                                return ExitCode::FAILURE;
-                            }
-                        }
-                    } else {
-                        String::new()
-                    };
-
-                    let mut keypair = match parse_private_key(&raw_priv) {
-                        Ok(k) => k,
-                        Err(e) => {
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&json!({ "ok": false, "error": e }))
-                                    .unwrap()
-                            );
-                            return ExitCode::FAILURE;
-                        }
-                    };
-
-                    if let Some(ref pub_path) = public_key {
-                        if let Ok(pub_content) = std::fs::read_to_string(pub_path) {
-                            let trimmed_pub = pub_content.trim().to_string();
-                            if !trimmed_pub.is_empty() {
-                                keypair.public_key = trimmed_pub;
-                            }
-                        }
-                    }
-
-                    let daemon_req = json!({
-                        "action": "ssh_key_create",
-                        "name": name,
-                        "private_key": keypair.private_key,
-                        "public_key": keypair.public_key,
-                        "fingerprint": keypair.fingerprint,
-                        "notes": notes,
-                        "folder_id": folder,
-                    });
-
-                    let daemon_res = send_daemon_request(&daemon_req);
-                    let item_val = if let Some(res) =
-                        daemon_res.filter(|r| r.get("ok").and_then(|v| v.as_bool()) == Some(true))
-                    {
-                        res.get("item").cloned()
-                    } else {
-                        match ensure_unlocked_user_key(&vault_mgr, &cfg.server_url) {
-                            Ok(user_key) => {
-                                match vault_mgr.create_ssh_key_with_client(
-                                    &name,
-                                    &keypair,
-                                    notes.as_deref(),
-                                    folder.as_deref(),
-                                    &user_key,
-                                    omawarden::api::resolve_effective_client_context(None).as_ref(),
-                                ) {
-                                    Ok(item) => Some(json!(item)),
-                                    Err(e) => {
-                                        println!(
-                                            "{}",
-                                            serde_json::to_string_pretty(&json!({
-                                                "ok": false,
-                                                "error": e
-                                            }))
-                                            .unwrap()
-                                        );
-                                        return ExitCode::FAILURE;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                println!(
-                                    "{}",
-                                    serde_json::to_string_pretty(&json!({
-                                        "ok": false,
-                                        "error": e
-                                    }))
-                                    .unwrap()
-                                );
-                                return ExitCode::FAILURE;
-                            }
-                        }
-                    };
-
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&json!({
-                            "ok": true,
-                            "item": item_val,
-                        }))
-                        .unwrap()
-                    );
-                    ExitCode::SUCCESS
-                }
-
-                SshKeyAction::Export {
-                    query,
-                    out_dir,
-                    private_key_file,
-                    public_key_file,
-                    stdout,
-                    public_only,
-                    private_only: _,
-                } => {
-                    omawarden::daemon::ensure_daemon_running();
-                    let st = send_daemon_request(&json!({ "action": "status" }));
-                    let is_unlocked = st
-                        .as_ref()
-                        .and_then(|v| v.get("is_unlocked"))
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-
-                    let item: Option<omawarden::vault::VaultItem> = if is_unlocked {
-                        let daemon_res = send_daemon_request(&json!({
-                            "action": "get_ssh_key",
-                            "query": query
-                        }));
-                        daemon_res
-                            .filter(|r| r.get("ok").and_then(|v| v.as_bool()) == Some(true))
-                            .and_then(|res| {
-                                res.get("item")
-                                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                            })
-                    } else {
-                        match ensure_unlocked_user_key(&vault_mgr, &cfg.server_url) {
-                            Ok(user_key) => {
-                                let storage = vault_mgr.storage_mgr.load();
-                                let items = omawarden::api::decrypt_sync_ciphers_with_context(
-                                    &storage.ciphers,
-                                    &storage.folders,
-                                    &storage.organizations,
-                                    &user_key,
-                                    storage.enc_private_key.as_deref(),
-                                );
-                                items.into_iter().find(|i| {
-                                    i.type_name == "ssh_key"
-                                        && (i.id == query
-                                            || i.name.eq_ignore_ascii_case(&query)
-                                            || i.name
-                                                .to_lowercase()
-                                                .contains(&query.to_lowercase()))
-                                })
-                            }
-                            Err(e) => {
-                                println!(
-                                    "{}",
-                                    serde_json::to_string_pretty(&json!({
-                                        "ok": false,
-                                        "error": e
-                                    }))
-                                    .unwrap()
-                                );
-                                return ExitCode::FAILURE;
-                            }
-                        }
-                    };
-
-                    let ssh_item = match item {
-                        Some(i) => i,
-                        None => {
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&json!({
-                                    "ok": false,
-                                    "error": format!("SSH key item '{}' not found in vault", query)
-                                }))
-                                .unwrap()
-                            );
-                            return ExitCode::FAILURE;
-                        }
-                    };
-
-                    let ssh_meta = match ssh_item.ssh_key {
-                        Some(s) => s,
-                        None => {
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&json!({
-                                    "ok": false,
-                                    "error": "Item has no SSH key metadata"
-                                }))
-                                .unwrap()
-                            );
-                            return ExitCode::FAILURE;
-                        }
-                    };
-
-                    if stdout {
-                        if public_only {
-                            if let Some(ref pubk) = ssh_meta.public_key {
-                                println!("{}", pubk);
-                            }
-                        } else if let Some(ref privk) = ssh_meta.private_key {
-                            print!("{}", privk);
-                            if !privk.ends_with('\n') {
-                                println!();
-                            }
-                        }
-                        return ExitCode::SUCCESS;
-                    }
-
-                    let target_dir = out_dir.unwrap_or_else(|| PathBuf::from("."));
-                    let priv_filename = private_key_file.unwrap_or_else(|| {
-                        let safe_name = ssh_item.name.to_lowercase().replace([' ', '/'], "_");
-                        if safe_name.is_empty() {
-                            "id_ssh_key".to_string()
-                        } else {
-                            safe_name
-                        }
-                    });
-                    let pub_filename =
-                        public_key_file.unwrap_or_else(|| format!("{}.pub", priv_filename));
-
-                    let priv_content = ssh_meta.private_key.unwrap_or_default();
-                    let pub_content = ssh_meta.public_key.unwrap_or_default();
-
-                    match write_keypair_files_named(
-                        &target_dir,
-                        &priv_filename,
-                        &pub_filename,
-                        &priv_content,
-                        &pub_content,
-                    ) {
-                        Ok((priv_p, pub_p)) => {
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&json!({
-                                    "ok": true,
-                                    "name": ssh_item.name,
-                                    "private_key_path": priv_p.to_string_lossy(),
-                                    "public_key_path": pub_p.to_string_lossy(),
-                                }))
-                                .unwrap()
-                            );
-                            ExitCode::SUCCESS
-                        }
-                        Err(e) => {
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&json!({
-                                    "ok": false,
-                                    "error": e.to_string()
-                                }))
-                                .unwrap()
-                            );
-                            ExitCode::FAILURE
-                        }
-                    }
-                }
-            }
+                    card_code: private_key,
+                    card_number: public_key,
+                },
+                timeout_val: timeout.unwrap_or(cfg.clipboard_clear_seconds),
+            };
+            run_copy_command(request)
         }
+
+        Commands::Totp { query, stdin, copy } => run_totp_command(query, stdin, copy),
 
         Commands::Generate {
             length,
@@ -2422,34 +1755,6 @@ fn main() -> ExitCode {
     }
 }
 
-fn ensure_unlocked_user_key(
-    vault_mgr: &VaultManager,
-    _server_url: &str,
-) -> Result<omawarden::crypto::SymmetricCryptoKey, String> {
-    if let Some(key) = vault_mgr.get_user_key() {
-        return Ok(key);
-    }
-
-    let st = vault_mgr.storage_mgr.load();
-    if st.enc_user_key.is_none() {
-        return Err("Account not logged in. Please run 'omawarden auth login' first.".to_string());
-    }
-
-    let (pwd, ..) = read_auth_payload();
-    if pwd.is_empty() {
-        return Err("Vault is locked. Please unlock the vault first using 'omawarden auth unlock' or provide Master Password.".to_string());
-    }
-
-    let user_key = vault_mgr
-        .storage_mgr
-        .unlock_user_key(&pwd, &st)
-        .map_err(|e| format!("Unlock failed: {:?}", e))?;
-
-    let _ = send_daemon_request(&json!({ "action": "unlock", "password": pwd }));
-
-    Ok(user_key)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2474,9 +1779,189 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_vault_reveal_and_copy_field_parsing() {
+        let cli = Cli::try_parse_from([
+            "omawarden",
+            "vault",
+            "reveal",
+            "--id",
+            "item-1",
+            "--field",
+            "card.code",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Vault {
+                action: VaultAction::Reveal { id, field },
+            } => assert_eq!((id.as_str(), field.as_str()), ("item-1", "card.code")),
+            _ => panic!("Expected vault reveal"),
+        }
+        let cli = Cli::try_parse_from([
+            "omawarden",
+            "vault",
+            "copy-field",
+            "--id",
+            "item-1",
+            "--field",
+            "login.password",
+            "--clear-after",
+            "20",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Vault {
+                action:
+                    VaultAction::CopyField {
+                        id,
+                        field,
+                        clear_after,
+                    },
+            } => {
+                assert_eq!((id.as_str(), field.as_str()), ("item-1", "login.password"));
+                assert_eq!(clear_after, Some(20));
+            }
+            _ => panic!("Expected vault copy-field"),
+        }
+    }
+
+    #[test]
+    fn test_cli_vault_copy_sequence_parsing() {
+        let cli = Cli::try_parse_from([
+            "omawarden",
+            "vault",
+            "copy-sequence",
+            "--id=item-1",
+            "--fields=login.password,login.totp",
+            "--clear-after=40",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Vault {
+                action:
+                    VaultAction::CopySequence {
+                        id,
+                        fields,
+                        clear_after,
+                    },
+            } => {
+                assert_eq!(id, "item-1");
+                assert_eq!(fields, vec!["login.password", "login.totp"]);
+                assert_eq!(clear_after, Some(40));
+            }
+            _ => panic!("Expected vault copy-sequence"),
+        }
+        assert!(
+            Cli::try_parse_from(["omawarden", "vault", "copy-sequence", "--id=item-1"]).is_err(),
+            "--fields is required"
+        );
+    }
+
+    #[test]
+    fn test_select_copy_target_flags_and_type_defaults() {
+        let flagged = |configure: fn(&mut CopySelection)| {
+            let mut selection = CopySelection::default();
+            configure(&mut selection);
+            selection
+        };
+        assert_eq!(
+            select_copy_target(&flagged(|s| s.username = true), "login"),
+            CopyTarget::Username
+        );
+        let cases: [(CopySelection, &str, &str, &str); 8] = [
+            (flagged(|s| s.totp = true), "login", "login.totp", "totp"),
+            (flagged(|s| s.notes = true), "login", "notes", "notes"),
+            (
+                flagged(|s| s.card_number = true),
+                "card",
+                "card.number",
+                "public_key",
+            ),
+            (
+                flagged(|s| s.card_code = true),
+                "card",
+                "card.code",
+                "private_key",
+            ),
+            (
+                flagged(|s| s.password = true),
+                "login",
+                "login.password",
+                "password",
+            ),
+            (
+                CopySelection::default(),
+                "login",
+                "login.password",
+                "password",
+            ),
+            (
+                CopySelection::default(),
+                "card",
+                "card.number",
+                "card_number",
+            ),
+            (CopySelection::default(), "note", "notes", "notes"),
+        ];
+        for (selection, type_name, field, label) in cases {
+            assert_eq!(
+                select_copy_target(&selection, type_name),
+                CopyTarget::Secret { field, label },
+                "{type_name} {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_redacted_username_fallbacks() {
+        assert_eq!(
+            redacted_username(&json!({ "login": { "username": "u" } })),
+            "u"
+        );
+        assert_eq!(
+            redacted_username(&json!({ "identity": { "email": "e@example.com" } })),
+            "e@example.com"
+        );
+        assert_eq!(redacted_username(&json!({ "card": {} })), "");
+    }
+
+    #[test]
+    fn test_totp_source_from_stdin() {
+        assert_eq!(totp_source_from_stdin(String::new()), TotpSource::Missing);
+        assert_eq!(
+            totp_source_from_stdin("JBSWY3DPEHPK3PXP".into()),
+            TotpSource::Seed("JBSWY3DPEHPK3PXP".into())
+        );
+        assert_eq!(
+            totp_source_from_stdin(r#"{"secret":"JBSWY3DPEHPK3PXP"}"#.into()),
+            TotpSource::Seed("JBSWY3DPEHPK3PXP".into())
+        );
+        assert_eq!(
+            totp_source_from_stdin(r#"{"id":"item-1"}"#.into()),
+            TotpSource::Item("item-1".into())
+        );
+        assert_eq!(
+            totp_source_from_stdin(r#"{"query":"github"}"#.into()),
+            TotpSource::Item("github".into())
+        );
+    }
+
+    #[test]
+    fn test_validate_auto_lock_option_range() {
+        assert!(validate_auto_lock_option(None).is_ok());
+        assert!(validate_auto_lock_option(Some(1)).is_ok());
+        assert!(validate_auto_lock_option(Some(720)).is_ok());
+        for minutes in [0, -5, 721] {
+            assert!(
+                validate_auto_lock_option(Some(minutes)).is_err(),
+                "{minutes}"
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_auth_payload_plain() {
         let (pwd, code, provider, ndv) = parse_auth_payload("mypassword\n");
-        assert_eq!(pwd, "mypassword");
+        assert_eq!(pwd.as_str(), "mypassword");
         assert_eq!(code, None);
         assert_eq!(provider, None);
         assert_eq!(ndv, None);
@@ -2486,7 +1971,7 @@ mod tests {
     fn test_parse_auth_payload_json_with_code() {
         let (pwd, code, provider, ndv) =
             parse_auth_payload("{\"password\": \"secret123\", \"code\": \"654321\"}\n");
-        assert_eq!(pwd, "secret123");
+        assert_eq!(pwd.as_str(), "secret123");
         assert_eq!(code.as_deref(), Some("654321"));
         assert_eq!(provider, None);
         assert_eq!(ndv, None);
@@ -2497,14 +1982,14 @@ mod tests {
         let (pwd, code, provider, ndv) = parse_auth_payload(
             "{\"password\": \"secret123\", \"code\": \"111222\", \"new_device_otp\": \"111222\"}\n",
         );
-        assert_eq!(pwd, "secret123");
+        assert_eq!(pwd.as_str(), "secret123");
         assert_eq!(code.as_deref(), Some("111222"));
         assert_eq!(provider, None);
         assert_eq!(ndv.as_deref(), Some("111222"));
 
         let (pwd2, code2, provider2, ndv2) =
             parse_auth_payload("{\"password\": \"secret123\", \"newDeviceOtp\": \"333444\"}\n");
-        assert_eq!(pwd2, "secret123");
+        assert_eq!(pwd2.as_str(), "secret123");
         assert_eq!(code2, None);
         assert_eq!(provider2, None);
         assert_eq!(ndv2.as_deref(), Some("333444"));
@@ -2515,7 +2000,7 @@ mod tests {
         let (pwd, code, provider, ndv) = parse_auth_payload(
             "{\"password\": \"secret123\", \"code\": \"123456\", \"two_factor_provider\": 1}\n",
         );
-        assert_eq!(pwd, "secret123");
+        assert_eq!(pwd.as_str(), "secret123");
         assert_eq!(code.as_deref(), Some("123456"));
         assert_eq!(provider, Some(1));
         assert_eq!(ndv, None);
@@ -2523,7 +2008,7 @@ mod tests {
         let (pwd2, code2, provider2, ndv2) = parse_auth_payload(
             "{\"password\": \"secret123\", \"code\": \"999888\", \"provider\": \"3\"}\n",
         );
-        assert_eq!(pwd2, "secret123");
+        assert_eq!(pwd2.as_str(), "secret123");
         assert_eq!(code2.as_deref(), Some("999888"));
         assert_eq!(provider2, Some(3));
         assert_eq!(ndv2, None);
@@ -2532,7 +2017,7 @@ mod tests {
     #[test]
     fn test_parse_auth_payload_json_without_code() {
         let (pwd, code, provider, ndv) = parse_auth_payload("{\"password\": \"secret123\"}\n");
-        assert_eq!(pwd, "secret123");
+        assert_eq!(pwd.as_str(), "secret123");
         assert_eq!(code, None);
         assert_eq!(provider, None);
         assert_eq!(ndv, None);
@@ -2541,7 +2026,7 @@ mod tests {
     #[test]
     fn test_parse_auth_payload_empty() {
         let (pwd, code, provider, ndv) = parse_auth_payload("  \r\n");
-        assert_eq!(pwd, "");
+        assert_eq!(pwd.as_str(), "");
         assert_eq!(code, None);
         assert_eq!(provider, None);
         assert_eq!(ndv, None);
@@ -2562,111 +2047,6 @@ mod tests {
         match cli_explicit.command {
             Commands::Daemon { auto_lock } => assert_eq!(auto_lock, Some(45)),
             _ => panic!("Expected Commands::Daemon"),
-        }
-    }
-
-    #[test]
-    fn test_cli_check_updates_arg_parsing() {
-        let cli_default = Cli::try_parse_from(["omawarden", "config", "set"]).unwrap();
-        match cli_default.command {
-            Commands::Config {
-                action: ConfigAction::Set { check_updates, .. },
-            } => assert_eq!(check_updates, None),
-            _ => panic!("Expected Commands::Config with ConfigAction::Set"),
-        }
-
-        let cli_false =
-            Cli::try_parse_from(["omawarden", "config", "set", "--check-updates", "false"])
-                .unwrap();
-        match cli_false.command {
-            Commands::Config {
-                action: ConfigAction::Set { check_updates, .. },
-            } => assert_eq!(check_updates.as_deref(), Some("false")),
-            _ => panic!("Expected Commands::Config with ConfigAction::Set"),
-        }
-
-        let cli_true =
-            Cli::try_parse_from(["omawarden", "config", "set", "--check-updates", "true"]).unwrap();
-        match cli_true.command {
-            Commands::Config {
-                action: ConfigAction::Set { check_updates, .. },
-            } => assert_eq!(check_updates.as_deref(), Some("true")),
-            _ => panic!("Expected Commands::Config with ConfigAction::Set"),
-        }
-    }
-
-    #[test]
-    fn test_cli_show_website_icons_arg_parsing() {
-        // Without the flag, show_website_icons should be None so config keeps its value
-        let cli_default = Cli::try_parse_from(["omawarden", "config", "set"]).unwrap();
-        match cli_default.command {
-            Commands::Config {
-                action:
-                    ConfigAction::Set {
-                        show_website_icons, ..
-                    },
-            } => assert_eq!(show_website_icons, None),
-            _ => panic!("Expected Commands::Config with ConfigAction::Set"),
-        }
-
-        let cli_false = Cli::try_parse_from([
-            "omawarden",
-            "config",
-            "set",
-            "--show-website-icons",
-            "false",
-        ])
-        .unwrap();
-        match cli_false.command {
-            Commands::Config {
-                action:
-                    ConfigAction::Set {
-                        show_website_icons, ..
-                    },
-            } => assert_eq!(show_website_icons, Some("false".to_string())),
-            _ => panic!("Expected Commands::Config with ConfigAction::Set"),
-        }
-
-        let cli_true =
-            Cli::try_parse_from(["omawarden", "config", "set", "--show-website-icons", "true"])
-                .unwrap();
-        match cli_true.command {
-            Commands::Config {
-                action:
-                    ConfigAction::Set {
-                        show_website_icons, ..
-                    },
-            } => assert_eq!(show_website_icons, Some("true".to_string())),
-            _ => panic!("Expected Commands::Config with ConfigAction::Set"),
-        }
-    }
-
-    #[test]
-    fn test_cli_max_attachment_size_arg_parsing() {
-        let cli_default = Cli::try_parse_from(["omawarden", "config", "set"]).unwrap();
-        match cli_default.command {
-            Commands::Config {
-                action:
-                    ConfigAction::Set {
-                        max_attachment_size,
-                        ..
-                    },
-            } => assert_eq!(max_attachment_size, None),
-            _ => panic!("Expected Commands::Config with ConfigAction::Set"),
-        }
-
-        let cli_custom =
-            Cli::try_parse_from(["omawarden", "config", "set", "--max-attachment-size", "250"])
-                .unwrap();
-        match cli_custom.command {
-            Commands::Config {
-                action:
-                    ConfigAction::Set {
-                        max_attachment_size,
-                        ..
-                    },
-            } => assert_eq!(max_attachment_size, Some(250)),
-            _ => panic!("Expected Commands::Config with ConfigAction::Set"),
         }
     }
 

@@ -33,6 +33,7 @@ ScrollView {
 
     // Shortcuts Cheat Sheet Header
     Text {
+      textFormat: Text.PlainText
       text: "KEYBOARD SHORTCUTS"
       color: emptyInspectorRoot.muted
       font.pixelSize: Style.fontPx(0.75)
@@ -54,6 +55,7 @@ ScrollView {
         border.color: emptyInspectorRoot.borderColor
         border.width: 1
         Text {
+          textFormat: Text.PlainText
           id: k3
           anchors.centerIn: parent
           text: "Tab"
@@ -63,7 +65,8 @@ ScrollView {
         }
       }
       Text {
-        text: "Switch Category Filter (Logins, Cards, Secure Note, SSH)"
+        textFormat: Text.PlainText
+        text: "Switch Category Filter (Logins, Cards, Identities, Secure Notes)"
         color: emptyInspectorRoot.muted
         font.pixelSize: Style.font.caption
         Layout.fillWidth: true
@@ -79,6 +82,7 @@ ScrollView {
         border.color: emptyInspectorRoot.borderColor
         border.width: 1
         Text {
+          textFormat: Text.PlainText
           id: kAltV
           anchors.centerIn: parent
           text: "Alt + V"
@@ -88,6 +92,7 @@ ScrollView {
         }
       }
       Text {
+        textFormat: Text.PlainText
         text: "Switch Vault Scope (All Vaults, Personal, Organizations)"
         color: emptyInspectorRoot.muted
         font.pixelSize: Style.font.caption
@@ -104,6 +109,7 @@ ScrollView {
         border.color: emptyInspectorRoot.borderColor
         border.width: 1
         Text {
+          textFormat: Text.PlainText
           id: kAltF
           anchors.centerIn: parent
           text: "Alt + F"
@@ -113,6 +119,7 @@ ScrollView {
         }
       }
       Text {
+        textFormat: Text.PlainText
         text: "Switch Folder Scope (All Folders, Specific Folder)"
         color: emptyInspectorRoot.muted
         font.pixelSize: Style.font.caption
@@ -129,6 +136,7 @@ ScrollView {
         border.color: emptyInspectorRoot.borderColor
         border.width: 1
         Text {
+          textFormat: Text.PlainText
           id: k1
           anchors.centerIn: parent
           text: "↵ "
@@ -138,6 +146,7 @@ ScrollView {
         }
       }
       Text {
+        textFormat: Text.PlainText
         text: "Copy Primary Credential (Password / Card / Key)"
         color: emptyInspectorRoot.muted
         font.pixelSize: Style.font.caption
@@ -154,6 +163,7 @@ ScrollView {
         border.color: emptyInspectorRoot.borderColor
         border.width: 1
         Text {
+          textFormat: Text.PlainText
           id: kEnterTotp
           anchors.centerIn: parent
           text: "Ctrl + ↵"
@@ -163,6 +173,7 @@ ScrollView {
         }
       }
       Text {
+        textFormat: Text.PlainText
         text: "Copy Live TOTP Code"
         color: emptyInspectorRoot.muted
         font.pixelSize: Style.font.caption
@@ -179,6 +190,7 @@ ScrollView {
         border.color: emptyInspectorRoot.borderColor
         border.width: 1
         Text {
+          textFormat: Text.PlainText
           id: kU
           anchors.centerIn: parent
           text: "Ctrl + U"
@@ -188,6 +200,7 @@ ScrollView {
         }
       }
       Text {
+        textFormat: Text.PlainText
         text: "Copy Username"
         color: emptyInspectorRoot.muted
         font.pixelSize: Style.font.caption
@@ -204,6 +217,7 @@ ScrollView {
         border.color: emptyInspectorRoot.borderColor
         border.width: 1
         Text {
+          textFormat: Text.PlainText
           id: kT
           anchors.centerIn: parent
           text: "Ctrl + T"
@@ -213,6 +227,7 @@ ScrollView {
         }
       }
       Text {
+        textFormat: Text.PlainText
         text: "Toggle Field / Secret Visibility"
         color: emptyInspectorRoot.muted
         font.pixelSize: Style.font.caption
@@ -229,6 +244,7 @@ ScrollView {
         border.color: emptyInspectorRoot.borderColor
         border.width: 1
         Text {
+          textFormat: Text.PlainText
           id: kH
           anchors.centerIn: parent
           text: "Ctrl + H"
@@ -238,6 +254,7 @@ ScrollView {
         }
       }
       Text {
+        textFormat: Text.PlainText
         text: "Open Password History Modal"
         color: emptyInspectorRoot.muted
         font.pixelSize: Style.font.caption
@@ -254,6 +271,7 @@ ScrollView {
         border.color: emptyInspectorRoot.borderColor
         border.width: 1
         Text {
+          textFormat: Text.PlainText
           id: kO
           anchors.centerIn: parent
           text: "Ctrl + O"
@@ -263,6 +281,7 @@ ScrollView {
         }
       }
       Text {
+        textFormat: Text.PlainText
         text: "Open Primary Website in Default Browser"
         color: emptyInspectorRoot.muted
         font.pixelSize: Style.font.caption
@@ -279,6 +298,7 @@ ScrollView {
         border.color: emptyInspectorRoot.borderColor
         border.width: 1
         Text {
+          textFormat: Text.PlainText
           id: k2
           anchors.centerIn: parent
           text: "Ctrl + K"
@@ -288,7 +308,8 @@ ScrollView {
         }
       }
       Text {
-        text: "Open Action Palette (Copy Attributes, PIN, Attachments)"
+        textFormat: Text.PlainText
+        text: "Open Action Palette (Copy Attributes, PIN)"
         color: emptyInspectorRoot.muted
         font.pixelSize: Style.font.caption
         Layout.fillWidth: true
@@ -304,6 +325,7 @@ ScrollView {
         border.color: emptyInspectorRoot.borderColor
         border.width: 1
         Text {
+          textFormat: Text.PlainText
           id: k4
           anchors.centerIn: parent
           text: "Ctrl + R"
@@ -313,6 +335,7 @@ ScrollView {
         }
       }
       Text {
+        textFormat: Text.PlainText
         text: "Sync Vault with Server"
         color: emptyInspectorRoot.muted
         font.pixelSize: Style.font.caption
@@ -329,6 +352,7 @@ ScrollView {
         border.color: emptyInspectorRoot.borderColor
         border.width: 1
         Text {
+          textFormat: Text.PlainText
           id: k5
           anchors.centerIn: parent
           text: "Ctrl + L"
@@ -338,6 +362,7 @@ ScrollView {
         }
       }
       Text {
+        textFormat: Text.PlainText
         text: "Lock Vault Immediately"
         color: emptyInspectorRoot.muted
         font.pixelSize: Style.font.caption
@@ -354,6 +379,7 @@ ScrollView {
         border.color: emptyInspectorRoot.borderColor
         border.width: 1
         Text {
+          textFormat: Text.PlainText
           id: k6
           anchors.centerIn: parent
           text: "Ctrl + ,"
@@ -363,6 +389,7 @@ ScrollView {
         }
       }
       Text {
+        textFormat: Text.PlainText
         text: "Open Settings & Configuration"
         color: emptyInspectorRoot.muted
         font.pixelSize: Style.font.caption

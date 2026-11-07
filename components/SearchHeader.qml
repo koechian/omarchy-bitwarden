@@ -10,7 +10,7 @@ ColumnLayout {
   property alias searchQuery: searchInputField.text
   property alias searchField: searchInputField
   property alias categoryTabBar: catBar
-  property var categoryList: ["all", "login", "card", "identity", "note", "ssh_key"]
+  property var categoryList: ["all", "login", "card", "identity", "note"]
   property string activeCategory: "all"
   property var rawVaultItems: []
   property color background: Commons.Color.menu.background
@@ -28,13 +28,10 @@ ColumnLayout {
   signal vaultScopeSelected(string scope)
   signal folderScopeSelected(string scope)
   signal clearSearchRequested()
-  signal createSshKeyRequested()
-  signal importSshKeyRequested()
   signal copyUsernameRequested()
   signal copyTotpRequested()
   signal openUrlRequested()
   signal actionPaletteRequested()
-  signal exportSshKeyRequested()
 
   property alias isScopeDropdownOpen: vaultScopeDropdown.isOpen
   property alias isVaultScopeOpen: vaultScopeDropdown.isOpen
@@ -142,6 +139,62 @@ ColumnLayout {
     }
   }
 
+  // Alt+V / Alt+F open the scope dropdowns. Returns true when handled.
+  function handleScopeShortcut(event) {
+    var letter = event.text ? event.text.toLowerCase() : ""
+    if (event.key === Qt.Key_V || letter === "v") {
+      searchHeaderRoot.openVaultScope()
+      return true
+    }
+    if (event.key === Qt.Key_F || letter === "f") {
+      searchHeaderRoot.openFolderScope()
+      return true
+    }
+    return false
+  }
+
+  // Ctrl+<key> -> the request it emits.
+  function controlShortcutRequest(key) {
+    var requests = {}
+    requests[Qt.Key_Return] = function() { searchHeaderRoot.copyTotpRequested() }
+    requests[Qt.Key_Enter] = requests[Qt.Key_Return]
+    requests[Qt.Key_U] = function() { searchHeaderRoot.copyUsernameRequested() }
+    requests[Qt.Key_O] = function() { searchHeaderRoot.openUrlRequested() }
+    requests[Qt.Key_K] = function() { searchHeaderRoot.actionPaletteRequested() }
+    return requests[key] || null
+  }
+
+  // A held chord is accepted but not repeated: Ctrl+Enter copies a TOTP code,
+  // a budgeted release, and must not drain the release budget.
+  function handleControlShortcut(event) {
+    var request = searchHeaderRoot.controlShortcutRequest(event.key)
+    if (!request) return false
+    if (!event.isAutoRepeat) request()
+    return true
+  }
+
+  // Esc in the search field: close an open dropdown, then clear the query,
+  // then clear the scope filters. Returns true when handled.
+  function handleEscapeKey() {
+    if (vaultScopeDropdown.isOpen) {
+      vaultScopeDropdown.close()
+      return true
+    }
+    if (folderScopeDropdown.isOpen) {
+      folderScopeDropdown.close()
+      return true
+    }
+    if (searchInputField.text.length > 0) {
+      searchInputField.text = ""
+      searchHeaderRoot.clearSearchRequested()
+      return true
+    }
+    if (searchHeaderRoot.activeVaultScope === "all" && searchHeaderRoot.activeFolderScope === "all") return false
+    searchHeaderRoot.vaultScopeSelected("all")
+    searchHeaderRoot.folderScopeSelected("all")
+    return true
+  }
+
   spacing: 6
   Layout.fillWidth: true
 
@@ -211,70 +264,22 @@ ColumnLayout {
           Keys.priority: Keys.BeforeItem
           Keys.onPressed: function(event) {
             if (searchHeaderRoot.modalsActive) return
-
-            if (event.modifiers & Qt.AltModifier) {
-              if (event.key === Qt.Key_V || (event.text && event.text.toLowerCase() === "v")) {
-                searchHeaderRoot.openVaultScope()
-                event.accepted = true
-                return
-              } else if (event.key === Qt.Key_F || (event.text && event.text.toLowerCase() === "f")) {
-                searchHeaderRoot.openFolderScope()
-                event.accepted = true
-                return
-              }
-            }
-
-            if (event.modifiers & Qt.ControlModifier) {
-              if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                searchHeaderRoot.copyTotpRequested()
-                event.accepted = true
-              } else if (event.key === Qt.Key_U) {
-                searchHeaderRoot.copyUsernameRequested()
-                event.accepted = true
-              } else if (event.key === Qt.Key_O) {
-                searchHeaderRoot.openUrlRequested()
-                event.accepted = true
-              } else if (event.key === Qt.Key_K) {
-                searchHeaderRoot.actionPaletteRequested()
-                event.accepted = true
-              } else if (event.key === Qt.Key_E) {
-                searchHeaderRoot.exportSshKeyRequested()
-                event.accepted = true
-              }
-            }
-
-            if (event.key === Qt.Key_Escape) {
-              if (vaultScopeDropdown.isOpen) {
-                vaultScopeDropdown.close()
-                event.accepted = true
-                return
-              }
-              if (folderScopeDropdown.isOpen) {
-                folderScopeDropdown.close()
-                event.accepted = true
-                return
-              }
-              if (searchInputField.text.length > 0) {
-                searchInputField.text = ""
-                searchHeaderRoot.clearSearchRequested()
-                event.accepted = true
-                return
-              }
-              if (searchHeaderRoot.activeVaultScope !== "all" || searchHeaderRoot.activeFolderScope !== "all") {
-                searchHeaderRoot.vaultScopeSelected("all")
-                searchHeaderRoot.folderScopeSelected("all")
-                event.accepted = true
-                return
-              }
+            if ((event.modifiers & Qt.AltModifier) && searchHeaderRoot.handleScopeShortcut(event)) {
+              event.accepted = true
+            } else if ((event.modifiers & Qt.ControlModifier) && searchHeaderRoot.handleControlShortcut(event)) {
+              event.accepted = true
+            } else if (event.key === Qt.Key_Escape && searchHeaderRoot.handleEscapeKey()) {
+              event.accepted = true
             }
           }
         }
 
         Text {
+          textFormat: Text.PlainText
           anchors.left: parent.left
           anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
-          text: "Search Bitwarden vault (names, usernames, notes, tags)..."
+          text: "Search Bitwarden vault (names, usernames, URLs, folders)..."
           color: searchHeaderRoot.muted
           font.family: "sans-serif"
           font.pixelSize: Style.font.body
@@ -284,6 +289,7 @@ ColumnLayout {
 
       // Clear search button (placed before Folder Scope Dropdown)
       Text {
+        textFormat: Text.PlainText
         visible: Boolean(searchInputField.text)
         text: "\uf00d"
         font.family: searchHeaderRoot.fontFamily
@@ -354,65 +360,5 @@ ColumnLayout {
     }
 
     Item { Layout.fillWidth: true }
-
-    // SSH Key Category Actions
-    RowLayout {
-      visible: searchHeaderRoot.activeCategory === "ssh_key"
-      spacing: 4
-
-      Rectangle {
-        implicitWidth: 18
-        implicitHeight: 18
-        radius: 4
-        color: createMouse.containsMouse ? Qt.rgba(searchHeaderRoot.foreground.r, searchHeaderRoot.foreground.g, searchHeaderRoot.foreground.b, 0.08) : "transparent"
-
-        Text {
-          anchors.centerIn: parent
-          text: "\uf067"
-          font.family: searchHeaderRoot.fontFamily
-          font.pixelSize: Style.font.caption
-          color: createMouse.containsMouse ? searchHeaderRoot.foreground : searchHeaderRoot.muted
-        }
-
-        MouseArea {
-          id: createMouse
-          anchors.fill: parent
-          hoverEnabled: true
-          cursorShape: Qt.PointingHandCursor
-          onClicked: searchHeaderRoot.createSshKeyRequested()
-
-          ToolTip.visible: containsMouse
-          ToolTip.delay: 300
-          ToolTip.text: "Generate SSH Key"
-        }
-      }
-
-      Rectangle {
-        implicitWidth: 18
-        implicitHeight: 18
-        radius: 4
-        color: importMouse.containsMouse ? Qt.rgba(searchHeaderRoot.foreground.r, searchHeaderRoot.foreground.g, searchHeaderRoot.foreground.b, 0.08) : "transparent"
-
-        Text {
-          anchors.centerIn: parent
-          text: "\uf019"
-          font.family: searchHeaderRoot.fontFamily
-          font.pixelSize: Style.font.caption
-          color: importMouse.containsMouse ? searchHeaderRoot.foreground : searchHeaderRoot.muted
-        }
-
-        MouseArea {
-          id: importMouse
-          anchors.fill: parent
-          hoverEnabled: true
-          cursorShape: Qt.PointingHandCursor
-          onClicked: searchHeaderRoot.importSshKeyRequested()
-
-          ToolTip.visible: containsMouse
-          ToolTip.delay: 300
-          ToolTip.text: "Import SSH Key"
-        }
-      }
-    }
   }
 }

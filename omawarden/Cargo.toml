@@ -1,6 +1,6 @@
 [package]
 name = "omawarden"
-version = "0.11.0"
+version = "0.13.0"
 edition = "2021"
 description = "High-performance and low memory Bitwarden CLI (Designed for Omarchy Plugin)"
 authors = ["icyleaf"]
@@ -14,7 +14,6 @@ which = "8.0"
 zeroize = { version = "1.8", features = ["derive"] }
 chrono = "0.4"
 url = "2.5"
-totp-rs = { version = "6.0", features = ["otpauth"] }
 base32 = "0.5"
 base64 = "0.23"
 hmac = "0.12"
@@ -29,14 +28,13 @@ subtle = "2.6"
 rsa = { version = "0.9", features = ["sha2", "sha1"] }
 pkcs8 = { version = "0.11", features = ["std"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "blocking"] }
-tokio = { version = "1", features = ["full"] }
 libc = "0.2"
-ssh-key = { version = "0.6", features = ["ed25519", "rsa", "ecdsa", "crypto", "alloc", "encryption"] }
-ssh-encoding = { version = "0.2", features = ["alloc"] }
-signature = "2"
 rand_core = { version = "0.6", features = ["getrandom"] }
 rand = "0.8"
 rpassword = "7.3"
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 
 [dev-dependencies]
 tempfile = "3.17"

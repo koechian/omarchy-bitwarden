@@ -88,39 +88,10 @@ Item {
     check(deriveEngineSource([], "", { installed: false }) === "", "Derives empty string when engine not installed")
     check(deriveEngineSource(aurModelGit, "/usr/bin/omawarden", { installed: false }) === "", "Derives empty string when cliHealth.installed is false")
 
-    // 5. Test isInstallingDependencies property
-    check(sm.isInstallingDependencies === false, "Default isInstallingDependencies is false")
-    sm.isInstallingDependencies = true
-    check(sm.isInstallingDependencies === true, "isInstallingDependencies updates to true")
-    sm.isInstallingDependencies = false
-
-    // 6. Test installPackageRequested signal on missing engine and updates
-    var lastInstalledPackage = ""
-    sm.installPackageRequested.connect(function(pkg) { lastInstalledPackage = pkg })
-
-    // Simulate missing engine install action
-    sm.cliHealth = { installed: false }
-    sm.updateAvailable = false
-    check(!sm.cliHealth.installed, "Engine is marked as missing")
-    sm.installPackageRequested("omawarden")
-    check(lastInstalledPackage === "omawarden", "installPackageRequested dispatched with omawarden for missing engine")
-
-    // 7. Simulate update action dispatch via AUR package
-    lastInstalledPackage = ""
-    sm.cliHealth = { installed: true, version: "0.8.1" }
-    sm.updateAvailable = true
-    sm.latestVersion = "0.8.2"
-    sm.engineSource = "aur"
-    sm.enginePackage = "omawarden-git"
-
-    sm.installPackageRequested(sm.enginePackage || "omawarden")
-    check(lastInstalledPackage === "omawarden-git", "Update triggers installPackageRequested with omawarden-git")
-
-    // 7b. Update when enginePackage is empty defaults to omawarden
-    lastInstalledPackage = ""
-    sm.enginePackage = ""
-    sm.installPackageRequested(sm.enginePackage || "omawarden")
-    check(lastInstalledPackage === "omawarden", "Update defaults to omawarden when enginePackage is unset")
+    // 5. The settings view reports the engine but never runs an installer
+    check(sm.installPackageRequested === undefined, "SettingsModal exposes no installer signal")
+    check(sm.isInstallingDependencies === undefined, "SettingsModal has no installer state")
+    check(sm.checkUpdateRequested === undefined, "SettingsModal exposes no update check signal")
 
     console.log("ALL SETTINGS ENGINE SOURCE TESTS PASSED!")
     Qt.exit(failures === 0 ? 0 : 1)

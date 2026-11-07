@@ -39,14 +39,12 @@ Item {
       type_name: "login",
       login: {
         username: "octocat",
-        password: "secretpassword",
-        totp: "otpauth://totp/GitHub:octocat?secret=JBSWY3DPEHPK3PXP",
+        has_password: true,
         has_totp: true,
         uris: [{ uri: "https://github.com" }]
       },
-      notes: "Some private notes",
-      fields: [{ name: "Pin", value: "1234", type: 1 }],
-      attachments: [{ fileName: "key.txt", size: 1024 }],
+      has_notes: true,
+      fields: [{ index: 0, name: "Pin", type: 1, has_value: true }],
       created_at: "2024-01-01T00:00:00Z",
       updated_at: "2024-01-02T00:00:00Z"
     })
@@ -109,7 +107,7 @@ Item {
       check(shortcutsHeader.color == latteMuted, "Shortcuts header color should match muted token")
     }
 
-    var tabDesc = findTextByContent(emptyInspector, "Switch Category Filter (Logins, Cards, Secure Note, SSH)")
+    var tabDesc = findTextByContent(emptyInspector, "Switch Category Filter (Logins, Cards, Identities, Secure Notes)")
     check(tabDesc !== null, "Found shortcut description text")
     if (tabDesc) {
       check(tabDesc.color == latteMuted, "Shortcut description text should match muted token")

@@ -14,17 +14,7 @@ Item {
   property string engineSource: "aur"
   property string enginePackage: ""
   property var logBuffer: []
-  property bool isInstallingDependencies: false
   property bool isBusy: false
-  property bool updateAvailable: false
-  property string latestVersion: ""
-  property string latestReleaseNotes: ""
-  property string latestReleaseUrl: ""
-  property string latestReleaseTitle: ""
-  property bool showReleaseNotes: false
-  property bool isCheckingUpdate: false
-  property string updateCheckStatus: ""
-  property bool justCheckedLatest: false
   property color foreground: Commons.Color.menu.text
   property color accent: Commons.Color.menu.selectedText
   property color borderColor: Commons.Color.menu.border
@@ -35,33 +25,11 @@ Item {
   // fills those controls (root maps accent := Color.menu.selectedText).
   readonly property color textOnAccent: StatusPalette.textOn(accent)
   property string fontFamily: ""
-  property bool checkUpdatesChecked: true
-  readonly property alias confirmRepeater: confirmRepeater
   readonly property alias logSeverityRepeater: logSeverityRepeater
-
-  Timer {
-    id: latestTimer
-    interval: 2500
-    onTriggered: settingsRoot.justCheckedLatest = false
-  }
-
-  onIsCheckingUpdateChanged: {
-    if (!isCheckingUpdate && !updateAvailable) {
-      justCheckedLatest = true
-      latestTimer.restart()
-    }
-  }
-
-  onVisibleChanged: {
-    if (!visible) {
-      showReleaseNotes = false
-    }
-  }
 
   property string activeTab: "general" // "general" | "logs"
   property string logFilter: "all" // "all" | "error" | "warn"
   property string selectedLogLevel: (config && config.log_level) ? config.log_level.toLowerCase() : "error"
-  property bool showWebsiteIconsChecked: true
   property bool rememberLastSearchChecked: false
   property bool enableMtlsChecked: false
 
@@ -82,13 +50,9 @@ Item {
       clientKeyInput.text = settingsRoot.certMatchesServer ? ((config && config.client_key_path) || "") : ""
     }
   }
-  property bool sshAgentChecked: false
-  property string sshAgentConfirm: "first-use"
   property bool quickUnlockChecked: false
 
   onConfigChanged: {
-    if (config) checkUpdatesChecked = (config.check_updates !== false)
-    if (config) showWebsiteIconsChecked = (config.show_website_icons !== false)
     if (config) rememberLastSearchChecked = (config.remember_last_search === true)
     if (config) enableMtlsChecked = Boolean(config.client_cert_path && settingsRoot.certMatchesServer)
     if (sUrlInput && config && config.server_url) {
@@ -100,8 +64,6 @@ Item {
     if (clientKeyInput) {
       clientKeyInput.text = settingsRoot.certMatchesServer ? ((config && config.client_key_path) || "") : ""
     }
-    if (config) sshAgentChecked = (config.ssh_agent_enabled === true)
-    if (config && config.ssh_agent_confirm) sshAgentConfirm = config.ssh_agent_confirm
     if (config) quickUnlockChecked = (config.quick_unlock === true)
   }
 
@@ -116,16 +78,10 @@ Item {
       identity_url: idUrlInput.text.trim(),
       client_cert_path: certPath,
       client_key_path: keyPath,
-      download_dir: dlDirInput.text.trim() || "~/Downloads",
       auto_lock_minutes: isNaN(parseInt(lockMinInput.text.trim())) ? 15 : Math.max(0, parseInt(lockMinInput.text.trim())),
       clipboard_clear_seconds: isNaN(parseInt(clipSecInput.text.trim())) ? 30 : Math.max(0, parseInt(clipSecInput.text.trim())),
-      max_attachment_size_mb: isNaN(parseInt(maxAttSizeInput.text.trim())) || parseInt(maxAttSizeInput.text.trim()) <= 0 ? 500 : parseInt(maxAttSizeInput.text.trim()),
       log_level: settingsRoot.selectedLogLevel,
-      show_website_icons: settingsRoot.showWebsiteIconsChecked,
-      check_updates: settingsRoot.checkUpdatesChecked,
       remember_last_search: settingsRoot.rememberLastSearchChecked,
-      ssh_agent_enabled: settingsRoot.sshAgentChecked,
-      ssh_agent_confirm: settingsRoot.sshAgentConfirm,
       quick_unlock: settingsRoot.quickUnlockChecked
     }
   }
@@ -133,8 +89,6 @@ Item {
   signal saveRequested(var newSettings)
   signal closeRequested()
   signal refreshHealthRequested()
-  signal checkUpdateRequested()
-  signal installPackageRequested(string pkgName)
   signal copyDiagnosticsRequested()
   signal clearLogsRequested()
 
@@ -198,12 +152,14 @@ Item {
       RowLayout {
         spacing: 6
         Text {
+          textFormat: Text.PlainText
           text: "\uf013"
           font.family: settingsRoot.fontFamily
           color: settingsRoot.accent
           font.pixelSize: Style.font.subtitle
         }
         Text {
+          textFormat: Text.PlainText
           text: "Settings & Diagnostics"
           color: settingsRoot.foreground
           font.pixelSize: Style.font.subtitle
@@ -229,6 +185,7 @@ Item {
           border.width: 1
 
           Text {
+            textFormat: Text.PlainText
             id: genTabText
             anchors.centerIn: parent
             text: "General"
@@ -261,6 +218,7 @@ Item {
             anchors.centerIn: parent
             spacing: 4
             Text {
+              textFormat: Text.PlainText
               text: "Logs & Diagnostics"
               color: logsTabItem.isSelected ? settingsRoot.accent : (logsMouse.containsMouse ? settingsRoot.foreground : settingsRoot.muted)
               font.pixelSize: Style.font.bodySmall
@@ -274,6 +232,7 @@ Item {
               radius: 7
               color: StatusPalette.danger
               Text {
+                textFormat: Text.PlainText
                 id: errBadgeText
                 anchors.centerIn: parent
                 text: String(settingsRoot.errorCount)
@@ -317,32 +276,8 @@ Item {
 
           RowLayout {
             Layout.fillWidth: true
-            Text { text: "ENGINE STATUS & HEALTH"; color: settingsRoot.muted; font.pixelSize: Style.font.caption; font.weight: Font.DemiBold }
+            Text { textFormat: Text.PlainText; text: "ENGINE STATUS & HEALTH"; color: settingsRoot.muted; font.pixelSize: Style.font.caption; font.weight: Font.DemiBold }
             Item { Layout.fillWidth: true }
-
-            // Check Update Button
-            Rectangle {
-              implicitHeight: 20
-              implicitWidth: chkUpText.implicitWidth + 10
-              radius: 3
-              color: Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.06)
-              border.color: settingsRoot.borderColor
-              border.width: 1
-
-              Text {
-                id: chkUpText
-                anchors.centerIn: parent
-                text: settingsRoot.isCheckingUpdate ? "Checking..." : (settingsRoot.justCheckedLatest ? "Latest" : "Check Update")
-                color: settingsRoot.justCheckedLatest ? StatusPalette.ok : settingsRoot.accent
-                font.pixelSize: Style.font.caption
-              }
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                enabled: !settingsRoot.isCheckingUpdate
-                onClicked: settingsRoot.checkUpdateRequested()
-              }
-            }
 
             // Refresh Button
             Rectangle {
@@ -353,7 +288,7 @@ Item {
               border.color: settingsRoot.borderColor
               border.width: 1
 
-              Text { id: refHText; anchors.centerIn: parent; text: "Refresh"; color: settingsRoot.accent; font.pixelSize: Style.font.caption }
+              Text { textFormat: Text.PlainText; id: refHText; anchors.centerIn: parent; text: "Refresh"; color: settingsRoot.accent; font.pixelSize: Style.font.caption }
               MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: settingsRoot.refreshHealthRequested() }
             }
           }
@@ -362,18 +297,17 @@ Item {
             Layout.fillWidth: true
             spacing: 6
 
-            // Unified Engine Badge & Update Action
+            // Unified Engine Badge
             Rectangle {
               id: engineBadgeBox
               implicitHeight: 24
               implicitWidth: cliBadgeRow.implicitWidth + 14
               radius: 4
-              color: engineMouse.containsMouse ? Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.12) : Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.06)
+              color: Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.06)
               border.color: settingsRoot.borderColor
               border.width: 1
 
               readonly property bool isInstalled: Boolean(settingsRoot.cliHealth.installed)
-              readonly property bool hasUpdate: isInstalled && settingsRoot.updateAvailable && Boolean(settingsRoot.latestVersion)
 
               RowLayout {
                 id: cliBadgeRow
@@ -388,6 +322,7 @@ Item {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   text: "Engine: " + (!engineBadgeBox.isInstalled ? "Missing" : (settingsRoot.cliHealth.version || "Ready"))
                   color: settingsRoot.foreground
                   font.pixelSize: Style.font.caption
@@ -404,6 +339,7 @@ Item {
                   border.width: 1
 
                   Text {
+                    textFormat: Text.PlainText
                     id: engineSourceText
                     anchors.centerIn: parent
                     text: {
@@ -415,67 +351,6 @@ Item {
                     color: (settingsRoot.engineSource.toLowerCase() === "aur") ? StatusPalette.aur : StatusPalette.system
                     font.pixelSize: Style.fontPx(0.75)
                     font.weight: Font.DemiBold
-                  }
-                }
-
-                // Inline update tag when update is available
-                Rectangle {
-                  visible: engineBadgeBox.hasUpdate
-                  implicitHeight: 16
-                  implicitWidth: updateTagRow.implicitWidth + 8
-                  radius: 3
-                  color: StatusPalette.tint(StatusPalette.update, 0.15)
-
-                  RowLayout {
-                    id: updateTagRow
-                    anchors.centerIn: parent
-                    spacing: 3
-                    Text {
-                      text: "\uf062"
-                      font.family: settingsRoot.fontFamily
-                      color: StatusPalette.textOnTint(StatusPalette.update, 0.15, Commons.Color.popups.background)
-                      font.pixelSize: Style.fontPx(0.667)
-                    }
-                    Text {
-                      id: updateTagLabel
-                      text: "Update (AUR)"
-                      color: StatusPalette.textOnTint(StatusPalette.update, 0.15, Commons.Color.popups.background)
-                      font.pixelSize: Style.fontPx(0.75)
-                      font.weight: Font.DemiBold
-                    }
-                  }
-                }
-
-                // Install pill when missing
-                Rectangle {
-                  visible: !engineBadgeBox.isInstalled
-                  implicitHeight: 16
-                  implicitWidth: dlTagText.implicitWidth + 8
-                  radius: 3
-                  color: settingsRoot.accent
-
-                  Text {
-                    id: dlTagText
-                    anchors.centerIn: parent
-                    text: settingsRoot.isInstallingDependencies ? "Installing..." : "Install"
-                    color: settingsRoot.textOnAccent
-                    font.pixelSize: Style.fontPx(0.75)
-                    font.weight: Font.Medium
-                  }
-                }
-              }
-
-              MouseArea {
-                id: engineMouse
-                anchors.fill: parent
-                hoverEnabled: engineBadgeBox.hasUpdate || !engineBadgeBox.isInstalled
-                cursorShape: (engineBadgeBox.hasUpdate || !engineBadgeBox.isInstalled) ? Qt.PointingHandCursor : Qt.ArrowCursor
-                enabled: !settingsRoot.isInstallingDependencies
-                onClicked: {
-                  if (engineBadgeBox.hasUpdate) {
-                    settingsRoot.installPackageRequested(settingsRoot.enginePackage || "omawarden")
-                  } else if (!engineBadgeBox.isInstalled) {
-                    settingsRoot.installPackageRequested("omawarden")
                   }
                 }
               }
@@ -503,6 +378,7 @@ Item {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   text: "Keyring: " + (settingsRoot.cliHealth.keyring_available ? "Ready" : "Unavailable")
                   color: settingsRoot.foreground
                   font.pixelSize: Style.font.caption
@@ -532,6 +408,7 @@ Item {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   text: "Clipboard: " + (settingsRoot.cliHealth.clipboard_available ? "Ready" : "Missing")
                   color: settingsRoot.foreground
                   font.pixelSize: Style.font.caption
@@ -550,7 +427,7 @@ Item {
           ColumnLayout {
             Layout.fillWidth: true
             spacing: 3
-            Text { text: "Bitwarden / Vaultwarden Server URL:"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
+            Text { textFormat: Text.PlainText; text: "Bitwarden / Vaultwarden Server URL:"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
             Rectangle {
               Layout.fillWidth: true; height: 32; radius: 5; color: Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.08); border.color: sUrlInput.activeFocus ? settingsRoot.accent : settingsRoot.borderColor; border.width: 1
               TextInput {
@@ -559,7 +436,7 @@ Item {
                 clip: true
                 activeFocusOnTab: true
                 KeyNavigation.tab: idUrlInput
-                KeyNavigation.backtab: maxAttSizeInput
+                KeyNavigation.backtab: clipSecInput
                 text: (settingsRoot.config && settingsRoot.config.server_url) ? settingsRoot.config.server_url : "https://vault.bitwarden.com"
               }
             }
@@ -571,8 +448,8 @@ Item {
             spacing: 3
             RowLayout {
               spacing: 4
-              Text { text: "Identity URL:"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
-              Text { text: "(Optional override, e.g. https://identity.bitwarden.com)"; color: settingsRoot.muted; font.pixelSize: Style.font.caption }
+              Text { textFormat: Text.PlainText; text: "Identity URL:"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
+              Text { textFormat: Text.PlainText; text: "(Optional override, e.g. https://identity.bitwarden.com)"; color: settingsRoot.muted; font.pixelSize: Style.font.caption }
             }
             Rectangle {
               Layout.fillWidth: true; height: 32; radius: 5; color: Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.08); border.color: idUrlInput.activeFocus ? settingsRoot.accent : settingsRoot.borderColor; border.width: 1
@@ -581,11 +458,12 @@ Item {
                 anchors.left: parent.left; anchors.right: parent.right; anchors.leftMargin: 10; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; color: settingsRoot.foreground; font.family: "sans-serif"; font.pixelSize: Style.font.body; selectByMouse: true
                 clip: true
                 activeFocusOnTab: true
-                KeyNavigation.tab: (!settingsRoot.isOfficialServer && settingsRoot.enableMtlsChecked) ? clientCertInput : dlDirInput
+                KeyNavigation.tab: (!settingsRoot.isOfficialServer && settingsRoot.enableMtlsChecked) ? clientCertInput : lockMinInput
                 KeyNavigation.backtab: sUrlInput
                 text: (settingsRoot.config && settingsRoot.config.identity_url) ? settingsRoot.config.identity_url : ""
               }
               Text {
+                textFormat: Text.PlainText
                 anchors.left: parent.left; anchors.leftMargin: 10; anchors.verticalCenter: parent.verticalCenter
                 text: "Auto (default: identity.bitwarden.com or /identity)"
                 color: settingsRoot.muted
@@ -604,6 +482,7 @@ Item {
               color: settingsRoot.enableMtlsChecked ? settingsRoot.accent : Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.10)
               border.color: settingsRoot.borderColor; border.width: 1
               Text {
+                textFormat: Text.PlainText
                 anchors.centerIn: parent
                 visible: settingsRoot.enableMtlsChecked
                 text: "\uf00c"
@@ -618,6 +497,7 @@ Item {
               }
             }
             Text {
+              textFormat: Text.PlainText
               text: "Use mTLS Client Certificate (for edge gateways)"
               color: settingsRoot.foreground
               font.pixelSize: Style.font.bodySmall
@@ -636,8 +516,8 @@ Item {
             spacing: 3
             RowLayout {
               spacing: 4
-              Text { text: "mTLS Client Certificate Path:"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
-              Text { text: "(Optional, for self-hosted instances with mTLS gateway)"; color: settingsRoot.muted; font.pixelSize: Style.font.caption }
+              Text { textFormat: Text.PlainText; text: "mTLS Client Certificate Path:"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
+              Text { textFormat: Text.PlainText; text: "(Optional, for self-hosted instances with mTLS gateway)"; color: settingsRoot.muted; font.pixelSize: Style.font.caption }
             }
             Rectangle {
               Layout.fillWidth: true; height: 32; radius: 5; color: Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.08); border.color: clientCertInput.activeFocus ? settingsRoot.accent : settingsRoot.borderColor; border.width: 1
@@ -651,6 +531,7 @@ Item {
                 text: settingsRoot.certMatchesServer ? ((settingsRoot.config && settingsRoot.config.client_cert_path) || "") : ""
               }
               Text {
+                textFormat: Text.PlainText
                 anchors.left: parent.left; anchors.right: settingsCertBrowseBtn.left; anchors.leftMargin: 10; anchors.rightMargin: 6; anchors.verticalCenter: parent.verticalCenter
                 text: "e.g. /home/user/.certs/client.crt or client.pem"
                 color: settingsRoot.muted
@@ -678,8 +559,8 @@ Item {
             spacing: 3
             RowLayout {
               spacing: 4
-              Text { text: "mTLS Client Private Key Path:"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
-              Text { text: "(Optional if merged in PEM, file permissions must be 0600 or 0400)"; color: settingsRoot.muted; font.pixelSize: Style.font.caption }
+              Text { textFormat: Text.PlainText; text: "mTLS Client Private Key Path:"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
+              Text { textFormat: Text.PlainText; text: "(Optional if merged in PEM, file permissions must be 0600 or 0400)"; color: settingsRoot.muted; font.pixelSize: Style.font.caption }
             }
             Rectangle {
               Layout.fillWidth: true; height: 32; radius: 5; color: Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.08); border.color: clientKeyInput.activeFocus ? settingsRoot.accent : settingsRoot.borderColor; border.width: 1
@@ -688,11 +569,12 @@ Item {
                 anchors.left: parent.left; anchors.right: settingsKeyBrowseBtn.left; anchors.leftMargin: 10; anchors.rightMargin: 6; anchors.verticalCenter: parent.verticalCenter; color: settingsRoot.foreground; font.family: "sans-serif"; font.pixelSize: Style.font.body; selectByMouse: true
                 clip: true
                 activeFocusOnTab: true
-                KeyNavigation.tab: dlDirInput
+                KeyNavigation.tab: lockMinInput
                 KeyNavigation.backtab: clientCertInput
                 text: settingsRoot.certMatchesServer ? ((settingsRoot.config && settingsRoot.config.client_key_path) || "") : ""
               }
               Text {
+                textFormat: Text.PlainText
                 anchors.left: parent.left; anchors.right: settingsKeyBrowseBtn.left; anchors.leftMargin: 10; anchors.rightMargin: 6; anchors.verticalCenter: parent.verticalCenter
                 text: "e.g. /home/user/.certs/client.key"
                 color: settingsRoot.muted
@@ -733,25 +615,6 @@ Item {
             }
           }
 
-          // Download Directory
-          ColumnLayout {
-            Layout.fillWidth: true
-            spacing: 3
-            Text { text: "Attachment Download Directory:"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
-            Rectangle {
-              Layout.fillWidth: true; height: 32; radius: 5; color: Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.08); border.color: dlDirInput.activeFocus ? settingsRoot.accent : settingsRoot.borderColor; border.width: 1
-              TextInput {
-                id: dlDirInput
-                anchors.left: parent.left; anchors.right: parent.right; anchors.leftMargin: 10; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; color: settingsRoot.foreground; font.family: "sans-serif"; font.pixelSize: Style.font.body; selectByMouse: true
-                clip: true
-                activeFocusOnTab: true
-                KeyNavigation.tab: lockMinInput
-                KeyNavigation.backtab: (!settingsRoot.isOfficialServer && settingsRoot.enableMtlsChecked) ? clientKeyInput : idUrlInput
-                text: (settingsRoot.config && settingsRoot.config.download_dir) ? settingsRoot.config.download_dir : "~/Downloads"
-              }
-            }
-          }
-
           // Row of Numeric Settings
           RowLayout {
             Layout.fillWidth: true
@@ -761,7 +624,7 @@ Item {
             ColumnLayout {
               Layout.fillWidth: true
               spacing: 3
-              Text { text: "Auto-lock Timeout (Minutes):"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
+              Text { textFormat: Text.PlainText; text: "Auto-lock Timeout (Minutes):"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
               Rectangle {
                 Layout.fillWidth: true; height: 32; radius: 5; color: Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.08); border.color: lockMinInput.activeFocus ? settingsRoot.accent : settingsRoot.borderColor; border.width: 1
                 TextInput {
@@ -770,7 +633,7 @@ Item {
                   clip: true
                   activeFocusOnTab: true
                   KeyNavigation.tab: clipSecInput
-                  KeyNavigation.backtab: dlDirInput
+                  KeyNavigation.backtab: (!settingsRoot.isOfficialServer && settingsRoot.enableMtlsChecked) ? clientKeyInput : idUrlInput
                   inputMethodHints: Qt.ImhDigitsOnly
                   validator: IntValidator { bottom: 0; top: 100000 }
                   text: (settingsRoot.config && settingsRoot.config.auto_lock_minutes !== undefined) ? String(settingsRoot.config.auto_lock_minutes) : "15"
@@ -782,7 +645,7 @@ Item {
             ColumnLayout {
               Layout.fillWidth: true
               spacing: 3
-              Text { text: "Clipboard Auto-Clear (Seconds):"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
+              Text { textFormat: Text.PlainText; text: "Clipboard Auto-Clear (Seconds):"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
               Rectangle {
                 Layout.fillWidth: true; height: 32; radius: 5; color: Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.08); border.color: clipSecInput.activeFocus ? settingsRoot.accent : settingsRoot.borderColor; border.width: 1
                 TextInput {
@@ -790,7 +653,7 @@ Item {
                   anchors.left: parent.left; anchors.right: parent.right; anchors.leftMargin: 10; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; color: settingsRoot.foreground; font.family: "sans-serif"; font.pixelSize: Style.font.body; selectByMouse: true
                   clip: true
                   activeFocusOnTab: true
-                  KeyNavigation.tab: maxAttSizeInput
+                  KeyNavigation.tab: sUrlInput
                   KeyNavigation.backtab: lockMinInput
                   inputMethodHints: Qt.ImhDigitsOnly
                   validator: IntValidator { bottom: 0; top: 100000 }
@@ -799,89 +662,6 @@ Item {
               }
             }
 
-            // Max Attachment Size (MB)
-            ColumnLayout {
-              Layout.fillWidth: true
-              spacing: 3
-              Text { text: "Max Attachment (MB):"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
-              Rectangle {
-                Layout.fillWidth: true; height: 32; radius: 5; color: Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.08); border.color: maxAttSizeInput.activeFocus ? settingsRoot.accent : settingsRoot.borderColor; border.width: 1
-                TextInput {
-                  id: maxAttSizeInput
-                  anchors.left: parent.left; anchors.right: parent.right; anchors.leftMargin: 10; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; color: settingsRoot.foreground; font.family: "sans-serif"; font.pixelSize: Style.font.body; selectByMouse: true
-                  clip: true
-                  activeFocusOnTab: true
-                  KeyNavigation.tab: sUrlInput
-                  KeyNavigation.backtab: clipSecInput
-                  inputMethodHints: Qt.ImhDigitsOnly
-                  validator: IntValidator { bottom: 1; top: 100000 }
-                  text: (settingsRoot.config && settingsRoot.config.max_attachment_size_mb !== undefined) ? String(settingsRoot.config.max_attachment_size_mb) : "500"
-                }
-              }
-            }
-          }
-
-          // Show Website Icons Checkbox
-          ColumnLayout {
-            Layout.fillWidth: true
-            spacing: 3
-            RowLayout {
-              spacing: 6
-              Rectangle {
-                width: 14; height: 14; radius: 3; color: settingsRoot.showWebsiteIconsChecked ? settingsRoot.accent : Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.10); border.color: settingsRoot.borderColor; border.width: 1
-                Text {
-                  anchors.centerIn: parent
-                  visible: settingsRoot.showWebsiteIconsChecked
-                  text: "\uf00c"
-                  font.family: settingsRoot.fontFamily
-                  color: settingsRoot.textOnAccent
-                  font.pixelSize: Style.fontPx(0.75)
-                }
-                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: settingsRoot.showWebsiteIconsChecked = !settingsRoot.showWebsiteIconsChecked }
-              }
-              Text { text: "Show Website Icons"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall }
-            }
-            Text {
-              readonly property string curServerUrl: (sUrlInput && sUrlInput.text.trim()) ? sUrlInput.text.trim() : ((settingsRoot.config && settingsRoot.config.server_url) ? settingsRoot.config.server_url : "")
-              readonly property bool isOfficial: IconPolicy.isOfficialServer(curServerUrl)
-              readonly property string serverHost: IconPolicy.extractHost(curServerUrl)
-              text: isOfficial
-                    ? "Fetches icons from icons.bitwarden.net, revealing your saved sites to Bitwarden."
-                    : ("Fetches icons directly from your vault server (" + (serverHost || "self-hosted") + ").")
-              color: settingsRoot.muted
-              font.pixelSize: Style.font.caption
-              Layout.fillWidth: true
-              wrapMode: Text.WordWrap
-            }
-          }
-
-          // Automatic Update Check Toggle
-          ColumnLayout {
-            Layout.fillWidth: true
-            spacing: 3
-            RowLayout {
-              spacing: 6
-              Rectangle {
-                width: 14; height: 14; radius: 3; color: settingsRoot.checkUpdatesChecked ? settingsRoot.accent : Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.10); border.color: settingsRoot.borderColor; border.width: 1
-                Text {
-                  anchors.centerIn: parent
-                  visible: settingsRoot.checkUpdatesChecked
-                  text: "\uf00c"
-                  font.family: settingsRoot.fontFamily
-                  color: settingsRoot.textOnAccent
-                  font.pixelSize: Style.fontPx(0.75)
-                }
-                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: settingsRoot.checkUpdatesChecked = !settingsRoot.checkUpdatesChecked }
-              }
-              Text { text: "Check For Updates"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall }
-            }
-            Text {
-              Layout.fillWidth: true
-              text: "Contacts github.com on startup. Turn off if omawarden is managed by a package manager."
-              color: settingsRoot.muted
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
           }
 
           // Remember Last Search Toggle
@@ -893,6 +673,7 @@ Item {
               Rectangle {
                 width: 14; height: 14; radius: 3; color: settingsRoot.rememberLastSearchChecked ? settingsRoot.accent : Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.10); border.color: settingsRoot.borderColor; border.width: 1
                 Text {
+                  textFormat: Text.PlainText
                   anchors.centerIn: parent
                   visible: settingsRoot.rememberLastSearchChecked
                   text: "\uf00c"
@@ -902,79 +683,15 @@ Item {
                 }
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: settingsRoot.rememberLastSearchChecked = !settingsRoot.rememberLastSearchChecked }
               }
-              Text { text: "Remember Last Search State"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall }
+              Text { textFormat: Text.PlainText; text: "Remember Last Search State"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall }
             }
             Text {
+              textFormat: Text.PlainText
               Layout.fillWidth: true
               text: "Retains previous search query, category, and selection when reopening while vault is unlocked."
               color: settingsRoot.muted
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
-            }
-          }
-
-          // SSH Agent Toggle
-          ColumnLayout {
-            Layout.fillWidth: true
-            spacing: 3
-            RowLayout {
-              spacing: 6
-              Rectangle {
-                width: 14; height: 14; radius: 3; color: settingsRoot.sshAgentChecked ? settingsRoot.accent : Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.10); border.color: settingsRoot.borderColor; border.width: 1
-                Text {
-                  anchors.centerIn: parent
-                  visible: settingsRoot.sshAgentChecked
-                  text: "\uf00c"
-                  font.family: settingsRoot.fontFamily
-                  color: settingsRoot.textOnAccent
-                  font.pixelSize: Style.fontPx(0.75)
-                }
-                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: settingsRoot.sshAgentChecked = !settingsRoot.sshAgentChecked }
-              }
-              Text { text: "SSH Agent"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall }
-            }
-            Text {
-              Layout.fillWidth: true
-              text: "Serves your vault's SSH keys to ssh and git without writing them to disk. Point SSH_AUTH_SOCK at $XDG_RUNTIME_DIR/omawarden-ssh-agent.sock."
-              color: settingsRoot.muted
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-            RowLayout {
-              visible: settingsRoot.sshAgentChecked
-              Layout.topMargin: 2
-              spacing: 4
-              Text { text: "Confirm signatures:"; color: settingsRoot.muted; font.pixelSize: Style.font.caption }
-              Repeater {
-                id: confirmRepeater
-                model: [["always", "Every time"], ["first-use", "First use"], ["never", "Never"]]
-                Rectangle {
-                  id: confirmItem
-                  required property var modelData
-                  readonly property bool chosen: settingsRoot.sshAgentConfirm === modelData[0]
-                  implicitHeight: 24
-                  implicitWidth: confirmLabel.implicitWidth + 14
-                  radius: 4
-                  color: chosen ? Qt.rgba(settingsRoot.accent.r, settingsRoot.accent.g, settingsRoot.accent.b, 0.2) : (confirmMouse.containsMouse ? Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.05) : "transparent")
-                  border.color: chosen ? settingsRoot.accent : "transparent"
-                  border.width: 1
-                  Text {
-                    id: confirmLabel
-                    anchors.centerIn: parent
-                    text: modelData[1]
-                    color: confirmItem.chosen ? settingsRoot.accent : (confirmMouse.containsMouse ? settingsRoot.foreground : settingsRoot.muted)
-                    font.pixelSize: Style.font.bodySmall
-                    font.weight: confirmItem.chosen ? Font.DemiBold : Font.Normal
-                  }
-                  MouseArea {
-                    id: confirmMouse
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: settingsRoot.sshAgentConfirm = modelData[0]
-                  }
-                }
-              }
             }
           }
 
@@ -987,6 +704,7 @@ Item {
               Rectangle {
                 width: 14; height: 14; radius: 3; color: settingsRoot.quickUnlockChecked ? settingsRoot.accent : Qt.rgba(settingsRoot.foreground.r, settingsRoot.foreground.g, settingsRoot.foreground.b, 0.10); border.color: settingsRoot.borderColor; border.width: 1
                 Text {
+                  textFormat: Text.PlainText
                   anchors.centerIn: parent
                   visible: settingsRoot.quickUnlockChecked
                   text: "\uf00c"
@@ -996,9 +714,10 @@ Item {
                 }
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: settingsRoot.quickUnlockChecked = !settingsRoot.quickUnlockChecked }
               }
-              Text { text: "Quick Unlock (System Authentication)"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall }
+              Text { textFormat: Text.PlainText; text: "Quick Unlock (System Authentication)"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall }
             }
             Text {
+              textFormat: Text.PlainText
               Layout.fillWidth: true
               text: "After a screen lock or idle timeout, unlocking asks for your login password or fingerprint (polkit) instead of the master password. The vault key stays in locked memory only: suspend, logout and three denied prompts wipe it. Requires the packaged polkit policy."
               color: settingsRoot.muted
@@ -1011,7 +730,7 @@ Item {
           ColumnLayout {
             Layout.fillWidth: true
             spacing: 4
-            Text { text: "Logging Severity Level:"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
+            Text { textFormat: Text.PlainText; text: "Logging Severity Level:"; color: settingsRoot.foreground; font.pixelSize: Style.font.bodySmall; font.weight: Font.Medium }
             RowLayout {
               spacing: 4
               Repeater {
@@ -1028,6 +747,7 @@ Item {
                   border.width: 1
 
                   Text {
+                    textFormat: Text.PlainText
                     id: lvlText
                     anchors.centerIn: parent
                     text: modelData.toUpperCase()
@@ -1064,6 +784,7 @@ Item {
             border.width: 1
 
             Text {
+              textFormat: Text.PlainText
               id: backBtnText
               anchors.centerIn: parent
               text: "Cancel"
@@ -1086,6 +807,7 @@ Item {
             color: settingsRoot.accent
 
             Text {
+              textFormat: Text.PlainText
               id: saveBtnText
               anchors.centerIn: parent
               text: settingsRoot.isBusy ? "Saving..." : "Save Settings"
@@ -1133,12 +855,14 @@ Item {
             anchors.centerIn: parent
             spacing: 4
             Text {
+              textFormat: Text.PlainText
               text: "All"
               color: fAllItem.isSelected ? settingsRoot.accent : (fAllMouse.containsMouse ? settingsRoot.foreground : settingsRoot.muted)
               font.pixelSize: Style.font.bodySmall
               font.weight: fAllItem.isSelected ? Font.DemiBold : Font.Normal
             }
             Text {
+              textFormat: Text.PlainText
               text: (settingsRoot.logBuffer ? settingsRoot.logBuffer.length : 0)
               color: fAllItem.isSelected ? settingsRoot.accent : settingsRoot.muted
               font.pixelSize: Style.font.caption
@@ -1168,12 +892,14 @@ Item {
             anchors.centerIn: parent
             spacing: 4
             Text {
+              textFormat: Text.PlainText
               text: "Errors"
               color: fErrItem.isSelected ? StatusPalette.labelOnTint(StatusPalette.error, 0.2, Commons.Color.popups.background) : (fErrMouse.containsMouse ? settingsRoot.foreground : settingsRoot.muted)
               font.pixelSize: Style.font.bodySmall
               font.weight: fErrItem.isSelected ? Font.DemiBold : Font.Normal
             }
             Text {
+              textFormat: Text.PlainText
               text: settingsRoot.errorCount
               color: fErrItem.isSelected ? StatusPalette.labelOnTint(StatusPalette.error, 0.2, Commons.Color.popups.background) : settingsRoot.muted
               font.pixelSize: Style.font.caption
@@ -1203,12 +929,14 @@ Item {
             anchors.centerIn: parent
             spacing: 4
             Text {
+              textFormat: Text.PlainText
               text: "Warnings"
               color: fWarnItem.isSelected ? StatusPalette.labelOnTint(StatusPalette.warn, 0.2, Commons.Color.popups.background) : (fWarnMouse.containsMouse ? settingsRoot.foreground : settingsRoot.muted)
               font.pixelSize: Style.font.bodySmall
               font.weight: fWarnItem.isSelected ? Font.DemiBold : Font.Normal
             }
             Text {
+              textFormat: Text.PlainText
               text: settingsRoot.warnCount
               color: fWarnItem.isSelected ? StatusPalette.labelOnTint(StatusPalette.warn, 0.2, Commons.Color.popups.background) : settingsRoot.muted
               font.pixelSize: Style.font.caption
@@ -1238,12 +966,14 @@ Item {
             anchors.centerIn: parent
             spacing: 4
             Text {
+              textFormat: Text.PlainText
               text: "Info"
               color: fInfoItem.isSelected ? StatusPalette.labelOnTint(StatusPalette.info, 0.2, Commons.Color.popups.background) : (fInfoMouse.containsMouse ? settingsRoot.foreground : settingsRoot.muted)
               font.pixelSize: Style.font.bodySmall
               font.weight: fInfoItem.isSelected ? Font.DemiBold : Font.Normal
             }
             Text {
+              textFormat: Text.PlainText
               text: settingsRoot.infoCount
               color: fInfoItem.isSelected ? StatusPalette.labelOnTint(StatusPalette.info, 0.2, Commons.Color.popups.background) : settingsRoot.muted
               font.pixelSize: Style.font.caption
@@ -1273,12 +1003,14 @@ Item {
             anchors.centerIn: parent
             spacing: 4
             Text {
+              textFormat: Text.PlainText
               text: "Debug"
               color: fDebugItem.isSelected ? StatusPalette.labelOnTint(StatusPalette.debug, 0.2, Commons.Color.popups.background) : (fDebugMouse.containsMouse ? settingsRoot.foreground : settingsRoot.muted)
               font.pixelSize: Style.font.bodySmall
               font.weight: fDebugItem.isSelected ? Font.DemiBold : Font.Normal
             }
             Text {
+              textFormat: Text.PlainText
               text: settingsRoot.debugCount
               color: fDebugItem.isSelected ? StatusPalette.labelOnTint(StatusPalette.debug, 0.2, Commons.Color.popups.background) : settingsRoot.muted
               font.pixelSize: Style.font.caption
@@ -1308,12 +1040,14 @@ Item {
             anchors.centerIn: parent
             spacing: 4
             Text {
+              textFormat: Text.PlainText
               text: "\uf1f8"
               font.family: settingsRoot.fontFamily
               color: settingsRoot.muted
               font.pixelSize: Style.fontPx(0.75)
             }
             Text {
+              textFormat: Text.PlainText
               text: "Clear"
               color: settingsRoot.muted
               font.pixelSize: Style.font.caption
@@ -1340,12 +1074,14 @@ Item {
             anchors.centerIn: parent
             spacing: 4
             Text {
+              textFormat: Text.PlainText
               text: "\uf0c5"
               font.family: settingsRoot.fontFamily
               color: settingsRoot.accent
               font.pixelSize: Style.font.caption
             }
             Text {
+              textFormat: Text.PlainText
               text: "Copy Diagnostics"
               color: settingsRoot.foreground
               font.pixelSize: Style.font.caption
@@ -1395,6 +1131,7 @@ Item {
 
               // 1. Timestamp
               Text {
+                textFormat: Text.PlainText
                 width: 58
                 text: (modelData.timestamp ? (modelData.timestamp.indexOf("T") !== -1 ? modelData.timestamp.split("T")[1].replace("Z", "") : modelData.timestamp) : "")
                 color: settingsRoot.muted
@@ -1409,6 +1146,7 @@ Item {
                 radius: 2
                 color: StatusPalette.levelColor(modelData.level)
                 Text {
+                  textFormat: Text.PlainText
                   anchors.centerIn: parent
                   text: modelData.level
                   color: StatusPalette.textOnTint(StatusPalette.levelColor(modelData.level), 1, Commons.Color.popups.background)
@@ -1420,6 +1158,7 @@ Item {
 
               // 3. Source Prefix
               Text {
+                textFormat: Text.PlainText
                 id: srcLabel
                 text: "[" + modelData.source + "]"
                 color: settingsRoot.accent
@@ -1430,6 +1169,7 @@ Item {
 
               // 4. Message Content
               Text {
+                textFormat: Text.PlainText
                 id: logMsgText
                 width: Math.max(80, parent.width - 58 - 44 - srcLabel.implicitWidth - 24)
                 text: modelData.message
@@ -1443,6 +1183,7 @@ Item {
 
           // Empty state placeholder
           Text {
+            textFormat: Text.PlainText
             visible: settingsRoot.getFilteredLogs().length === 0
             anchors.centerIn: parent
             text: "No log entries recorded for this filter."
@@ -1454,25 +1195,5 @@ Item {
     }
   }
 
-  // Release Notes Modal
-  ReleaseNotesModal {
-    active: settingsRoot.showReleaseNotes
-    version: settingsRoot.latestVersion
-    releaseTitle: settingsRoot.latestReleaseTitle
-    releaseNotes: settingsRoot.latestReleaseNotes
-    releaseUrl: settingsRoot.latestReleaseUrl
-    engineSource: settingsRoot.engineSource
-    enginePackage: settingsRoot.enginePackage
-    isDownloadingCli: settingsRoot.isInstallingDependencies
-    foreground: settingsRoot.foreground
-    accent: settingsRoot.accent
-    borderColor: settingsRoot.borderColor
-    fontFamily: settingsRoot.fontFamily
-    onCloseRequested: settingsRoot.showReleaseNotes = false
-    onUpdateRequested: {
-      settingsRoot.showReleaseNotes = false
-      settingsRoot.installPackageRequested(settingsRoot.enginePackage || "omawarden")
-    }
-  }
 }
 

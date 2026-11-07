@@ -50,7 +50,7 @@ FloatingWindow {
   }
 
   // -------------------------------------------------------------
-  // Checking & Installation Logic
+  // Checking Logic
   // -------------------------------------------------------------
   property bool isChecking: false
   property var missingPackages: []
@@ -114,20 +114,10 @@ FloatingWindow {
     pacmanCheckProc.running = true
   }
 
-  function installMissingPackages() {
-    if (root.missingPackages.length === 0) return
-
-    var pkgs = root.missingPackages.join(" ")
-    // Automatically use AUR helper (paru / yay) if present, or fallback to sudo pacman
-    var installCmd = "if command -v paru >/dev/null 2>&1; then paru -S --needed " + pkgs +
-                     "; elif command -v yay >/dev/null 2>&1; then yay -S --needed " + pkgs +
-                     "; else sudo pacman -S --needed " + pkgs + "; fi"
-
-    // Launch floating terminal with Omarchy presentation wrapper
-    installProc.running = false
-    installProc.command = ["omarchy-launch-floating-terminal-with-presentation", installCmd]
-    installProc.running = true
-  }
+  // Displayed for the user to run; this window never launches an installer.
+  readonly property string installCommand: missingPackages.length > 0
+    ? "paru -S --needed " + missingPackages.join(" ")
+    : ""
 
   // Package check process
   Process {
@@ -205,16 +195,6 @@ FloatingWindow {
         }
       }
       root.missingPackages = missing
-    }
-  }
-
-  // Package installation process
-  Process {
-    id: installProc
-    running: false
-    onExited: function(code) {
-      // Recheck dependencies when the installer terminal window closes
-      root.checkAllDependencies()
     }
   }
 
@@ -439,7 +419,7 @@ FloatingWindow {
         }
       }
 
-      // Bottom Bar: One-Click Install & Status
+      // Bottom Bar: Install Command & Status
       RowLayout {
         Layout.fillWidth: true
         spacing: 12
@@ -452,38 +432,24 @@ FloatingWindow {
 
         Item { Layout.fillWidth: true }
 
-        Button {
-          id: installBtn
-          property bool hasMissing: root.missingPackages.length > 0
+        Text {
+          visible: !root.isChecking && !root.installCommand
+          text: "✓ 所有依赖均已就绪"
+          color: "#a6e3a1"
+          font.pixelSize: 13
+          font.bold: true
+        }
 
-          text: {
-            if (root.isChecking) return "正在检测中..."
-            if (hasMissing) return "⚡ 一键安装缺失依赖 (" + root.missingPackages.join(", ") + ")"
-            return "✓ 所有依赖均已就绪"
-          }
-
-          enabled: hasMissing && !root.isChecking && !installProc.running
-          onClicked: root.installMissingPackages()
-
-          background: Rectangle {
-            implicitHeight: 38
-            implicitWidth: installBtnText.implicitWidth + 28
-            radius: 8
-            color: {
-              if (!installBtn.hasMissing) return "#2e473b"
-              return installBtn.down ? "#74c7ec" : (installBtn.hovered ? "#89b4fa" : "#89b4fa")
-            }
-          }
-
-          contentItem: Text {
-            id: installBtnText
-            text: installBtn.text
-            color: installBtn.hasMissing ? "#11111b" : "#a6e3a1"
-            font.pixelSize: 13
-            font.bold: true
-            horizontalAlignment: Text.AlignHCenter
-            verticalAlignment: Text.AlignVCenter
-          }
+        // Install command as selectable text (select it and copy with Ctrl+C)
+        TextEdit {
+          visible: !root.isChecking && Boolean(root.installCommand)
+          text: root.installCommand
+          readOnly: true
+          selectByMouse: true
+          color: "#cdd6f4"
+          selectionColor: "#89b4fa"
+          font.family: "monospace"
+          font.pixelSize: 13
         }
       }
     }

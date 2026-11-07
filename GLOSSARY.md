@@ -57,16 +57,12 @@ An encrypted arbitrary text note cipher.
 _Avoid_: Note, text file, memo
 
 **SSH Key**:
-An OpenSSH cryptographic keypair cipher (Type 5) containing private key, public key, and SHA256 fingerprint.
+An OpenSSH cryptographic keypair cipher (Type 5) containing private key, public key, and SHA256 fingerprint. This fork does not list SSH key items.
 _Avoid_: Keyfile, SSH credential
 
 **Attachment**:
-The encrypted binary or text file associated with a vault cipher.
+The encrypted binary or text file associated with a vault cipher. This fork does not download or display attachments.
 _Avoid_: File, upload, asset
-
-**Icon Cache**:
-The local offline store of website and service favicons, namespaced by origin and domain to preserve network privacy and enable offline UI rendering.
-_Avoid_: Favicon folder, icon directory, image cache
 
 **Organization**:
 A shared administrative entity containing enterprise or team credentials.

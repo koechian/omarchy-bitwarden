@@ -1,25 +1,11 @@
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::RwLock;
 
 use crate::api::{decrypt_sync_ciphers_with_context, ApiError, BitwardenApiClient, ClientContext};
-use crate::crypto::{
-    parse_rsa_private_key_der, parse_symmetric_key_from_decrypted_bytes, EncString,
-    SymmetricCryptoKey,
-};
+use crate::crypto::SymmetricCryptoKey;
 use crate::keyring::KeyringManager;
 use crate::storage::{StorageManager, VaultStorage};
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SshMetadata {
-    pub is_ssh_key: bool,
-    pub key_type: String,
-    pub private_key: Option<String>,
-    pub public_key: Option<String>,
-    pub fingerprint: Option<String>,
-    pub passphrase: Option<String>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VaultItem {
@@ -51,13 +37,63 @@ pub struct VaultItem {
     pub card: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ssh_key: Option<SshMetadata>,
     #[serde(default)]
     pub fields: Vec<Value>,
-    #[serde(default)]
-    pub attachments: Vec<Value>,
     pub search_text: String,
+}
+
+impl VaultItem {
+    /// Overwrites every decrypted string of the item with zeroes (ADR 0027).
+    pub fn zeroize_contents(&mut self) {
+        use crate::secret_memory::{
+            zeroize_json_value, zeroize_optional_json_value, zeroize_optional_string,
+        };
+        use zeroize::Zeroize;
+        for text in [
+            &mut self.id,
+            &mut self.name,
+            &mut self.type_name,
+            &mut self.sub_title,
+            &mut self.search_text,
+        ] {
+            text.zeroize();
+        }
+        for text in [
+            &mut self.notes,
+            &mut self.created_at,
+            &mut self.updated_at,
+            &mut self.folder_id,
+            &mut self.folder_name,
+            &mut self.organization_id,
+            &mut self.organization_name,
+        ] {
+            zeroize_optional_string(text);
+        }
+        if let Some(ids) = self.collection_ids.as_mut() {
+            ids.iter_mut().for_each(Zeroize::zeroize);
+        }
+        for section in [&mut self.login, &mut self.card, &mut self.identity] {
+            zeroize_optional_json_value(section);
+        }
+        self.fields.iter_mut().for_each(zeroize_json_value);
+    }
+}
+
+/// Every copy of a decrypted item (the cache, clones handed to handlers,
+/// search results) is zeroized when it is dropped: on lock, purge and
+/// replacement after a sync.
+impl Drop for VaultItem {
+    fn drop(&mut self) {
+        self.zeroize_contents();
+    }
+}
+
+/// Bitwarden cipher type for SSH key items. This client does not list them.
+pub const SSH_KEY_CIPHER_TYPE: i64 = 5;
+
+/// Reports whether vault items of the given Bitwarden cipher type are listed.
+pub fn is_listed_cipher_type(item_type: i64) -> bool {
+    item_type != SSH_KEY_CIPHER_TYPE
 }
 
 pub fn is_fuzzy_match(pattern: &str, text: &str) -> bool {
@@ -81,184 +117,6 @@ pub fn is_fuzzy_match(pattern: &str, text: &str) -> bool {
         }
     }
     false
-}
-
-pub fn detect_ssh_key_metadata(raw: &Value) -> Option<SshMetadata> {
-    let notes = raw.get("notes").and_then(|v| v.as_str()).unwrap_or("");
-    let fields = raw.get("fields").and_then(|v| v.as_array());
-
-    let mut private_key: Option<String> = None;
-    let mut public_key: Option<String> = None;
-    let mut passphrase: Option<String> = None;
-    let mut key_type = "SSH".to_string();
-
-    let priv_re = Regex::new(
-        r"(-----BEGIN (?:[A-Z0-9_ -]+ )?PRIVATE KEY-----[\s\S]+?-----END (?:[A-Z0-9_ -]+ )?PRIVATE KEY-----)",
-    )
-    .unwrap();
-    if let Some(caps) = priv_re.captures(notes) {
-        let matched = caps.get(1).unwrap().as_str().trim().to_string();
-        if matched.contains("BEGIN OPENSSH PRIVATE KEY") {
-            key_type = if matched.contains("ssh-ed25519") {
-                "ED25519".to_string()
-            } else {
-                "OPENSSH".to_string()
-            };
-        } else if matched.contains("BEGIN RSA PRIVATE KEY") {
-            key_type = "RSA".to_string();
-        } else if matched.contains("BEGIN EC PRIVATE KEY") {
-            key_type = "ECDSA".to_string();
-        } else if matched.contains("BEGIN DSA PRIVATE KEY") {
-            key_type = "DSA".to_string();
-        } else {
-            key_type = "PKCS8".to_string();
-        }
-        private_key = Some(matched);
-    }
-
-    let pub_re = Regex::new(
-        r"((?:ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-[a-z0-9]+)\s+[A-Za-z0-9+/=.]+(?:\s+.*)?)",
-    )
-    .unwrap();
-    if let Some(caps) = pub_re.captures(notes) {
-        let matched = caps.get(1).unwrap().as_str().trim().to_string();
-        if matched.contains("ssh-ed25519") {
-            key_type = "ED25519".to_string();
-        } else if matched.contains("ssh-rsa") {
-            key_type = "RSA".to_string();
-        } else if matched.contains("ecdsa-sha2") {
-            key_type = "ECDSA".to_string();
-        } else if matched.contains("ssh-dss") {
-            key_type = "DSA".to_string();
-        }
-        public_key = Some(matched);
-    }
-
-    if let Some(field_arr) = fields {
-        for f in field_arr {
-            let fname = f
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_lowercase();
-            let fval = f
-                .get("value")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if fval.is_empty() {
-                continue;
-            }
-
-            if matches!(
-                fname.as_str(),
-                "private_key"
-                    | "privatekey"
-                    | "ssh_private_key"
-                    | "id_rsa"
-                    | "id_ed25519"
-                    | "id_ecdsa"
-            ) || fval.contains("PRIVATE KEY-----")
-            {
-                if private_key.is_none() || fval.contains("BEGIN") {
-                    if fval.contains("RSA") {
-                        key_type = "RSA".to_string();
-                    } else if fval.contains("OPENSSH") {
-                        key_type = if fval.contains("ed25519") {
-                            "ED25519".to_string()
-                        } else {
-                            "OPENSSH".to_string()
-                        };
-                    } else if fval.contains("EC") {
-                        key_type = "ECDSA".to_string();
-                    } else if fval.contains("DSA") {
-                        key_type = "DSA".to_string();
-                    } else if fval.contains("PRIVATE KEY") {
-                        key_type = "PKCS8".to_string();
-                    }
-                    private_key = Some(fval);
-                } else if private_key.is_none() {
-                    private_key = Some(fval);
-                }
-            } else if matches!(
-                fname.as_str(),
-                "public_key" | "publickey" | "ssh_public_key" | "ssh_key"
-            ) || fval.starts_with("ssh-rsa ")
-                || fval.starts_with("ssh-ed25519 ")
-                || fval.starts_with("ecdsa-sha2-")
-            {
-                if fval.contains("ssh-ed25519") {
-                    key_type = "ED25519".to_string();
-                } else if fval.contains("ssh-rsa") {
-                    key_type = "RSA".to_string();
-                } else if fval.contains("ecdsa") {
-                    key_type = "ECDSA".to_string();
-                }
-                public_key = Some(fval);
-            } else if matches!(
-                fname.as_str(),
-                "passphrase" | "pass_phrase" | "key_passphrase" | "ssh_passphrase"
-            ) {
-                passphrase = Some(fval);
-            }
-        }
-    }
-
-    if private_key.is_some() || public_key.is_some() {
-        Some(SshMetadata {
-            is_ssh_key: true,
-            key_type,
-            private_key,
-            public_key,
-            fingerprint: None,
-            passphrase,
-        })
-    } else {
-        None
-    }
-}
-
-pub fn parse_ssh_key_fields(
-    private_key: Option<String>,
-    public_key: Option<String>,
-    fingerprint: Option<String>,
-) -> SshMetadata {
-    let mut key_type = "SSH".to_string();
-    if let Some(ref pk) = public_key {
-        if pk.contains("ssh-ed25519") {
-            key_type = "ED25519".to_string();
-        } else if pk.contains("ssh-rsa") {
-            key_type = "RSA".to_string();
-        } else if pk.contains("ecdsa") {
-            key_type = "ECDSA".to_string();
-        } else if pk.contains("ssh-dss") {
-            key_type = "DSA".to_string();
-        }
-    } else if let Some(ref prk) = private_key {
-        if prk.contains("OPENSSH") {
-            key_type = if prk.contains("ed25519") {
-                "ED25519".to_string()
-            } else {
-                "OPENSSH".to_string()
-            };
-        } else if prk.contains("RSA") {
-            key_type = "RSA".to_string();
-        } else if prk.contains("EC") {
-            key_type = "ECDSA".to_string();
-        } else if prk.contains("DSA") {
-            key_type = "DSA".to_string();
-        }
-    }
-
-    SshMetadata {
-        is_ssh_key: true,
-        key_type,
-        private_key,
-        public_key,
-        fingerprint,
-        passphrase: None,
-    }
 }
 
 pub struct VaultManager {
@@ -293,6 +151,121 @@ pub struct VaultManager {
     /// commit section (which re-checks the epoch under the guard), making
     /// wipe-vs-restore mutually exclusive at the commit point.
     pub restore_guard: std::sync::Mutex<()>,
+}
+
+/// A user key copied out for re-decrypting items after a sync, with the
+/// lock generation sampled before the copy.
+struct ItemRefresh {
+    lock_generation: u64,
+    user_key: SymmetricCryptoKey,
+}
+
+/// Error returned when the retained quick-unlock key no longer opens the
+/// stored vault.
+const STALE_RETAINED_KEY_ERROR: &str =
+    "The retained key no longer matches this vault; unlock with the master password.";
+
+/// What the wrapped private key says about a retained key.
+enum PrivateKeyEvidence {
+    /// Wrapped under the user key (types 0..=2) and decrypts.
+    Confirms,
+    /// Wrapped under the user key and does not decrypt.
+    Refutes,
+    /// Absent, unparseable or asymmetric: proves nothing.
+    Inconclusive,
+}
+
+fn private_key_evidence(
+    enc_private_key: Option<&str>,
+    key: &SymmetricCryptoKey,
+) -> PrivateKeyEvidence {
+    let Some(parsed) = enc_private_key.and_then(|k| crate::crypto::EncString::parse(k).ok()) else {
+        return PrivateKeyEvidence::Inconclusive;
+    };
+    if parsed.enc_type > 2 {
+        return PrivateKeyEvidence::Inconclusive;
+    }
+    // The decrypted DER is the RSA private key: zeroize it immediately.
+    match parsed.decrypt(key).map(zeroize::Zeroizing::new) {
+        Ok(_) => PrivateKeyEvidence::Confirms,
+        Err(_) => PrivateKeyEvidence::Refutes,
+    }
+}
+
+fn is_personal_live_cipher(cipher: &Value) -> bool {
+    let deleted = cipher
+        .get("deletedDate")
+        .or_else(|| cipher.get("DeletedDate"))
+        .is_some_and(|v| !v.is_null());
+    let organization = cipher.get("organizationId").is_some_and(|v| !v.is_null());
+    !deleted && !organization
+}
+
+/// Whether any EncString the cipher exposes under the user key decrypts:
+/// its own item key first, then its name. `None` when it exposes neither.
+/// A real item key decrypts to a raw key blob, so the probe uses decrypt()
+/// (raw bytes, zeroized at once) rather than decrypt_string().
+fn cipher_decrypts_under(cipher: &Value, key: &SymmetricCryptoKey) -> Option<bool> {
+    let key_field = cipher.get("key").and_then(|v| v.as_str());
+    let name_field = cipher.get("name").and_then(|v| v.as_str());
+    if key_field.is_none() && name_field.is_none() {
+        return None;
+    }
+    let decrypts = [key_field, name_field].into_iter().flatten().any(|field| {
+        crate::crypto::EncString::parse(field)
+            .ok()
+            .is_some_and(|parsed| parsed.decrypt(key).map(zeroize::Zeroizing::new).is_ok())
+    });
+    Some(decrypts)
+}
+
+/// Personal-cipher evidence: `Some(true)` when one decrypts, `Some(false)`
+/// when candidates exist and none decrypts, `None` without candidates.
+fn personal_cipher_evidence(ciphers: &[Value], key: &SymmetricCryptoKey) -> Option<bool> {
+    let mut candidates = false;
+    for cipher in ciphers.iter().filter(|c| is_personal_live_cipher(c)) {
+        match cipher_decrypts_under(cipher, key) {
+            Some(true) => return Some(true),
+            Some(false) => candidates = true,
+            None => {}
+        }
+    }
+    candidates.then_some(false)
+}
+
+impl VaultManager {
+    /// Proves that a retained key still belongs to the stored vault,
+    /// strongest evidence first: the wrapped private key, then any personal
+    /// cipher, then (for an empty vault) the account wrapping recorded at
+    /// retention time. An identical wrapping means the same account, the
+    /// same master password and therefore the same user key.
+    fn verify_retained_key(
+        &self,
+        key: &SymmetricCryptoKey,
+        storage: &VaultStorage,
+    ) -> Result<(), &'static str> {
+        match private_key_evidence(storage.enc_private_key.as_deref(), key) {
+            PrivateKeyEvidence::Confirms => return Ok(()),
+            PrivateKeyEvidence::Refutes => {
+                return Err("Retained key fails to decrypt the private key")
+            }
+            PrivateKeyEvidence::Inconclusive => {}
+        }
+        match personal_cipher_evidence(&storage.ciphers, key) {
+            Some(true) => return Ok(()),
+            Some(false) => return Err("Retained key fails to decrypt any personal cipher"),
+            None => {}
+        }
+        let recorded = self
+            .quick_unlock_user_key_wrap
+            .read()
+            .ok()
+            .and_then(|wrap| wrap.clone());
+        match (recorded.as_deref(), storage.enc_user_key.as_deref()) {
+            (Some(recorded), Some(current)) if recorded == current => Ok(()),
+            _ => Err("Retained key cannot be verified against this vault"),
+        }
+    }
 }
 
 impl VaultManager {
@@ -359,20 +332,24 @@ impl VaultManager {
     }
 
     fn purge_decrypted_state(&self) {
-        if let Ok(mut unl) = self.is_unlocked.write() {
-            if *unl {
-                self.lock_generation
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-            *unl = false;
-        }
+        // The generation is bumped and the flag cleared while the items
+        // write lock is held, so `store_refreshed_items` (which checks both
+        // under the same lock) either stores before this purge, which then
+        // clears what it stored, or sees the lock and discards its result.
+        // Lock order: decrypted_items, then is_unlocked.
         if let Ok(mut items) = self.decrypted_items.write() {
+            if let Ok(mut unl) = self.is_unlocked.write() {
+                if *unl {
+                    self.lock_generation
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                *unl = false;
+            }
             items.clear();
         }
         if let Ok(mut key) = self.user_key.write() {
             *key = None;
         }
-        crate::attachment::clear_preview_attachments(None);
     }
 
     /// Full lock: purges decrypted state AND the quick-unlock slot. This is
@@ -508,110 +485,11 @@ impl VaultManager {
         // Fail closed on a stale key (server-side rotation, password change
         // elsewhere, account switch while soft-locked): decryption failures
         // fall back to "Untitled" names, so the vault would otherwise look
-        // unlocked with garbage content. Validation, strongest first:
-        // 1. enc_private_key is wrapped under the user key (type 0..=2) and
-        //    must decrypt;
-        // 2. otherwise (absent, unparseable or asymmetric), at least one
-        //    personal cipher must expose a field that decrypts under the
-        //    user key: its own item key or its name (both EncStrings under
-        //    the user key; the item key decrypts to raw bytes, not UTF-8).
-        //    Personal ciphers that all carry item keys still validate; only
-        //    org wrappers are skipped.
-        let mut validated_by_private_key = false;
-        if let Some(enc_priv) = fresh_storage.enc_private_key.as_deref() {
-            if let Ok(parsed) = crate::crypto::EncString::parse(enc_priv) {
-                if parsed.enc_type <= 2 {
-                    validated_by_private_key = true;
-                    if parsed.decrypt(&key).is_err() {
-                        crate::log_warn!(
-                            "omawarden:vault",
-                            "Retained key fails to decrypt the private key; wiping quick unlock"
-                        );
-                        self.wipe_quick_unlock();
-                        return Err("The retained key no longer matches this vault; unlock with the master password.".to_string());
-                    }
-                }
-            }
-        }
-        if !validated_by_private_key {
-            let mut candidates = 0usize;
-            let mut decrypted_any = false;
-            for c in &fresh_storage.ciphers {
-                let deleted = c
-                    .get("deletedDate")
-                    .or_else(|| c.get("DeletedDate"))
-                    .map(|v| !v.is_null())
-                    .unwrap_or(false);
-                if deleted
-                    || c.get("organizationId")
-                        .map(|v| !v.is_null())
-                        .unwrap_or(false)
-                {
-                    continue;
-                }
-                // Probe every EncString the cipher exposes under the user
-                // key: its own item key first, then its name. A real item
-                // key decrypts to a raw 64-byte key blob, so the probe uses
-                // decrypt() (raw bytes) rather than decrypt_string(); a name
-                // is UTF-8 text but decrypt() accepts it identically. Trying
-                // both fields keeps one corrupt value (an unparseable or
-                // foreign item key) from vetoing an otherwise valid name. A
-                // cipher exposing neither field proves nothing either way and
-                // is skipped rather than counted as a failure.
-                let key_field = c.get("key").and_then(|v| v.as_str());
-                let name_field = c.get("name").and_then(|v| v.as_str());
-                if key_field.is_none() && name_field.is_none() {
-                    continue;
-                }
-                candidates += 1;
-                for field in [key_field, name_field].into_iter().flatten() {
-                    if let Ok(parsed_field) = crate::crypto::EncString::parse(field) {
-                        if parsed_field.decrypt(&key).is_ok() {
-                            decrypted_any = true;
-                            break;
-                        }
-                    }
-                }
-                if decrypted_any {
-                    break;
-                }
-            }
-            if candidates > 0 && !decrypted_any {
-                crate::log_warn!(
-                    "omawarden:vault",
-                    "Retained key fails to decrypt any personal cipher; wiping quick unlock"
-                );
-                self.wipe_quick_unlock();
-                return Err("The retained key no longer matches this vault; unlock with the master password.".to_string());
-            }
-            if candidates == 0 {
-                // Nothing to decrypt-test: no personal cipher and no usable
-                // wrapped private key. An empty vault cannot prove the key on
-                // its own, so fall back to the account binding recorded at
-                // retention time. An identical wrapping means the same
-                // account, the same master password and therefore the same
-                // user key; a different one means the key is stale, and
-                // committing would let the user write items under a key the
-                // next master-password unlock cannot read.
-                let recorded = self
-                    .quick_unlock_user_key_wrap
-                    .read()
-                    .ok()
-                    .and_then(|wrap| wrap.clone());
-                let matches = match (recorded.as_deref(), fresh_storage.enc_user_key.as_deref()) {
-                    (Some(recorded), Some(current)) => recorded == current,
-                    // Either side missing: nothing proves the key, fail closed.
-                    _ => false,
-                };
-                if !matches {
-                    crate::log_warn!(
-                        "omawarden:vault",
-                        "Retained key cannot be verified against this vault; wiping quick unlock"
-                    );
-                    self.wipe_quick_unlock();
-                    return Err("The retained key no longer matches this vault; unlock with the master password.".to_string());
-                }
-            }
+        // unlocked with garbage content.
+        if let Err(reason) = self.verify_retained_key(&key, &fresh_storage) {
+            crate::log_warn!("omawarden:vault", "{}; wiping quick unlock", reason);
+            self.wipe_quick_unlock();
+            return Err(STALE_RETAINED_KEY_ERROR.to_string());
         }
 
         // A hard lock (suspend drift, 12h ceiling, explicit lock/logout)
@@ -620,51 +498,8 @@ impl VaultManager {
         // first, then the commit runs under restore_guard with the epoch
         // re-checked inside — wipe_quick_unlock holds the same guard, so a
         // wipe can no longer interleave between this check and the writes.
-        if self
-            .quick_unlock_epoch
-            .load(std::sync::atomic::Ordering::SeqCst)
-            != epoch_before
-        {
-            crate::log_warn!(
-                "omawarden:vault",
-                "Vault was locked during quick unlock; aborting restore"
-            );
-            return Err("The vault was locked during unlock. Try again.".to_string());
-        }
-
-        {
-            let _restore = match self.restore_guard.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if self
-                .quick_unlock_epoch
-                .load(std::sync::atomic::Ordering::SeqCst)
-                != epoch_before
-            {
-                crate::log_warn!(
-                    "omawarden:vault",
-                    "Vault was locked during quick unlock; aborting restore"
-                );
-                return Err("The vault was locked during unlock. Try again.".to_string());
-            }
-
-            if let Ok(mut dec_items) = self.decrypted_items.write() {
-                *dec_items = items;
-            }
-            if let Ok(mut key_slot) = self.user_key.write() {
-                *key_slot = Some(key);
-            }
-            if let Ok(mut unl) = self.is_unlocked.write() {
-                *unl = true;
-            }
-            if let Ok(mut st) = self.storage.write() {
-                *st = fresh_storage;
-            }
-            // The retained slot is intentionally left untouched: it still
-            // holds the same key, and rewriting it would resurrect a key a
-            // concurrent wipe just destroyed.
-        }
+        self.ensure_no_wipe_since(epoch_before)?;
+        self.commit_restored_session(epoch_before, items, key, fresh_storage)?;
 
         crate::log_info!(
             "omawarden:vault",
@@ -672,6 +507,55 @@ impl VaultManager {
             count
         );
         Ok(count)
+    }
+
+    /// Fails when a quick-unlock wipe happened after `epoch_before` was
+    /// sampled.
+    fn ensure_no_wipe_since(&self, epoch_before: u64) -> Result<(), String> {
+        let current = self
+            .quick_unlock_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if current == epoch_before {
+            return Ok(());
+        }
+        crate::log_warn!(
+            "omawarden:vault",
+            "Vault was locked during quick unlock; aborting restore"
+        );
+        Err("The vault was locked during unlock. Try again.".to_string())
+    }
+
+    /// Writes the restored session under `restore_guard`, re-checking the
+    /// epoch inside the guard so a concurrent wipe either lands before (and
+    /// aborts this commit) or after (and locks the restored session).
+    fn commit_restored_session(
+        &self,
+        epoch_before: u64,
+        items: Vec<VaultItem>,
+        key: SymmetricCryptoKey,
+        storage: VaultStorage,
+    ) -> Result<(), String> {
+        let _restore = match self.restore_guard.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.ensure_no_wipe_since(epoch_before)?;
+        if let Ok(mut dec_items) = self.decrypted_items.write() {
+            *dec_items = items;
+        }
+        if let Ok(mut key_slot) = self.user_key.write() {
+            *key_slot = Some(key);
+        }
+        if let Ok(mut unl) = self.is_unlocked.write() {
+            *unl = true;
+        }
+        if let Ok(mut st) = self.storage.write() {
+            *st = storage;
+        }
+        // The retained slot is intentionally left untouched: it still holds
+        // the same key, and rewriting it would resurrect a key a concurrent
+        // wipe just destroyed.
+        Ok(())
     }
 
     pub fn unlock(&self, password: &str) -> Result<usize, String> {
@@ -853,20 +737,7 @@ impl VaultManager {
             .save(&updated)
             .map_err(|e| format!("Failed to save storage: {:?}", e))?;
 
-        if let Ok(key_guard) = self.user_key.read() {
-            if let Some(user_key) = key_guard.as_ref() {
-                let items = decrypt_sync_ciphers_with_context(
-                    &updated.ciphers,
-                    &updated.folders,
-                    &updated.organizations,
-                    user_key,
-                    updated.enc_private_key.as_deref(),
-                );
-                if let Ok(mut dec_items) = self.decrypted_items.write() {
-                    *dec_items = items;
-                }
-            }
-        }
+        self.refresh_decrypted_items(&updated);
 
         if let Ok(mut st) = self.storage.write() {
             *st = updated;
@@ -880,6 +751,54 @@ impl VaultManager {
         );
 
         Ok(count)
+    }
+
+    /// Re-decrypts the cached items from freshly synced storage. The key is
+    /// copied out instead of held, so a concurrent lock never waits for the
+    /// decryption, and the result is stored only if no lock happened since
+    /// the lock generation was sampled (see `store_refreshed_items`).
+    fn refresh_decrypted_items(&self, storage: &VaultStorage) {
+        let Some(refresh) = self.begin_item_refresh() else {
+            return;
+        };
+        let items = decrypt_sync_ciphers_with_context(
+            &storage.ciphers,
+            &storage.folders,
+            &storage.organizations,
+            &refresh.user_key,
+            storage.enc_private_key.as_deref(),
+        );
+        self.store_refreshed_items(refresh.lock_generation, items);
+    }
+
+    /// Samples the lock generation, then copies the user key. Sampling
+    /// first means a lock landing between the two is always detected.
+    fn begin_item_refresh(&self) -> Option<ItemRefresh> {
+        let lock_generation = self.lock_generation();
+        let user_key = self.user_key.read().ok()?.clone()?;
+        Some(ItemRefresh {
+            lock_generation,
+            user_key,
+        })
+    }
+
+    /// Stores re-decrypted items unless the vault locked after
+    /// `lock_generation` was sampled or is no longer unlocked. A discarded
+    /// result is zeroized on drop. Returns whether the items were stored.
+    fn store_refreshed_items(&self, lock_generation: u64, items: Vec<VaultItem>) -> bool {
+        let Ok(mut cached) = self.decrypted_items.write() else {
+            return false;
+        };
+        let locked_since = self.lock_generation() != lock_generation || !self.is_unlocked();
+        if locked_since {
+            crate::log_info!(
+                "omawarden:vault",
+                "Vault locked during synchronization; discarding the decrypted result"
+            );
+            return false;
+        }
+        *cached = items;
+        true
     }
 
     pub fn renew_session(&self) -> Result<String, String> {
@@ -1074,19 +993,14 @@ impl VaultManager {
         updated.refresh_token = None;
         let _ = self.storage_mgr.save(&updated);
         self.lock();
-        crate::attachment::clear_preview_attachments(None);
     }
 
+    /// The decrypted items held by this manager; empty while locked. The
+    /// daemon is the only holder of decrypted items, and it exposes them to
+    /// clients only in redacted form (ADR 0027), so there is no fallback to
+    /// asking the daemon here.
     pub fn get_items(&self) -> Vec<VaultItem> {
-        let is_unlocked = self.is_unlocked();
-        if !is_unlocked {
-            if let Some(daemon_resp) =
-                crate::daemon::send_daemon_request(&serde_json::json!({ "action": "list" }))
-            {
-                if let Ok(items) = serde_json::from_value::<Vec<VaultItem>>(daemon_resp) {
-                    return items;
-                }
-            }
+        if !self.is_unlocked() {
             return Vec::new();
         }
         self.decrypted_items
@@ -1095,302 +1009,13 @@ impl VaultManager {
             .unwrap_or_default()
     }
 
-    /// Name and SSH data of the unlocked vault's SSH key items, without
-    /// copying the rest of the vault. Empty while locked, and never asks the
-    /// daemon: the SSH agent runs inside it.
-    pub fn ssh_key_items(&self) -> Vec<(String, SshMetadata)> {
-        if !self.is_unlocked() {
-            return Vec::new();
-        }
-        self.decrypted_items
-            .read()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|i| Some((i.name.clone(), i.ssh_key.clone()?)))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     pub fn search_items(&self, query: &str, category: Option<&str>) -> Vec<VaultItem> {
-        let is_unlocked = self.is_unlocked();
-        if !is_unlocked {
-            if let Some(daemon_resp) = crate::daemon::send_daemon_request(&serde_json::json!({
-                "action": "search",
-                "query": query,
-                "category": category
-            })) {
-                if let Ok(items) = serde_json::from_value::<Vec<VaultItem>>(daemon_resp) {
-                    return items;
-                }
-            }
-            return Vec::new();
-        }
-        let items = self.decrypted_items.read().unwrap().clone();
+        let items = self.get_items();
         self.search(&items, query, category)
-    }
-
-    pub fn resolve_attachment_key(
-        &self,
-        item_id: &str,
-        attachment_id: &str,
-    ) -> Option<SymmetricCryptoKey> {
-        let user_key_guard = self.user_key.read().ok()?;
-        let user_key = user_key_guard.as_ref()?;
-        let storage_guard = self.storage.read().ok()?;
-
-        let rsa_priv_key = if let Some(ref enc_priv) = storage_guard.enc_private_key {
-            if let Ok(enc_priv_str) = EncString::parse(enc_priv) {
-                if let Ok(der_bytes) = enc_priv_str.decrypt(user_key) {
-                    parse_rsa_private_key_der(&der_bytes).ok()
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let cipher = storage_guard
-            .ciphers
-            .iter()
-            .find(|c| c.get("id").and_then(|v| v.as_str()) == Some(item_id))?;
-
-        let org_id_opt = cipher.get("organizationId").and_then(|v| v.as_str());
-        let mut base_key = user_key.clone();
-        if let Some(oid) = org_id_opt {
-            if let Some(org) = storage_guard
-                .organizations
-                .iter()
-                .find(|o| o.get("id").and_then(|v| v.as_str()) == Some(oid))
-            {
-                if let Some(org_key_enc) = org.get("key").and_then(|v| v.as_str()) {
-                    if let Ok(enc_str) = EncString::parse(org_key_enc) {
-                        let raw_key = match enc_str.enc_type {
-                            3..=6 => {
-                                if let Some(ref rsa) = rsa_priv_key {
-                                    enc_str.decrypt_rsa(rsa).ok()
-                                } else {
-                                    None
-                                }
-                            }
-                            0..=2 => enc_str.decrypt(user_key).ok(),
-                            _ => None,
-                        };
-                        if let Some(key_bytes) = raw_key {
-                            if let Some(sym_key) =
-                                parse_symmetric_key_from_decrypted_bytes(&key_bytes)
-                            {
-                                base_key = sym_key;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut cipher_key = base_key.clone();
-        if let Some(enc_key_str) = cipher.get("key").and_then(|v| v.as_str()) {
-            if let Ok(parsed_k) = EncString::parse(enc_key_str) {
-                let raw_k = parsed_k
-                    .decrypt(&base_key)
-                    .or_else(|_| parsed_k.decrypt(user_key));
-                if let Ok(raw_k_bytes) = raw_k {
-                    if let Some(k) = parse_symmetric_key_from_decrypted_bytes(&raw_k_bytes) {
-                        cipher_key = k;
-                    }
-                }
-            }
-        }
-
-        if let Some(attachments) = cipher.get("attachments").and_then(|v| v.as_array()) {
-            if let Some(att) = attachments
-                .iter()
-                .find(|a| a.get("id").and_then(|v| v.as_str()) == Some(attachment_id))
-            {
-                if let Some(att_key_enc) = att.get("key").and_then(|v| v.as_str()) {
-                    if let Ok(parsed_k) = EncString::parse(att_key_enc) {
-                        let raw_k = parsed_k
-                            .decrypt(&cipher_key)
-                            .or_else(|_| parsed_k.decrypt(user_key));
-                        if let Ok(raw_k_bytes) = raw_k {
-                            if let Some(k) = parse_symmetric_key_from_decrypted_bytes(&raw_k_bytes)
-                            {
-                                return Some(k);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Some(cipher_key)
     }
 
     pub fn get_user_key(&self) -> Option<SymmetricCryptoKey> {
         self.user_key.read().ok().and_then(|k| k.clone())
-    }
-
-    pub fn create_ssh_key(
-        &self,
-        name: &str,
-        ssh_key_data: &crate::ssh::GeneratedSshKey,
-        notes: Option<&str>,
-        folder_id: Option<&str>,
-        user_key: &SymmetricCryptoKey,
-    ) -> Result<VaultItem, String> {
-        self.create_ssh_key_with_client(name, ssh_key_data, notes, folder_id, user_key, None)
-    }
-
-    pub fn create_ssh_key_with_client(
-        &self,
-        name: &str,
-        ssh_key_data: &crate::ssh::GeneratedSshKey,
-        notes: Option<&str>,
-        folder_id: Option<&str>,
-        user_key: &SymmetricCryptoKey,
-        client_context: Option<&ClientContext>,
-    ) -> Result<VaultItem, String> {
-        let storage = self.storage_mgr.load();
-        let s_url = if !storage.server_url.is_empty() {
-            &storage.server_url
-        } else {
-            &self.server_url
-        };
-        let initial_token = self
-            .keyring_mgr
-            .get_token(s_url, crate::keyring::KIND_ACCESS_TOKEN)
-            .or_else(|| self.keyring_mgr.get_session(s_url))
-            .or_else(|| storage.access_token.clone());
-
-        let active_token = match initial_token {
-            Some(tok) if !crate::auth::is_jwt_expired(&tok) => tok,
-            Some(_) => {
-                crate::log_info!(
-                    "omawarden:vault",
-                    "Access token is expired for create_ssh_key, attempting renewal..."
-                );
-                self.renew_session_with_client(client_context)?
-            }
-            None => self.renew_session_with_client(client_context)?,
-        };
-
-        let enc_name = user_key
-            .encrypt_string(name)
-            .map_err(|e| format!("Failed to encrypt item name: {:?}", e))?;
-
-        let enc_notes = if let Some(n) = notes.filter(|s| !s.is_empty()) {
-            Some(
-                user_key
-                    .encrypt_string(n)
-                    .map_err(|e| format!("Failed to encrypt notes: {:?}", e))?,
-            )
-        } else {
-            None
-        };
-
-        let enc_private_key = user_key
-            .encrypt_string(&ssh_key_data.private_key)
-            .map_err(|e| format!("Failed to encrypt private key: {:?}", e))?;
-
-        let enc_public_key = user_key
-            .encrypt_string(&ssh_key_data.public_key)
-            .map_err(|e| format!("Failed to encrypt public key: {:?}", e))?;
-
-        let enc_fingerprint = user_key
-            .encrypt_string(&ssh_key_data.fingerprint)
-            .map_err(|e| format!("Failed to encrypt fingerprint: {:?}", e))?;
-
-        let payload = json!({
-            "type": 5,
-            "folderId": folder_id,
-            "organizationId": null,
-            "name": enc_name,
-            "notes": enc_notes,
-            "favorite": false,
-            "reprompt": 0,
-            "sshKey": {
-                "privateKey": enc_private_key,
-                "publicKey": enc_public_key,
-                "keyFingerprint": enc_fingerprint,
-            }
-        });
-
-        let s_url = if !storage.server_url.is_empty() {
-            &storage.server_url
-        } else {
-            &self.server_url
-        };
-        let id_url = self
-            .identity_url
-            .as_deref()
-            .or(storage.identity_url.as_deref());
-        let client = BitwardenApiClient::with_options(s_url, id_url, client_context);
-
-        let created_cipher = match client.create_cipher(&active_token, &payload) {
-            Ok(c) => c,
-            Err(ApiError::HttpStatus(code, _))
-                if code == reqwest::StatusCode::UNAUTHORIZED
-                    || code == reqwest::StatusCode::FORBIDDEN =>
-            {
-                crate::log_warn!(
-                    "omawarden:vault",
-                    "HTTP {} creating SSH key. Attempting session renewal...",
-                    code
-                );
-                let renewed = self.renew_session_with_client(client_context)?;
-                client
-                    .create_cipher(&renewed, &payload)
-                    .map_err(|e| format!("Failed to create SSH key on server: {:?}", e))?
-            }
-            Err(ApiError::Http(ref msg)) if msg.contains("401") || msg.contains("403") => {
-                crate::log_warn!(
-                    "omawarden:vault",
-                    "HTTP 401/403 creating SSH key. Attempting session renewal..."
-                );
-                let renewed = self.renew_session_with_client(client_context)?;
-                client
-                    .create_cipher(&renewed, &payload)
-                    .map_err(|e| format!("Failed to create SSH key on server: {:?}", e))?
-            }
-            Err(e) => return Err(format!("Failed to create SSH key on server: {:?}", e)),
-        };
-
-        // Update local storage data.json
-        let mut updated_storage = self.storage_mgr.load();
-        updated_storage.ciphers.push(created_cipher.clone());
-        let _ = self.storage_mgr.save(&updated_storage);
-
-        // Decrypt the created item into a VaultItem
-        let decrypted_items = decrypt_sync_ciphers_with_context(
-            &[created_cipher],
-            &updated_storage.folders,
-            &updated_storage.organizations,
-            user_key,
-            updated_storage.enc_private_key.as_deref(),
-        );
-
-        let decrypted_item = decrypted_items
-            .into_iter()
-            .next()
-            .ok_or_else(|| "Failed to decrypt newly created cipher item".to_string())?;
-
-        // Update in-memory items if unlocked
-        if let Ok(mut items) = self.decrypted_items.write() {
-            items.push(decrypted_item.clone());
-        }
-
-        crate::log_info!(
-            "omawarden:vault",
-            "Successfully created and stored SSH key '{}' ({})",
-            decrypted_item.name,
-            decrypted_item.id
-        );
-
-        Ok(decrypted_item)
     }
 
     pub fn find_item(&self, query: &str, category: Option<&str>) -> Option<VaultItem> {
@@ -1440,10 +1065,6 @@ impl VaultManager {
         }
 
         None
-    }
-
-    pub fn find_ssh_key(&self, id_or_name: &str) -> Option<VaultItem> {
-        self.find_item(id_or_name, Some("ssh_key"))
     }
 
     pub fn get_status(&self) -> Value {
@@ -1505,6 +1126,9 @@ impl VaultManager {
 
         for raw in raw_items {
             let item_type = raw.get("type").and_then(|v| v.as_i64()).unwrap_or(1);
+            if !is_listed_cipher_type(item_type) {
+                continue;
+            }
             let name = raw
                 .get("name")
                 .and_then(|v| v.as_str())
@@ -1520,11 +1144,6 @@ impl VaultManager {
                 .unwrap_or(false);
             let fields = raw
                 .get("fields")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let attachments = raw
-                .get("attachments")
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
@@ -1568,12 +1187,11 @@ impl VaultManager {
                 2 => "note",
                 3 => "card",
                 4 => "identity",
-                5 => "ssh_key",
                 _ => "login",
             }
             .to_string();
 
-            let (sub_title, mut search_tokens) = self.extract_metadata(
+            let (sub_title, search_tokens) = self.extract_metadata(
                 item_type,
                 raw,
                 &name,
@@ -1581,41 +1199,11 @@ impl VaultManager {
                 &fields,
             );
 
-            for att in &attachments {
-                if let Some(fname) = att.get("fileName").and_then(|v| v.as_str()) {
-                    search_tokens.push(fname.to_lowercase());
-                }
-            }
             let search_text = search_tokens
                 .into_iter()
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
                 .join(" ");
-
-            let ssh_key = if item_type == 5 {
-                if let Some(ssh_data) = raw.get("sshKey").or_else(|| raw.get("ssh_key")) {
-                    let priv_k = ssh_data
-                        .get("privateKey")
-                        .or_else(|| ssh_data.get("private_key"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    let pub_k = ssh_data
-                        .get("publicKey")
-                        .or_else(|| ssh_data.get("public_key"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    let fp = ssh_data
-                        .get("keyFingerprint")
-                        .or_else(|| ssh_data.get("fingerprint"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    Some(parse_ssh_key_fields(priv_k, pub_k, fp))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
 
             parsed.push(VaultItem {
                 id,
@@ -1647,9 +1235,7 @@ impl VaultManager {
                 } else {
                     None
                 },
-                ssh_key,
                 fields,
-                attachments,
                 search_text,
             });
         }
@@ -1735,49 +1321,6 @@ impl VaultManager {
                     search_tokens.push(full_name.to_lowercase());
                 }
             }
-            5 => {
-                if let Some(ssh_data) = raw.get("sshKey").or_else(|| raw.get("ssh_key")) {
-                    let pubk = ssh_data
-                        .get("publicKey")
-                        .or_else(|| ssh_data.get("public_key"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let privk = ssh_data
-                        .get("privateKey")
-                        .or_else(|| ssh_data.get("private_key"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let fp = ssh_data
-                        .get("keyFingerprint")
-                        .or_else(|| ssh_data.get("fingerprint"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let mut key_type = "SSH".to_string();
-                    if pubk.contains("ssh-ed25519") || privk.contains("ed25519") {
-                        key_type = "ED25519".to_string();
-                    } else if pubk.contains("ssh-rsa") || privk.contains("RSA") {
-                        key_type = "RSA".to_string();
-                    } else if pubk.contains("ecdsa") || privk.contains("EC") {
-                        key_type = "ECDSA".to_string();
-                    } else if pubk.contains("ssh-dss") || privk.contains("DSA") {
-                        key_type = "DSA".to_string();
-                    }
-                    sub_title = format!("SSH Key ({})", key_type);
-                    search_tokens.push("ssh".to_string());
-                    search_tokens.push("ssh key".to_string());
-                    search_tokens.push(key_type.to_lowercase());
-                    if !pubk.is_empty() {
-                        search_tokens.push(pubk.to_lowercase());
-                    }
-                    if !fp.is_empty() {
-                        search_tokens.push(fp.to_lowercase());
-                    }
-                } else {
-                    sub_title = "SSH Key".to_string();
-                    search_tokens.push("ssh".to_string());
-                    search_tokens.push("ssh key".to_string());
-                }
-            }
             2 => {
                 sub_title = "Secure Note".to_string();
             }
@@ -1800,83 +1343,91 @@ impl VaultManager {
         (sub_title, search_tokens)
     }
 
+    /// Items matching every query word, best match first (favorites get a
+    /// bonus). Names, subtitles and the non-secret search text are matched;
+    /// notes and other secret fields are not, so search cannot be used to
+    /// probe secret content (ADR 0027).
     pub fn search(
         &self,
         items: &[VaultItem],
         query: &str,
         category: Option<&str>,
     ) -> Vec<VaultItem> {
-        let q = query.trim().to_lowercase();
-        let cat = category.unwrap_or("").trim().to_lowercase();
-        let cat_filter = if cat.is_empty() || cat == "all" {
-            None
-        } else {
-            Some(cat)
-        };
+        let query_lower = query.trim().to_lowercase();
+        let words: Vec<&str> = query_lower.split_whitespace().collect();
+        let category_filter = normalized_category_filter(category);
 
-        let mut scored_items: Vec<(&VaultItem, i64)> = Vec::new();
-
-        for item in items {
-            if let Some(ref c) = cat_filter {
-                if &item.type_name != c {
-                    continue;
-                }
-            }
-
-            if q.is_empty() {
-                scored_items.push((item, if item.favorite { 100 } else { 0 }));
-                continue;
-            }
-
-            let query_words: Vec<&str> = q.split_whitespace().collect();
-            let mut total_score: i64 = if item.favorite { 100 } else { 0 };
-            let name_lower = item.name.to_lowercase();
-            let sub_lower = item.sub_title.to_lowercase();
-            let search_lower = item.search_text.to_lowercase();
-            let notes_lower = item.notes.as_deref().unwrap_or("").to_lowercase();
-
-            let mut all_words_matched = true;
-            for w in query_words {
-                let mut word_matched = false;
-                if name_lower == w {
-                    total_score += 2000;
-                    word_matched = true;
-                } else if name_lower.starts_with(w) {
-                    total_score += 1000;
-                    word_matched = true;
-                } else if name_lower.contains(w) {
-                    total_score += 500;
-                    word_matched = true;
-                } else if sub_lower.starts_with(w) {
-                    total_score += 400;
-                    word_matched = true;
-                } else if sub_lower.contains(w) {
-                    total_score += 300;
-                    word_matched = true;
-                } else if search_lower.contains(w) || notes_lower.contains(w) {
-                    total_score += 100;
-                    word_matched = true;
-                } else if is_fuzzy_match(w, &name_lower) {
-                    total_score += 80;
-                    word_matched = true;
-                }
-
-                if !word_matched {
-                    all_words_matched = false;
-                    break;
-                }
-            }
-
-            if all_words_matched {
-                scored_items.push((item, total_score));
-            }
-        }
+        let mut scored_items: Vec<(&VaultItem, i64)> = items
+            .iter()
+            .filter(|item| {
+                category_filter
+                    .as_deref()
+                    .is_none_or(|category| item.type_name == category)
+            })
+            .filter_map(|item| score_item(item, &words).map(|score| (item, score)))
+            .collect();
 
         scored_items.sort_by_key(|a| std::cmp::Reverse(a.1));
         scored_items
             .into_iter()
             .map(|(item, _)| item.clone())
             .collect()
+    }
+}
+
+/// The category to filter by, or `None` for every category ("" or "all").
+fn normalized_category_filter(category: Option<&str>) -> Option<String> {
+    let category = category.unwrap_or("").trim().to_lowercase();
+    (!category.is_empty() && category != "all").then_some(category)
+}
+
+/// Relevance of `item` for the query words, or `None` when any word fails
+/// to match. An empty query matches every item.
+fn score_item(item: &VaultItem, words: &[&str]) -> Option<i64> {
+    let favorite_bonus = if item.favorite { 100 } else { 0 };
+    let haystack = SearchHaystack::new(item);
+    words.iter().try_fold(favorite_bonus, |total, word| {
+        haystack.score_word(word).map(|score| total + score)
+    })
+}
+
+/// Lower-cased, non-secret text of one item that query words match against.
+struct SearchHaystack {
+    name: String,
+    sub_title: String,
+    search_text: String,
+}
+
+impl SearchHaystack {
+    fn new(item: &VaultItem) -> Self {
+        Self {
+            name: item.name.to_lowercase(),
+            sub_title: item.sub_title.to_lowercase(),
+            search_text: item.search_text.to_lowercase(),
+        }
+    }
+
+    /// Score of one word, strongest match first.
+    fn score_word(&self, word: &str) -> Option<i64> {
+        if self.name == word {
+            return Some(2000);
+        }
+        if self.name.starts_with(word) {
+            return Some(1000);
+        }
+        if self.name.contains(word) {
+            return Some(500);
+        }
+        if self.sub_title.starts_with(word) {
+            return Some(400);
+        }
+        if self.sub_title.contains(word) {
+            return Some(300);
+        }
+        if self.search_text.contains(word) {
+            return Some(100);
+        }
+        is_fuzzy_match(word, &self.name).then_some(80)
     }
 }
 
@@ -1902,7 +1453,7 @@ pub(crate) mod tests {
         let master_key =
             derive_master_key(email, password, KdfType::Pbkdf2Sha256, 600_000, None, None)
                 .expect("master key");
-        let master_sym = SymmetricCryptoKey::from_master_key(master_key.as_slice());
+        let master_sym = SymmetricCryptoKey::stretch_master_key(master_key.as_slice()).unwrap();
         let raw = [42u8; 64];
 
         let iv = [9u8; 16];
@@ -1934,6 +1485,25 @@ pub(crate) mod tests {
         let storage_mgr = StorageManager::new(dir.join("data.json"));
         storage_mgr.save(&storage).expect("save storage");
         VaultManager::new("", Some(storage_mgr), None)
+    }
+
+    #[test]
+    fn test_vault_item_zeroize_contents_clears_every_string() {
+        let mut item = crate::item_redaction::tests::login_item();
+        item.zeroize_contents();
+        let serialized = serde_json::to_value(&item).unwrap();
+        fn has_text(value: &Value) -> bool {
+            match value {
+                Value::String(text) => !text.is_empty(),
+                Value::Array(values) => values.iter().any(has_text),
+                Value::Object(map) => map.values().any(has_text),
+                _ => false,
+            }
+        }
+        assert!(
+            !has_text(&serialized),
+            "every string is zeroized: {serialized}"
+        );
     }
 
     #[test]
@@ -2120,6 +1690,55 @@ pub(crate) mod tests {
             epoch_before
         );
         assert!(!vault.quick_unlock_available());
+    }
+
+    #[test]
+    fn test_sync_result_is_discarded_when_a_lock_lands_during_decryption() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = seeded_vault(dir.path(), "master-pw");
+        vault.unlock("master-pw").unwrap();
+
+        // The interleaving of the race, step by step: the sync samples the
+        // generation and copies the key, a lock lands while it decrypts,
+        // and the sync then tries to store its plaintext.
+        let refresh = vault.begin_item_refresh().expect("unlocked vault");
+        vault.lock();
+        assert!(
+            vault.user_key.read().unwrap().is_none(),
+            "the lock does not wait for the decryption"
+        );
+        let decrypted = vec![crate::item_redaction::tests::login_item()];
+        assert!(!vault.store_refreshed_items(refresh.lock_generation, decrypted));
+        assert!(!vault.is_unlocked());
+        assert!(
+            vault.decrypted_items.read().unwrap().is_empty(),
+            "no plaintext may be stored after a lock"
+        );
+
+        // A lock and a fresh unlock in between are detected as well.
+        let refresh = vault.begin_item_refresh();
+        assert!(
+            refresh.is_none(),
+            "a locked vault has no key to refresh with"
+        );
+        vault.unlock("master-pw").unwrap();
+        let refresh = vault.begin_item_refresh().unwrap();
+        vault.lock();
+        vault.unlock("master-pw").unwrap();
+        let stale = vec![crate::item_redaction::tests::login_item()];
+        assert!(!vault.store_refreshed_items(refresh.lock_generation, stale));
+        assert!(vault.decrypted_items.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_sync_result_is_stored_when_no_lock_intervenes() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = seeded_vault(dir.path(), "master-pw");
+        vault.unlock("master-pw").unwrap();
+        let refresh = vault.begin_item_refresh().unwrap();
+        let decrypted = vec![crate::item_redaction::tests::login_item()];
+        assert!(vault.store_refreshed_items(refresh.lock_generation, decrypted));
+        assert_eq!(vault.decrypted_items.read().unwrap().len(), 1);
     }
 
     #[test]
@@ -2356,54 +1975,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_ssh_heuristics_rsa_in_notes() {
-        let raw = json!({
-            "name": "Server Key",
-            "notes": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----\nssh-rsa AAAAB3NzaC1yc2E... user@host"
-        });
-        let meta = detect_ssh_key_metadata(&raw).unwrap();
-        assert!(meta.is_ssh_key);
-        assert_eq!(meta.key_type, "RSA");
-        assert!(meta.private_key.unwrap().contains("BEGIN RSA PRIVATE KEY"));
-        assert!(meta.public_key.unwrap().starts_with("ssh-rsa"));
-    }
-
-    #[test]
-    fn test_ssh_heuristics_ed25519_openssh() {
-        let raw = json!({
-            "name": "Dev Ed25519 Key",
-            "notes": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAA...ssh-ed25519\n-----END OPENSSH PRIVATE KEY-----\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5... user@host"
-        });
-        let meta = detect_ssh_key_metadata(&raw).unwrap();
-        assert!(meta.is_ssh_key);
-        assert_eq!(meta.key_type, "ED25519");
-        assert!(meta.private_key.is_some());
-        assert_eq!(
-            meta.public_key.unwrap(),
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... user@host"
-        );
-    }
-
-    #[test]
-    fn test_ssh_heuristics_custom_fields() {
-        let raw = json!({
-            "name": "Custom SSH Item",
-            "notes": "Some regular notes",
-            "fields": [
-                { "name": "private_key", "value": "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEI...\n-----END EC PRIVATE KEY-----" },
-                { "name": "public_key", "value": "ecdsa-sha2-nistp256 AAAAE2VjZHNh... user@host" },
-                { "name": "passphrase", "value": "secret_passphrase_123" }
-            ]
-        });
-        let meta = detect_ssh_key_metadata(&raw).unwrap();
-        assert!(meta.is_ssh_key);
-        assert_eq!(meta.key_type, "ECDSA");
-        assert!(meta.private_key.unwrap().contains("BEGIN EC PRIVATE KEY"));
-        assert!(meta.public_key.unwrap().starts_with("ecdsa-sha2-nistp256"));
-        assert_eq!(meta.passphrase.unwrap(), "secret_passphrase_123");
-    }
-
-    #[test]
     fn test_parse_and_search_categories() {
         let raw_items = vec![
             json!({
@@ -2445,7 +2016,9 @@ pub(crate) mod tests {
 
         let vault_mgr = VaultManager::new("https://vault.example.com", None, None);
         let items = vault_mgr.parse_raw_items(&raw_items);
-        assert_eq!(items.len(), 4);
+        // The SSH key item (type 5) is not listed.
+        assert_eq!(items.len(), 3);
+        assert!(items.iter().all(|i| i.id != "3"));
 
         assert_eq!(items[0].type_name, "login");
         assert_eq!(items[0].sub_title, "octocat");
@@ -2453,17 +2026,8 @@ pub(crate) mod tests {
         assert_eq!(items[1].type_name, "card");
         assert_eq!(items[1].sub_title, "Visa •••• 4444");
 
-        assert_eq!(items[2].type_name, "ssh_key");
-        assert_eq!(items[2].sub_title, "SSH Key (ED25519)");
-        assert!(items[2].ssh_key.is_some());
-        assert_eq!(
-            items[2].ssh_key.as_ref().unwrap().fingerprint.as_deref(),
-            Some("SHA256:abcd1234efgh")
-        );
-
-        assert_eq!(items[3].type_name, "note");
-        assert_eq!(items[3].sub_title, "Secure Note");
-        assert!(items[3].ssh_key.is_none());
+        assert_eq!(items[2].type_name, "note");
+        assert_eq!(items[2].sub_title, "Secure Note");
 
         let search_gh = vault_mgr.search(&items, "github", None);
         assert_eq!(search_gh.len(), 1);
@@ -2472,10 +2036,6 @@ pub(crate) mod tests {
         let search_card = vault_mgr.search(&items, "", Some("card"));
         assert_eq!(search_card.len(), 1);
         assert_eq!(search_card[0].id, "2");
-
-        let search_ssh = vault_mgr.search(&items, "", Some("ssh_key"));
-        assert_eq!(search_ssh.len(), 1);
-        assert_eq!(search_ssh[0].id, "3");
 
         let search_note = vault_mgr.search(&items, "", Some("note"));
         assert_eq!(search_note.len(), 1);
@@ -2534,67 +2094,6 @@ pub(crate) mod tests {
         assert!(!err_msg.contains("Vault is locked"));
         assert!(!err_msg.contains("Session token missing"));
         assert!(err_msg.contains("Sync failed"));
-    }
-
-    #[test]
-    fn test_find_ssh_key() {
-        let raw_items = vec![
-            json!({
-                "id": "item-uuid-1",
-                "name": "Production Deploy Key",
-                "type": 5,
-                "sshKey": {
-                    "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA test@host",
-                    "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\ntest\n-----END OPENSSH PRIVATE KEY-----",
-                    "keyFingerprint": "SHA256:abc123xyz"
-                }
-            }),
-            json!({
-                "id": "item-uuid-2",
-                "name": "GitHub CI Key",
-                "type": 5,
-                "sshKey": {
-                    "publicKey": "ssh-rsa AAAAB3NzaC1yc2EAAA test@github",
-                    "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\ntest-rsa\n-----END OPENSSH PRIVATE KEY-----",
-                    "keyFingerprint": "SHA256:rsa456"
-                }
-            }),
-        ];
-
-        let vault_mgr = VaultManager::new("https://vault.example.com", None, None);
-        let items = vault_mgr.parse_raw_items(&raw_items);
-        *vault_mgr.decrypted_items.write().unwrap() = items;
-        *vault_mgr.is_unlocked.write().unwrap() = true;
-
-        // Exact ID lookup
-        let found_id = vault_mgr.find_ssh_key("item-uuid-1");
-        assert!(found_id.is_some());
-        assert_eq!(found_id.unwrap().name, "Production Deploy Key");
-
-        // Exact name lookup (case insensitive)
-        let found_name = vault_mgr.find_ssh_key("github ci key");
-        assert!(found_name.is_some());
-        assert_eq!(found_name.unwrap().id, "item-uuid-2");
-
-        // Substring name lookup
-        let found_sub = vault_mgr.find_ssh_key("deploy");
-        assert!(found_sub.is_some());
-        assert_eq!(found_sub.unwrap().id, "item-uuid-1");
-
-        // Not found
-        let not_found = vault_mgr.find_ssh_key("nonexistent-key");
-        assert!(not_found.is_none());
-
-        // Generic find_item test
-        let found_gen = vault_mgr.find_item("Deploy Key", None);
-        assert!(found_gen.is_some());
-        assert_eq!(found_gen.unwrap().id, "item-uuid-1");
-
-        let found_cat = vault_mgr.find_item("Deploy Key", Some("ssh_key"));
-        assert!(found_cat.is_some());
-
-        let not_found_cat = vault_mgr.find_item("Deploy Key", Some("login"));
-        assert!(not_found_cat.is_none());
     }
 
     #[test]

@@ -72,7 +72,6 @@ Rectangle {
 
   signal generateRequested(var options)
   signal copyRequested(string text, bool isSensitive, string label)
-  signal upgradeRequested()
   signal closeRequested()
 
   anchors.fill: parent
@@ -132,23 +131,23 @@ Rectangle {
     }
   }
 
+  // Entities for every character that is markup in Qt rich text. The
+  // generated password is escaped character by character before it reaches
+  // the RichText TextEdit, so no part of it is ever read as markup.
+  readonly property var richTextEntities: ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })
+
+  function escapeRichTextCharacter(character) {
+    return genModalRoot.richTextEntities[character] || character
+  }
+
   function formatStyledPassword(password) {
     if (!password) return ""
     var accentHex = "" + genModalRoot.accent
     var res = ""
     for (var i = 0; i < password.length; i++) {
       var ch = password.charAt(i)
-      var safe = ch
-      if (ch === "&") safe = "&amp;"
-      else if (ch === "<") safe = "&lt;"
-      else if (ch === ">") safe = "&gt;"
-      else if (ch === '"') safe = "&quot;"
-
-      if (ch >= "0" && ch <= "9") {
-        res += "<font color='" + accentHex + "'>" + safe + "</font>"
-      } else {
-        res += safe
-      }
+      var safe = genModalRoot.escapeRichTextCharacter(ch)
+      res += (ch >= "0" && ch <= "9") ? ("<font color='" + accentHex + "'>" + safe + "</font>") : safe
     }
     return res
   }
@@ -224,12 +223,14 @@ Rectangle {
         RowLayout {
           spacing: 8
           Text {
+            textFormat: Text.PlainText
             text: "\uf084"
             font.family: genModalRoot.fontFamily
             font.pixelSize: Style.font.subtitle
             color: genModalRoot.accent
           }
           Text {
+            textFormat: Text.PlainText
             text: "Generate Credential"
             color: genModalRoot.foreground
             font.pixelSize: Style.font.subtitle
@@ -260,6 +261,7 @@ Rectangle {
               radius: 4
               color: genModalRoot.mode === "password" ? genModalRoot.accent : "transparent"
               Text {
+                textFormat: Text.PlainText
                 anchors.centerIn: parent
                 text: "Password"
                 color: genModalRoot.mode === "password" ? genModalRoot.textOnAccent : genModalRoot.muted
@@ -285,6 +287,7 @@ Rectangle {
               radius: 4
               color: genModalRoot.mode === "passphrase" ? genModalRoot.accent : "transparent"
               Text {
+                textFormat: Text.PlainText
                 anchors.centerIn: parent
                 text: "Passphrase"
                 color: genModalRoot.mode === "passphrase" ? genModalRoot.textOnAccent : genModalRoot.muted
@@ -323,6 +326,7 @@ Rectangle {
           spacing: 6
 
           Text {
+            textFormat: Text.PlainText
             text: "\uf06a"
             font.family: genModalRoot.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -330,47 +334,13 @@ Rectangle {
           }
 
           Text {
+            textFormat: Text.PlainText
             id: errText
             text: genModalRoot.errorMessage
             color: StatusPalette.invalidInput
             font.pixelSize: Style.font.bodySmall
             Layout.fillWidth: true
             wrapMode: Text.Wrap
-          }
-
-          // Upgrade Button (shown when engine is outdated or upgrade required)
-          Rectangle {
-            visible: genModalRoot.isEngineOutdated || /outdated|upgrade/i.test(genModalRoot.errorMessage)
-            implicitHeight: 22
-            implicitWidth: upgradeBtnRow.implicitWidth + 12
-            radius: 4
-            color: upgradeMouse.containsMouse ? Qt.lighter(genModalRoot.accent, 1.15) : genModalRoot.accent
-
-            RowLayout {
-              id: upgradeBtnRow
-              anchors.centerIn: parent
-              spacing: 4
-              Text {
-                text: "\uf019"
-                font.family: genModalRoot.fontFamily
-                font.pixelSize: Style.font.caption
-                color: genModalRoot.textOnAccent
-              }
-              Text {
-                text: "Upgrade"
-                font.pixelSize: Style.font.caption
-                font.weight: Font.DemiBold
-                color: genModalRoot.textOnAccent
-              }
-            }
-
-            MouseArea {
-              id: upgradeMouse
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              hoverEnabled: true
-              onClicked: genModalRoot.upgradeRequested()
-            }
           }
         }
       }
@@ -379,7 +349,7 @@ Rectangle {
       Rectangle {
         Layout.fillWidth: true
         Layout.preferredHeight: Math.max(52, genSecretText.contentHeight + 20)
-        Behavior on Layout.preferredHeight { NumberAnimation { duration: 120 } }
+        Behavior on Layout.preferredHeight { NumberAnimation { duration: Style.duration(120); easing.type: Easing.OutCubic } }
         radius: 8
         color: Qt.rgba(genModalRoot.foreground.r, genModalRoot.foreground.g, genModalRoot.foreground.b, 0.05)
         border.color: genModalRoot.borderColor
@@ -395,12 +365,14 @@ Rectangle {
 
           TextEdit {
             id: genSecretText
+            objectName: "generatedPasswordText"
             Layout.fillWidth: true
             Layout.alignment: Qt.AlignVCenter
             readOnly: true
             selectByMouse: !genModalRoot.errorMessage && Boolean(genModalRoot.generatedPassword)
             cursorVisible: false
             wrapMode: TextEdit.WrapAnywhere
+            // text-format-exemption: RichText escaped by formatStyledPassword
             textFormat: TextEdit.RichText
             text: genModalRoot.errorMessage ? "—" : (genModalRoot.generatedPassword ? genModalRoot.formatStyledPassword(genModalRoot.generatedPassword) : "Generating...")
             color: genModalRoot.errorMessage ? genModalRoot.muted : genModalRoot.foreground
@@ -422,6 +394,7 @@ Rectangle {
             border.width: 1
 
             Text {
+              textFormat: Text.PlainText
               anchors.centerIn: parent
               text: "\uf021"
               font.family: genModalRoot.fontFamily
@@ -447,7 +420,7 @@ Rectangle {
         Layout.fillWidth: true
         Layout.preferredHeight: 16
         opacity: (!genModalRoot.errorMessage && Boolean(genModalRoot.generatedPassword)) ? 1.0 : 0.0
-        Behavior on opacity { NumberAnimation { duration: 150 } }
+        Behavior on opacity { NumberAnimation { duration: Style.duration(150); easing.type: Easing.OutCubic } }
         spacing: 8
 
         // 5-segment strength meter
@@ -467,11 +440,13 @@ Rectangle {
         RowLayout {
           spacing: 5
           Text {
+            textFormat: Text.PlainText
             text: "Strength:"
             color: genModalRoot.muted
             font.pixelSize: Style.font.caption
           }
           Text {
+            textFormat: Text.PlainText
             text: genModalRoot.strengthLabel
             color: genModalRoot.strengthColor
             font.pixelSize: Style.font.caption
@@ -506,6 +481,7 @@ Rectangle {
               RowLayout {
                 Layout.fillWidth: true
                 Text {
+                  textFormat: Text.PlainText
                   text: "Length"
                   color: genModalRoot.foreground
                   font.pixelSize: Style.font.bodySmall
@@ -513,6 +489,7 @@ Rectangle {
                 }
                 Item { Layout.fillWidth: true }
                 Text {
+                  textFormat: Text.PlainText
                   text: String(genModalRoot.passwordLength)
                   color: genModalRoot.accent
                   font.pixelSize: Style.font.bodySmall
@@ -534,6 +511,7 @@ Rectangle {
               }
 
               Text {
+                textFormat: Text.PlainText
                 text: "Use 14 or more characters for a strong password."
                 color: genModalRoot.muted
                 font.pixelSize: Style.font.caption
@@ -555,6 +533,7 @@ Rectangle {
                   color: genModalRoot.includeUppercase ? genModalRoot.accent : Qt.rgba(genModalRoot.foreground.r, genModalRoot.foreground.g, genModalRoot.foreground.b, 0.08)
                   border.color: genModalRoot.borderColor; border.width: 1
                   Text {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     visible: genModalRoot.includeUppercase
                     text: "\uf00c"; font.family: genModalRoot.fontFamily
@@ -568,7 +547,7 @@ Rectangle {
                     }
                   }
                 }
-                Text { text: "Uppercase (A-Z)"; color: genModalRoot.foreground; font.pixelSize: Style.font.bodySmall }
+                Text { textFormat: Text.PlainText; text: "Uppercase (A-Z)"; color: genModalRoot.foreground; font.pixelSize: Style.font.bodySmall }
               }
 
               // Lowercase
@@ -579,6 +558,7 @@ Rectangle {
                   color: genModalRoot.includeLowercase ? genModalRoot.accent : Qt.rgba(genModalRoot.foreground.r, genModalRoot.foreground.g, genModalRoot.foreground.b, 0.08)
                   border.color: genModalRoot.borderColor; border.width: 1
                   Text {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     visible: genModalRoot.includeLowercase
                     text: "\uf00c"; font.family: genModalRoot.fontFamily
@@ -592,7 +572,7 @@ Rectangle {
                     }
                   }
                 }
-                Text { text: "Lowercase (a-z)"; color: genModalRoot.foreground; font.pixelSize: Style.font.bodySmall }
+                Text { textFormat: Text.PlainText; text: "Lowercase (a-z)"; color: genModalRoot.foreground; font.pixelSize: Style.font.bodySmall }
               }
 
               // Numbers
@@ -603,6 +583,7 @@ Rectangle {
                   color: genModalRoot.includeNumbers ? genModalRoot.accent : Qt.rgba(genModalRoot.foreground.r, genModalRoot.foreground.g, genModalRoot.foreground.b, 0.08)
                   border.color: genModalRoot.borderColor; border.width: 1
                   Text {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     visible: genModalRoot.includeNumbers
                     text: "\uf00c"; font.family: genModalRoot.fontFamily
@@ -616,7 +597,7 @@ Rectangle {
                     }
                   }
                 }
-                Text { text: "Numbers (0-9)"; color: genModalRoot.foreground; font.pixelSize: Style.font.bodySmall }
+                Text { textFormat: Text.PlainText; text: "Numbers (0-9)"; color: genModalRoot.foreground; font.pixelSize: Style.font.bodySmall }
               }
 
               // Special
@@ -627,6 +608,7 @@ Rectangle {
                   color: genModalRoot.includeSpecial ? genModalRoot.accent : Qt.rgba(genModalRoot.foreground.r, genModalRoot.foreground.g, genModalRoot.foreground.b, 0.08)
                   border.color: genModalRoot.borderColor; border.width: 1
                   Text {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     visible: genModalRoot.includeSpecial
                     text: "\uf00c"; font.family: genModalRoot.fontFamily
@@ -640,7 +622,7 @@ Rectangle {
                     }
                   }
                 }
-                Text { text: "Special (!@#$%^&*)"; color: genModalRoot.foreground; font.pixelSize: Style.font.bodySmall }
+                Text { textFormat: Text.PlainText; text: "Special (!@#$%^&*)"; color: genModalRoot.foreground; font.pixelSize: Style.font.bodySmall }
               }
             }
 
@@ -652,6 +634,7 @@ Rectangle {
                 color: genModalRoot.avoidAmbiguous ? genModalRoot.accent : Qt.rgba(genModalRoot.foreground.r, genModalRoot.foreground.g, genModalRoot.foreground.b, 0.08)
                 border.color: genModalRoot.borderColor; border.width: 1
                 Text {
+                  textFormat: Text.PlainText
                   anchors.centerIn: parent
                   visible: genModalRoot.avoidAmbiguous
                   text: "\uf00c"; font.family: genModalRoot.fontFamily
@@ -667,8 +650,8 @@ Rectangle {
               }
               ColumnLayout {
                 spacing: 2
-                Text { text: "Avoid Ambiguous Characters"; color: genModalRoot.foreground; font.pixelSize: Style.font.bodySmall }
-                Text { text: "Excludes 0, O, o, 1, l, I, | to prevent visual confusion"; color: genModalRoot.muted; font.pixelSize: Style.font.caption }
+                Text { textFormat: Text.PlainText; text: "Avoid Ambiguous Characters"; color: genModalRoot.foreground; font.pixelSize: Style.font.bodySmall }
+                Text { textFormat: Text.PlainText; text: "Excludes 0, O, o, 1, l, I, | to prevent visual confusion"; color: genModalRoot.muted; font.pixelSize: Style.font.caption }
               }
             }
           }
@@ -687,6 +670,7 @@ Rectangle {
               RowLayout {
                 Layout.fillWidth: true
                 Text {
+                  textFormat: Text.PlainText
                   text: "Number of Words"
                   color: genModalRoot.foreground
                   font.pixelSize: Style.font.bodySmall
@@ -694,6 +678,7 @@ Rectangle {
                 }
                 Item { Layout.fillWidth: true }
                 Text {
+                  textFormat: Text.PlainText
                   text: String(genModalRoot.passphraseWords)
                   color: genModalRoot.accent
                   font.pixelSize: Style.font.bodySmall
@@ -721,6 +706,7 @@ Rectangle {
               spacing: 6
 
               Text {
+                textFormat: Text.PlainText
                 text: "Word Separator"
                 color: genModalRoot.foreground
                 font.pixelSize: Style.font.bodySmall
@@ -747,6 +733,7 @@ Rectangle {
                     border.width: 1
 
                     Text {
+                      textFormat: Text.PlainText
                       id: sepText
                       anchors.centerIn: parent
                       text: modelData.label
@@ -775,6 +762,7 @@ Rectangle {
                 color: genModalRoot.passphraseCapitalize ? genModalRoot.accent : Qt.rgba(genModalRoot.foreground.r, genModalRoot.foreground.g, genModalRoot.foreground.b, 0.08)
                 border.color: genModalRoot.borderColor; border.width: 1
                 Text {
+                  textFormat: Text.PlainText
                   anchors.centerIn: parent
                   visible: genModalRoot.passphraseCapitalize
                   text: "\uf00c"; font.family: genModalRoot.fontFamily
@@ -788,7 +776,7 @@ Rectangle {
                   }
                 }
               }
-              Text { text: "Capitalize Each Word (Title Case)"; color: genModalRoot.foreground; font.pixelSize: Style.font.bodySmall }
+              Text { textFormat: Text.PlainText; text: "Capitalize Each Word (Title Case)"; color: genModalRoot.foreground; font.pixelSize: Style.font.bodySmall }
             }
           }
         }
@@ -809,6 +797,7 @@ Rectangle {
           border.width: 1
 
           Text {
+            textFormat: Text.PlainText
             anchors.centerIn: parent
             text: "Close"
             color: genModalRoot.muted
@@ -839,12 +828,14 @@ Rectangle {
             anchors.centerIn: parent
             spacing: 8
             Text {
+              textFormat: Text.PlainText
               text: "\uf0c5"
               font.family: genModalRoot.fontFamily
               color: genModalRoot.textOnAccent
               font.pixelSize: Style.font.bodySmall
             }
             Text {
+              textFormat: Text.PlainText
               text: "Copy to Clipboard (↵)"
               color: genModalRoot.textOnAccent
               font.pixelSize: Style.font.bodySmall

@@ -4,11 +4,17 @@ import QtQuick.Layouts
 import qs.Commons
 import qs.Commons as Commons
 
+// Password history of one login. The entries are released once, when the
+// modal opens, through `vault reveal --field password_history` and passed in
+// as `historyEntries` (null while the reply is outstanding). Entries stay
+// masked until shown here. The engine refuses to copy password history
+// (`field_not_copyable`), so the modal offers no copy action.
 Rectangle {
   id: historyModalRoot
 
   property bool active: false
   property var item: null
+  property var historyEntries: null
   property color foreground: Commons.Color.foreground
   property color accent: Commons.Color.accent
   property color muted: Commons.Color.muted
@@ -18,8 +24,12 @@ Rectangle {
 
   property bool allRevealed: false
   property var revealedIndexes: ({})
+  readonly property QtObject strings: Commons.Translations {
+    directory: Qt.resolvedUrl("../i18n")
+  }
+  readonly property bool isRetrieving: historyModalRoot.active && historyModalRoot.historyEntries === null
+  readonly property var historyList: historyModalRoot.getHistoryList()
 
-  signal copyRequested(string text, bool isSensitive, string label)
   signal closeRequested()
 
   anchors.fill: parent
@@ -42,17 +52,22 @@ Rectangle {
   }
 
   onActiveChanged: {
-    if (active) {
+    allRevealed = false
+    revealedIndexes = {}
+    if (active) historyModalRoot.forceActiveFocus()
+  }
+
+  onHistoryEntriesChanged: {
+    if (historyModalRoot.historyEntries === null) {
       allRevealed = false
       revealedIndexes = {}
-      historyModalRoot.forceActiveFocus()
     }
   }
 
   function toggleAllRevealed() {
     allRevealed = !allRevealed
     var copy = {}
-    var list = getHistoryList()
+    var list = historyModalRoot.historyList
     for (var i = 0; i < list.length; i++) {
       copy[i] = allRevealed
     }
@@ -76,11 +91,9 @@ Rectangle {
   }
 
   function getHistoryList() {
-    if (!item || !item.login || !item.login.password_history) return []
-    var list = item.login.password_history
-    if (!Array.isArray(list)) return []
+    if (!Array.isArray(historyModalRoot.historyEntries)) return []
     // Show newest first
-    return list.slice().reverse()
+    return historyModalRoot.historyEntries.slice().reverse()
   }
 
   function isIndexRevealed(idx) {
@@ -89,7 +102,7 @@ Rectangle {
   }
 
   function toggleReveal(idx) {
-    var list = getHistoryList()
+    var list = historyModalRoot.historyList
     var copy = {}
     if (allRevealed) {
       for (var i = 0; i < list.length; i++) {
@@ -133,6 +146,7 @@ Rectangle {
         spacing: 8
 
         Text {
+          textFormat: Text.PlainText
           text: "\uf1da"
           font.family: historyModalRoot.fontFamily
           font.pixelSize: Style.font.title
@@ -140,6 +154,7 @@ Rectangle {
         }
 
         Text {
+          textFormat: Text.PlainText
           text: "Password History: " + (historyModalRoot.item ? (historyModalRoot.item.name || "Item") : "")
           color: historyModalRoot.foreground
           font.pixelSize: Style.font.subtitle
@@ -167,8 +182,17 @@ Rectangle {
           width: modalCard.width - 32
           spacing: 8
 
+          Text {
+            visible: historyModalRoot.isRetrieving
+            textFormat: Text.PlainText
+            text: historyModalRoot.strings.t("history.retrieving", "Retrieving password history…")
+            color: historyModalRoot.muted
+            font.pixelSize: Style.font.bodySmall
+            Layout.alignment: Qt.AlignCenter
+          }
+
           Repeater {
-            model: historyModalRoot.getHistoryList()
+            model: historyModalRoot.historyList
 
             Rectangle {
               id: entryCard
@@ -193,6 +217,7 @@ Rectangle {
                   spacing: 6
 
                   Text {
+                    textFormat: Text.PlainText
                     text: (modelData.last_used_date ? historyModalRoot.formatDateTime(modelData.last_used_date) : "Unknown date")
                     color: historyModalRoot.muted
                     font.pixelSize: Style.font.caption
@@ -201,7 +226,8 @@ Rectangle {
                   }
 
                   Text {
-                    text: "#" + (historyModalRoot.getHistoryList().length - index)
+                    textFormat: Text.PlainText
+                    text: "#" + (historyModalRoot.historyList.length - index)
                     color: historyModalRoot.muted
                     font.pixelSize: Style.fontPx(0.75)
                   }
@@ -213,6 +239,7 @@ Rectangle {
                   spacing: 8
 
                   Text {
+                    textFormat: Text.PlainText
                     text: entryCard.isEntryRevealed ? ((modelData && modelData.password) ? modelData.password : "") : "••••••••••••••••"
                     color: historyModalRoot.foreground
                     font.pixelSize: Style.font.body
@@ -230,14 +257,6 @@ Rectangle {
                     fontFamily: historyModalRoot.fontFamily
                     onClicked: historyModalRoot.toggleReveal(index)
                   }
-
-                  // Copy Ghost Button
-                  GhostIconButton {
-                    iconText: "\uf0c5"
-                    tooltip: "Copy history password"
-                    fontFamily: historyModalRoot.fontFamily
-                    onClicked: historyModalRoot.copyRequested((modelData && modelData.password) ? modelData.password : "", true, "history password")
-                  }
                 }
               }
             }
@@ -245,7 +264,8 @@ Rectangle {
 
           // Empty state fallback (just in case)
           Text {
-            visible: historyModalRoot.getHistoryList().length === 0
+            textFormat: Text.PlainText
+            visible: !historyModalRoot.isRetrieving && historyModalRoot.historyList.length === 0
             text: "No password history available for this item."
             color: historyModalRoot.muted
             font.pixelSize: Style.font.bodySmall
@@ -266,7 +286,8 @@ Rectangle {
         spacing: 8
 
         Text {
-          text: historyModalRoot.getHistoryList().length + " past password(s) recorded"
+          textFormat: Text.PlainText
+          text: historyModalRoot.strings.tn("history.entry_count", historyModalRoot.historyList.length).arg(historyModalRoot.historyList.length)
           color: historyModalRoot.muted
           font.pixelSize: Style.font.caption
           Layout.fillWidth: true
@@ -274,7 +295,7 @@ Rectangle {
 
         // Toggle Mask Ghost Button
         GhostIconButton {
-          visible: historyModalRoot.getHistoryList().length > 0
+          visible: historyModalRoot.historyList.length > 0
           iconText: historyModalRoot.allRevealed ? "\uf070" : "\uf06e"
           tooltip: historyModalRoot.allRevealed ? "Hide all passwords (Ctrl+T)" : "Show all passwords (Ctrl+T)"
           fontFamily: historyModalRoot.fontFamily
@@ -291,6 +312,7 @@ Rectangle {
           border.width: 1
 
           Text {
+            textFormat: Text.PlainText
             id: closeBtnText
             anchors.centerIn: parent
             text: "Close"

@@ -10,9 +10,6 @@ Rectangle {
   property string overlayVersion: ""
   property string backendVersion: ""
   property bool isEngineInstalled: true
-  property bool isInstallingDependencies: false
-  property bool updateAvailable: false
-  property string latestVersion: ""
   property bool isUnlocked: true
   property bool isBusy: false
   property color background: "transparent"
@@ -27,7 +24,6 @@ Rectangle {
   signal syncTriggered()
   signal lockTriggered()
   signal settingsTriggered()
-  signal installCliTriggered()
 
   height: 30
   Layout.fillWidth: true
@@ -75,12 +71,14 @@ Rectangle {
             RowLayout {
               spacing: 3
               Text {
+                textFormat: Text.PlainText
                 text: "\uf0e7"
                 font.family: footerRoot.fontFamily
                 color: actionsMouse.containsMouse ? footerRoot.foreground : footerRoot.muted
                 font.pixelSize: Style.font.bodySmall
               }
               Text {
+                textFormat: Text.PlainText
                 text: "Actions"
                 color: actionsMouse.containsMouse ? footerRoot.foreground : footerRoot.muted
                 font.pixelSize: Style.font.bodySmall
@@ -88,6 +86,7 @@ Rectangle {
               }
             }
             Text {
+              textFormat: Text.PlainText
               text: "Ctrl+K"
               color: footerRoot.muted
               font.pixelSize: Style.fontPx(0.75)
@@ -118,12 +117,14 @@ Rectangle {
             RowLayout {
               spacing: 3
               Text {
+                textFormat: Text.PlainText
                 text: "\uf084"
                 font.family: footerRoot.fontFamily
                 color: generateMouse.containsMouse ? footerRoot.foreground : footerRoot.muted
                 font.pixelSize: Style.font.bodySmall
               }
               Text {
+                textFormat: Text.PlainText
                 text: "Generate"
                 color: generateMouse.containsMouse ? footerRoot.foreground : footerRoot.muted
                 font.pixelSize: Style.font.bodySmall
@@ -131,6 +132,7 @@ Rectangle {
               }
             }
             Text {
+              textFormat: Text.PlainText
               text: "Ctrl+G"
               color: footerRoot.muted
               font.pixelSize: Style.fontPx(0.75)
@@ -161,12 +163,14 @@ Rectangle {
             RowLayout {
               spacing: 3
               Text {
+                textFormat: Text.PlainText
                 text: "\uf021"
                 font.family: footerRoot.fontFamily
                 color: syncMouse.containsMouse ? footerRoot.foreground : footerRoot.muted
                 font.pixelSize: Style.font.bodySmall
               }
               Text {
+                textFormat: Text.PlainText
                 text: "Sync"
                 color: syncMouse.containsMouse ? footerRoot.foreground : footerRoot.muted
                 font.pixelSize: Style.font.bodySmall
@@ -174,6 +178,7 @@ Rectangle {
               }
             }
             Text {
+              textFormat: Text.PlainText
               text: "Ctrl+R"
               color: footerRoot.muted
               font.pixelSize: Style.fontPx(0.75)
@@ -204,12 +209,14 @@ Rectangle {
             RowLayout {
               spacing: 3
               Text {
+                textFormat: Text.PlainText
                 text: "\uf023"
                 font.family: footerRoot.fontFamily
                 color: lockMouse.containsMouse ? footerRoot.foreground : footerRoot.muted
                 font.pixelSize: Style.font.bodySmall
               }
               Text {
+                textFormat: Text.PlainText
                 text: "Lock"
                 color: lockMouse.containsMouse ? footerRoot.foreground : footerRoot.muted
                 font.pixelSize: Style.font.bodySmall
@@ -217,6 +224,7 @@ Rectangle {
               }
             }
             Text {
+              textFormat: Text.PlainText
               text: "Ctrl+L"
               color: footerRoot.muted
               font.pixelSize: Style.fontPx(0.75)
@@ -248,12 +256,14 @@ Rectangle {
           RowLayout {
             spacing: 3
             Text {
+              textFormat: Text.PlainText
               text: "\uf013"
               font.family: footerRoot.fontFamily
               color: settingsMouse.containsMouse ? footerRoot.foreground : footerRoot.muted
               font.pixelSize: Style.font.bodySmall
             }
             Text {
+              textFormat: Text.PlainText
               text: "Settings"
               color: settingsMouse.containsMouse ? footerRoot.foreground : footerRoot.muted
               font.pixelSize: Style.font.bodySmall
@@ -261,6 +271,7 @@ Rectangle {
             }
           }
           Text {
+            textFormat: Text.PlainText
             text: "Ctrl+,"
             color: footerRoot.muted
             font.pixelSize: Style.fontPx(0.75)
@@ -279,61 +290,35 @@ Rectangle {
 
     Item { Layout.fillWidth: true }
 
-    // 3. Bottom Right: Plain version info + Engine Download / Update badges
+    // 3. Bottom Right: Plain version info + missing engine badge
     RowLayout {
       spacing: 3
 
       Text {
+        textFormat: Text.PlainText
         text: "Omarchy Bitwarden " + footerRoot.overlayVersion
         color: footerRoot.muted
         font.pixelSize: Style.font.caption
       }
 
       Text {
+        textFormat: Text.PlainText
         text: "•"
         color: footerRoot.muted
         font.pixelSize: Style.font.caption
       }
 
       Text {
-        visible: footerRoot.isEngineInstalled && !footerRoot.updateAvailable
+        textFormat: Text.PlainText
+        visible: footerRoot.isEngineInstalled
         text: "Omawarden " + footerRoot.backendVersion
         color: footerRoot.muted
         font.pixelSize: Style.font.caption
       }
 
-      // Installing Engine Indicator
+      // Missing Engine Badge (install instructions are on the dependency check view)
       Rectangle {
-        visible: footerRoot.isInstallingDependencies
-        implicitHeight: 18
-        implicitWidth: dlProgRow.implicitWidth + 10
-        radius: 4
-        color: Qt.rgba(footerRoot.accent.r, footerRoot.accent.g, footerRoot.accent.b, 0.15)
-        border.color: footerRoot.accent
-        border.width: 1
-
-        RowLayout {
-          id: dlProgRow
-          anchors.centerIn: parent
-          spacing: 3
-          Text {
-            text: "\uf021"
-            font.family: footerRoot.fontFamily
-            color: footerRoot.accent
-            font.pixelSize: Style.fontPx(0.75)
-          }
-          Text {
-            text: "Installing Engine..."
-            color: footerRoot.accent
-            font.pixelSize: Style.font.caption
-            font.weight: Font.Medium
-          }
-        }
-      }
-
-      // Install Engine Button (When missing/not installed)
-      Rectangle {
-        visible: !footerRoot.isEngineInstalled && !footerRoot.isInstallingDependencies
+        visible: !footerRoot.isEngineInstalled
         implicitHeight: 18
         implicitWidth: dlBadgeRow.implicitWidth + 10
         radius: 4
@@ -346,59 +331,19 @@ Rectangle {
           anchors.centerIn: parent
           spacing: 3
           Text {
-            text: "\uf019"
+            textFormat: Text.PlainText
+            text: "\uf071"
             font.family: footerRoot.fontFamily
             color: StatusPalette.danger
             font.pixelSize: Style.fontPx(0.75)
           }
           Text {
-            text: "Install Engine"
+            textFormat: Text.PlainText
+            text: "Engine Missing"
             color: StatusPalette.danger
             font.pixelSize: Style.font.caption
             font.weight: Font.DemiBold
           }
-        }
-
-        MouseArea {
-          anchors.fill: parent
-          cursorShape: Qt.PointingHandCursor
-          hoverEnabled: true
-          onClicked: footerRoot.installCliTriggered()
-        }
-      }
-
-      // Update Available Badge
-      Rectangle {
-        visible: footerRoot.isEngineInstalled && footerRoot.updateAvailable && Boolean(footerRoot.latestVersion)
-        implicitHeight: 18
-        implicitWidth: updateBadgeRow.implicitWidth + 10
-        radius: 4
-        color: StatusPalette.tint(StatusPalette.update, 0.15)
-        border.width: 0
-
-        RowLayout {
-          id: updateBadgeRow
-          anchors.centerIn: parent
-          spacing: 3
-          Text {
-            text: "Omawarden"
-            font.family: footerRoot.fontFamily
-            color: StatusPalette.update
-            font.pixelSize: Style.fontPx(0.75)
-          }
-          Text {
-            text: "\uf005 " + footerRoot.latestVersion + " Available"
-            color: StatusPalette.update
-            font.pixelSize: Style.font.caption
-            font.weight: Font.Medium
-          }
-        }
-
-        MouseArea {
-          anchors.fill: parent
-          cursorShape: Qt.PointingHandCursor
-          hoverEnabled: true
-          onClicked: footerRoot.settingsTriggered()
         }
       }
     }

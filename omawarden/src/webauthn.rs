@@ -76,6 +76,11 @@ pub fn unwrap_cbor_bytestring(data: &[u8]) -> &[u8] {
 }
 
 /// Parses WebAuthn challenge parameters from Bitwarden/Vaultwarden `TwoFactorProviders2["7"]`.
+///
+/// Returns `None` when the server-supplied `rpId` is not acceptable for the
+/// configured server (see [validate_rp_id]); the value is later written to
+/// `fido2-assert` stdin, and a foreign rpId would make the security key sign
+/// an assertion for another relying party.
 pub fn parse_webauthn_challenge(
     val: &serde_json::Value,
     server_url: &str,
@@ -89,47 +94,128 @@ pub fn parse_webauthn_challenge(
         .and_then(|v| v.as_str())?
         .to_string();
 
-    let parsed_url = Url::parse(server_url).ok();
-    let fallback_rp = parsed_url
-        .as_ref()
-        .and_then(|u| u.host_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| "localhost".to_string());
-
+    let server_host = configured_server_host(server_url)?;
     let rp_id = obj
         .get("rpId")
         .or_else(|| obj.get("RelyingPartyId"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .unwrap_or(fallback_rp);
+        .unwrap_or_else(|| server_host.clone());
+    if let Err(reason) = validate_rp_id(&rp_id, &server_host) {
+        crate::log_warn!("omawarden:auth", "Rejected WebAuthn challenge: {}", reason);
+        return None;
+    }
 
-    let origin = parsed_url
-        .as_ref()
+    let origin = Url::parse(server_url)
+        .ok()
         .map(|u| u.origin().ascii_serialization())
         .filter(|o| o != "null")
         .unwrap_or_else(|| format!("https://{}", rp_id));
-
-    let mut allow_credentials = Vec::new();
-    let creds_arr = obj
-        .get("allowCredentials")
-        .or_else(|| obj.get("AllowCredentials"))
-        .and_then(|v| v.as_array());
-
-    if let Some(arr) = creds_arr {
-        for item in arr {
-            if let Some(id_str) = item.as_str() {
-                allow_credentials.push(id_str.to_string());
-            } else if let Some(id_str) = item.get("id").and_then(|v| v.as_str()) {
-                allow_credentials.push(id_str.to_string());
-            }
-        }
-    }
 
     Some(WebAuthnChallenge {
         challenge,
         rp_id,
         origin,
-        allow_credentials,
+        allow_credentials: parse_allow_credentials(obj),
     })
+}
+
+/// Collects credential IDs, dropping any that are not Base64URL text so that
+/// nothing but Base64 reaches `fido2-assert` stdin.
+fn parse_allow_credentials(obj: &serde_json::Value) -> Vec<String> {
+    let Some(entries) = obj
+        .get("allowCredentials")
+        .or_else(|| obj.get("AllowCredentials"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|item| item.as_str().or_else(|| item.get("id")?.as_str()))
+        .filter(|id| is_base64url_text(id))
+        .map(|id| id.to_string())
+        .collect()
+}
+
+fn is_base64url_text(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'='))
+}
+
+/// Host of the configured server, lower-cased and without IPv6 brackets.
+fn configured_server_host(server_url: &str) -> Option<String> {
+    let trimmed = server_url.trim();
+    let normalized = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{}", trimmed)
+    };
+    let parsed = Url::parse(&normalized).ok()?;
+    let host = parsed.host_str()?;
+    Some(
+        host.trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase(),
+    )
+}
+
+/// Accepts an rpId only when it contains no control characters and either
+/// equals the configured server host or is a parent domain of it.
+///
+/// No public suffix list is available, so a parent domain must have at least
+/// two labels (`bitwarden.com` for `vault.bitwarden.com`, never `com`), and
+/// IP-address hosts accept only an exact match.
+pub fn validate_rp_id(rp_id: &str, server_host: &str) -> Result<(), String> {
+    if rp_id.chars().any(char::is_control) {
+        return Err("rpId contains control characters".to_string());
+    }
+    let rp_id = rp_id.to_ascii_lowercase();
+    if rp_id == server_host {
+        return Ok(());
+    }
+    if is_registrable_parent_domain(&rp_id, server_host) {
+        return Ok(());
+    }
+    Err(format!(
+        "rpId '{}' does not match the configured server host '{}'",
+        rp_id, server_host
+    ))
+}
+
+fn is_registrable_parent_domain(candidate: &str, host: &str) -> bool {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    let has_two_labels = candidate
+        .split('.')
+        .filter(|label| !label.is_empty())
+        .count()
+        >= 2;
+    let well_formed = !candidate.starts_with('.') && !candidate.ends_with('.');
+    has_two_labels && well_formed && host.ends_with(&format!(".{}", candidate))
+}
+
+/// Builds the three-line `fido2-assert -G` input. Every field must be a
+/// single line; a line break would let one field inject further input.
+fn build_fido2_assert_input(
+    client_data_hash_b64: &str,
+    rp_id: &str,
+    credential_id_b64: &str,
+) -> Result<String, String> {
+    let fields = [client_data_hash_b64, rp_id, credential_id_b64];
+    if fields
+        .iter()
+        .any(|f| f.is_empty() || f.chars().any(char::is_control))
+    {
+        return Err("Refusing malformed fido2-assert input".to_string());
+    }
+    Ok(format!(
+        "{}\n{}\n{}\n",
+        client_data_hash_b64, rp_id, credential_id_b64
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,7 +352,7 @@ fn select_credential(
 
     for cred_id_raw in allow_credentials {
         let cred_id_b64 = base64url_to_base64(cred_id_raw);
-        let payload = format!("{}\n{}\n{}\n", probe_hash_b64, rp_id, cred_id_b64);
+        let payload = build_fido2_assert_input(&probe_hash_b64, rp_id, &cred_id_b64)?;
         let output = run_fido2_assert(device_path, &payload, false)?;
         if output.status.success() {
             return Ok(cred_id_b64);
@@ -312,10 +398,8 @@ pub fn perform_fido2_assertion(
         device_path,
     )?;
 
-    let stdin_payload = format!(
-        "{}\n{}\n{}\n",
-        cd_hash_b64, challenge_data.rp_id, cred_id_b64
-    );
+    let stdin_payload =
+        build_fido2_assert_input(&cd_hash_b64, &challenge_data.rp_id, &cred_id_b64)?;
 
     crate::log_info!("omawarden:auth", "Waiting for security key touch...");
     let output = run_fido2_assert(device_path, &stdin_payload, true)?;
@@ -435,6 +519,73 @@ mod tests {
         assert_eq!(parsed.rp_id, "bitwarden.com");
         assert_eq!(parsed.origin, "https://vault.bitwarden.com");
         assert_eq!(parsed.allow_credentials, vec!["Y3JlZF9h", "Y3JlZF9i"]);
+    }
+
+    #[test]
+    fn test_parse_webauthn_challenge_rejects_foreign_or_malformed_rp_id() {
+        let challenge_with_rp = |rp_id: &str| {
+            serde_json::json!({
+                "7": {
+                    "challenge": "dGVzdA",
+                    "rpId": rp_id,
+                    "allowCredentials": ["Y3JlZF8x"]
+                }
+            })
+        };
+        let server = "https://vault.example.com";
+        for rejected in [
+            "evil.example.org",
+            "example.com\nY3JlZF8y",
+            "vault.example.com\r",
+            "vault.example.com\u{0}",
+            "com",
+            ".example.com",
+            "ample.com",
+            "sub.vault.example.com",
+            "",
+        ] {
+            assert!(
+                parse_webauthn_challenge(&challenge_with_rp(rejected), server).is_none(),
+                "{rejected:?} must be rejected"
+            );
+        }
+        for accepted in ["vault.example.com", "example.com", "VAULT.example.com"] {
+            assert!(
+                parse_webauthn_challenge(&challenge_with_rp(accepted), server).is_some(),
+                "{accepted:?} must be accepted"
+            );
+        }
+
+        // Loopback self-hosted servers accept only their own host.
+        let local = "http://localhost:8000";
+        assert!(parse_webauthn_challenge(&challenge_with_rp("localhost"), local).is_some());
+        assert!(parse_webauthn_challenge(&challenge_with_rp("example.com"), local).is_none());
+        let ip = "http://127.0.0.1:8000";
+        assert!(parse_webauthn_challenge(&challenge_with_rp("127.0.0.1"), ip).is_some());
+        assert!(parse_webauthn_challenge(&challenge_with_rp("0.0.1"), ip).is_none());
+    }
+
+    #[test]
+    fn test_parse_webauthn_challenge_drops_non_base64url_credentials() {
+        let json_val = serde_json::json!({
+            "7": {
+                "challenge": "dGVzdA",
+                "rpId": "vault.example.com",
+                "allowCredentials": ["Y3JlZF8x", "Y3Jl\nvault.example.com", { "id": "Y3JlZF8y" }]
+            }
+        });
+        let parsed = parse_webauthn_challenge(&json_val, "https://vault.example.com").unwrap();
+        assert_eq!(parsed.allow_credentials, vec!["Y3JlZF8x", "Y3JlZF8y"]);
+    }
+
+    #[test]
+    fn test_build_fido2_assert_input_rejects_line_breaks() {
+        assert_eq!(
+            build_fido2_assert_input("aGFzaA==", "example.com", "Y3JlZA==").unwrap(),
+            "aGFzaA==\nexample.com\nY3JlZA==\n"
+        );
+        assert!(build_fido2_assert_input("aGFzaA==", "example.com\nx", "Y3JlZA==").is_err());
+        assert!(build_fido2_assert_input("aGFzaA==", "", "Y3JlZA==").is_err());
     }
 
     #[test]

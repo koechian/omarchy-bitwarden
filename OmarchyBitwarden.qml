@@ -8,8 +8,9 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 import "./components"
-import "./components/IconPolicy.js" as IconPolicy
-import "./components/CardFormatter.js" as CardFormatter
+import "./components/SecretFieldCatalog.js" as SecretFieldCatalog
+import "./components/UriPolicy.js" as UriPolicy
+import "./components/VaultSearch.js" as VaultSearch
 
 Item {
   id: root
@@ -17,7 +18,6 @@ Item {
   Component.onCompleted: {
     root.checkDependencies()
     root.resolveHelper()
-    root.checkUpdates(false)
   }
 
   property var shell: null
@@ -37,7 +37,8 @@ Item {
   }
 
   property string helperPath: "omawarden"
-  readonly property string minimumEngineVersion: "0.8.1"
+  // The first engine that redacts items and releases secrets per field (ADR 0027).
+  readonly property string minimumEngineVersion: "0.12.0"
   readonly property string minimumGeneratorEngineVersion: "0.9.0"
   readonly property bool isGeneratorEngineOutdated: {
     var ver = (root.cliHealth && root.cliHealth.version) ? root.cliHealth.version : ""
@@ -97,10 +98,9 @@ Item {
     }
   }
 
-  // Dependency Checking & One-Click Installer State
+  // Dependency Checking State
   property bool dependenciesMissing: false
   property bool isCheckingDependencies: false
-  property bool isInstallingDependencies: false
   property var missingDependencyPackages: []
 
   function checkDependencies() {
@@ -113,34 +113,13 @@ Item {
     pacmanCheckProc.running = true
   }
 
-  function installPackage(pkgName) {
-    if (!pkgName || typeof pkgName !== "string") return
-    var cleanPkg = pkgName.trim()
-    if (!/^[a-zA-Z0-9_\-\.\s]+$/.test(cleanPkg)) return
-
-    var installCmd = "if command -v paru >/dev/null 2>&1; then paru -S --needed " + cleanPkg +
-                     "; elif command -v yay >/dev/null 2>&1; then yay -S --needed " + cleanPkg +
-                     "; else sudo pacman -S --needed " + cleanPkg + "; fi"
-
-    root.isInstallingDependencies = true
-    installDependenciesProc.running = false
-    installDependenciesProc.command = ["omarchy-launch-floating-terminal-with-presentation", installCmd]
-    installDependenciesProc.running = true
-  }
-
-  function installMissingDependencies() {
-    var missing = dependencyCheckView ? dependencyCheckView.getInstallPackageNames() : []
-    if (missing.length === 0) return
-    root.installPackage(missing.join(" "))
-  }
-
   readonly property string engineSource: {
     if (!cliHealth || !cliHealth.installed) return ""
     if (dependencyCheckView) {
       for (var i = 0; i < dependencyCheckView.dependencyModel.count; i++) {
         var item = dependencyCheckView.dependencyModel.get(i)
         if (item.pkgName === "omawarden" && item.status === "installed") {
-          return "aur"
+          return item.isLocalFallback ? "local" : "aur"
         }
       }
     }
@@ -212,34 +191,49 @@ Item {
     }
 
     onExited: function(code) {
-      root.finalizeDependencyCheck()
+      root.completePackageCheck()
     }
   }
 
+  // pacman knows only packaged engines. This fork's engine is built from
+  // source, so when no package satisfies the check, look for a local build
+  // on PATH before reporting the engine as missing.
+  function completePackageCheck() {
+    if (dependencyCheckView && dependencyCheckView.engineNeedsLocalProbe()) {
+      localEngineProbeProc.running = false
+      localEngineProbeProc.running = true
+      return
+    }
+    root.finalizeDependencyCheck()
+  }
+
   Process {
-    id: installDependenciesProc
+    id: localEngineProbeProc
+    command: ["sh", "-c", "engine=$(command -v omawarden) && \"$engine\" --version"]
     running: false
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (dependencyCheckView) {
+          dependencyCheckView.applyLocalEngineProbe(text)
+        }
+      }
+    }
+
     onExited: function(code) {
-      root.isInstallingDependencies = false
-      root.checkDependencies()
-      root.doCheckFido2Status()
+      root.finalizeDependencyCheck()
     }
   }
 
   // Configuration & Engine Health State
   property var config: ({
     server_url: "https://vault.bitwarden.com",
-    download_dir: "~/Downloads",
     auto_lock_minutes: 15,
     clipboard_clear_seconds: 30,
-    email: "",
-    check_updates: true,
-    show_website_icons: true
+    email: ""
   })
   property bool rememberEmailChecked: true
-  property bool checkUpdatesEnabled: false
-  property bool pendingUpdateCheck: false
-  property bool showWebsiteIcons: false
   property int configSeq: 0
   property bool show2FAField: false
   property bool isNewDeviceVerification: false
@@ -257,26 +251,6 @@ Item {
     error: "Checking CLI status..."
   })
   property bool engineAttestationVerified: false
-  property string latestVersion: ""
-  property bool isCheckingUpdate: false
-  property string updateCheckStatus: ""
-  property string latestReleaseNotes: ""
-  property string latestReleaseUrl: ""
-  property string latestReleaseTitle: ""
-  readonly property bool updateAvailable: {
-    if (!latestVersion) return false
-    var currentVer = (cliHealth && cliHealth.version) ? cliHealth.version : ""
-    if (!currentVer) return false
-    // Suppress regular release update notifications when running development builds
-    if (currentVer.indexOf("-dev") !== -1 || currentVer.indexOf(".dev") !== -1) return false
-    return compareSemVer(latestVersion, currentVer) > 0
-  }
-
-  readonly property string effectiveServerUrl: {
-    if (root.authState && root.authState.server_url) return root.authState.server_url
-    if (root.config && root.config.server_url) return root.config.server_url
-    return "https://vault.bitwarden.com"
-  }
 
   property var authState: ({
     status: "unauthenticated",
@@ -289,40 +263,21 @@ Item {
   property var rawVaultItems: []
   property var filteredItems: []
   property string searchQuery: ""
-  property var categoryList: ["all", "login", "card", "identity", "note", "ssh_key"]
+  property var categoryList: ["all", "login", "card", "identity", "note"]
   property string activeCategory: "all"
   property string activeVaultScope: "all"
   property string activeFolderScope: "all"
   property int selectedIndex: 0
 
-  // Details Inspector State
-  property bool showPasswordRevealed: false
-  property bool showPrivateKeyRevealed: false
-  property bool showCardNumberRevealed: false
-  property bool showCardCodeRevealed: false
-  property bool showCustomHiddenRevealed: false
-  property var currentTotp: ({ code: "", ttl: 30, period: 30 })
+  // Details Inspector State. Revealed secrets live only in secretRelease.
   property bool showActionPalette: false
   property int actionPaletteIndex: 0
   property var currentAvailableActions: []
-  property bool showSshKeyModal: false
-  property string sshKeyModalMode: "create"
-  property var sshKeyModalItem: null
-  // SSH agent confirmation: the first pending prompt from `ssh-agent pending`.
-  // `sshApprovalOnly` means the overlay was opened just for it and closes after.
-  property var sshApprovalPrompt: null
-  property bool sshApprovalOnly: false
-  property int sshApprovalRemaining: 0
-  // Set while closing the overlay with prompts still pending: they are denied
-  // one by one so `ssh` fails now instead of hanging until the daemon times out.
-  property bool sshDenyingOnClose: false
   property bool showPasswordHistoryModal: false
   property var activePasswordHistoryItem: null
   property bool showPasswordGeneratorModal: false
   property string passwordGeneratorModalMode: "password"
-  readonly property bool hasActiveModal: root.showActionPalette || root.showSshKeyModal || root.showPasswordHistoryModal || root.showPasswordGeneratorModal
-  property var activeAttachmentPreview: null
-  property string loadingAttachmentId: ""
+  readonly property bool hasActiveModal: root.showActionPalette || root.showPasswordHistoryModal || root.showPasswordGeneratorModal
 
   property string currentView: "auto"
   property string loginMethod: "password"
@@ -343,6 +298,10 @@ Item {
   readonly property color selectedBackground: Commons.Color.menu.selectedBackground
   readonly property color muted: Commons.Color.muted
   readonly property string fontFamily: Style.font.menuFamily
+  readonly property int defaultClipboardClearSeconds: 30
+  readonly property QtObject strings: Commons.Translations {
+    directory: Qt.resolvedUrl("i18n")
+  }
 
   readonly property var selectedItem: {
     if (filteredItems && filteredItems.length > 0 && selectedIndex >= 0 && selectedIndex < filteredItems.length) {
@@ -387,12 +346,7 @@ Item {
     root.activeFolderScope = "all"
     root.selectedIndex = 0
 
-    root.showPasswordRevealed = false
-    root.showPrivateKeyRevealed = false
-    root.showCardNumberRevealed = false
-    root.showCardCodeRevealed = false
-    root.showCustomHiddenRevealed = false
-    root.currentTotp = ({ code: "", ttl: 30, period: 30 })
+    secretRelease.reset()
 
     root.showActionPalette = false
     root.actionPaletteIndex = 0
@@ -411,12 +365,6 @@ Item {
       passwordGenProc.running = false
     }
 
-    root.showSshKeyModal = false
-    root.sshKeyModalItem = null
-
-    root.activeAttachmentPreview = null
-    root.loadingAttachmentId = ""
-
     root.twoFactorProvider = 0
     root.availableTwoFactorProviders = []
 
@@ -425,115 +373,69 @@ Item {
     }
   }
 
-  function open(payloadJson) {
-    var payload = {}
-    try { payload = JSON.parse(payloadJson || "{}") || {} } catch (e) { payload = {} }
-    if (payload.view === "ssh-approval") {
-      // Don't disturb a session already on screen; just show the prompt on top.
-      if (root.opened) {
-        root.refreshSshApprovals()
-        return
-      }
-      root.sshApprovalOnly = true
-      root.refreshSshApprovals()
+  // Whether the last search survives closing and reopening the overlay.
+  function canRememberSearch() {
+    return Boolean(root.config && root.config.remember_last_search === true && root.authState && root.authState.status === "unlocked")
+  }
+
+  // Keeps a remembered selection inside the current result list.
+  function clampSelectedIndex() {
+    var count = root.filteredItems ? root.filteredItems.length : 0
+    root.selectedIndex = count > 0 ? Math.min(Math.max(root.selectedIndex, 0), count - 1) : 0
+  }
+
+  // Closes every modal and drops revealed values and palette closures.
+  function resetTransientState() {
+    root.showActionPalette = false
+    root.showPasswordHistoryModal = false
+    root.showPasswordGeneratorModal = false
+    root.activePasswordHistoryItem = null
+    root.currentAvailableActions = []
+    secretRelease.reset()
+  }
+
+  function focusActiveView(cursorAtEnd) {
+    if (root.effectiveView === "search" && searchHeader) {
+      searchHeader.focusSearch(cursorAtEnd)
+    } else if (root.effectiveView !== "dependency_check" && authViewComponent && authViewComponent.unlockInput) {
+      authViewComponent.unlockInput.forceActiveFocus()
     }
-    root.sshDenyingOnClose = false
+  }
+
+  // payloadJson is part of the shell's plugin interface; no view payload is used.
+  function open(payloadJson) {
     root.opened = true
     root.errorMessage = ""
     root.statusMessage = ""
     root.currentView = "auto"
-    var canRemember = Boolean(root.config && root.config.remember_last_search === true && root.authState && root.authState.status === "unlocked")
-    if (!canRemember) {
+    var canRemember = root.canRememberSearch()
+    if (canRemember) {
+      root.clampSelectedIndex()
+    } else {
       root.searchQuery = ""
       root.selectedIndex = 0
-    } else {
-      if (root.filteredItems && root.filteredItems.length > 0) {
-        if (root.selectedIndex < 0) {
-          root.selectedIndex = 0
-        } else if (root.selectedIndex >= root.filteredItems.length) {
-          root.selectedIndex = root.filteredItems.length - 1
-        }
-      } else {
-        root.selectedIndex = 0
-      }
     }
     if (!root.authState || root.authState.status !== "unlocked") {
       root.clearSensitiveState()
     } else {
-      root.showActionPalette = false
-      root.showSshKeyModal = false
-      root.showPasswordHistoryModal = false
-      root.showPasswordGeneratorModal = false
-      root.showPasswordRevealed = false
-      root.showPrivateKeyRevealed = false
-      root.showCardNumberRevealed = false
-      root.showCardCodeRevealed = false
-      root.showCustomHiddenRevealed = false
-      root.activeAttachmentPreview = null
-      root.activePasswordHistoryItem = null
-      root.sshKeyModalItem = null
-      root.currentAvailableActions = []
-      root.currentTotp = ({ code: "", ttl: 30, period: 30 })
+      root.resetTransientState()
     }
     root.checkDependencies()
     if (!root.dependenciesMissing) {
       root.refreshHealth()
       root.refreshConfig()
       root.refreshAuthStatus()
-      root.checkUpdates(false)
     }
     if (root.effectiveView === "search" && root.selectedItem) {
       root.handleSelectedItemChanged()
     }
-    Qt.callLater(function() {
-      if (root.effectiveView === "search" && searchHeader) {
-        searchHeader.focusSearch(canRemember)
-      } else if (root.effectiveView !== "dependency_check" && authViewComponent && authViewComponent.unlockInput) {
-        authViewComponent.unlockInput.forceActiveFocus()
-      }
-    })
-  }
-
-  function refreshSshApprovals() {
-    if (sshPendingProc.running) return
-    sshPendingProc.command = [root.helperPath, "ssh-agent", "pending"]
-    sshPendingProc.running = true
-  }
-
-  function replySshApproval(approve) {
-    var p = root.sshApprovalPrompt
-    if (!p || sshReplyProc.running) return
-    root.logInfo("omarchy:ssh-agent", (approve ? "Allowed" : "Denied") + " signature with key " + p.key_name + " for " + p.client)
-    root.sshApprovalPrompt = null
-    sshReplyProc.command = [root.helperPath, "ssh-agent", "reply", String(p.id), approve ? "--allow" : "--deny"]
-    sshReplyProc.running = true
+    Qt.callLater(function() { root.focusActiveView(canRemember) })
   }
 
   function close() {
-    // Closing the window without answering counts as Deny.
-    if (root.sshApprovalPrompt) {
-      root.sshDenyingOnClose = true
-      root.replySshApproval(false)
-    }
-    root.sshApprovalOnly = false
     root.opened = false
-    totpGenProc.running = false
-    root.showActionPalette = false
-    root.showSshKeyModal = false
-    root.showPasswordHistoryModal = false
-    root.showPasswordGeneratorModal = false
-    root.showPasswordRevealed = false
-    root.showPrivateKeyRevealed = false
-    root.showCardNumberRevealed = false
-    root.showCardCodeRevealed = false
-    root.showCustomHiddenRevealed = false
-    root.activeAttachmentPreview = null
-    root.activePasswordHistoryItem = null
-    root.sshKeyModalItem = null
-    root.currentAvailableActions = []
-    root.currentTotp = ({ code: "", ttl: 30, period: 30 })
-    var canRemember = Boolean(root.config && root.config.remember_last_search === true && root.authState && root.authState.status === "unlocked")
-    if (!canRemember) {
+    root.resetTransientState()
+    if (!root.canRememberSearch()) {
       root.searchQuery = ""
       root.selectedIndex = 0
     }
@@ -552,8 +454,6 @@ Item {
   }
 
   function refreshConfig() {
-    root.checkUpdatesEnabled = false
-    root.showWebsiteIcons = false
     if (configGetProc.running) return
     root.configSeq++
     configGetProc.seq = root.configSeq
@@ -584,20 +484,6 @@ Item {
       if (a[i] < b[i]) return -1
     }
     return 0
-  }
-
-  function checkUpdates(isManual) {
-    if (!isManual && !root.checkUpdatesEnabled) { root.pendingUpdateCheck = true; return }
-    if (root.isCheckingUpdate) return
-    root.isCheckingUpdate = true
-    if (isManual) {
-      root.updateCheckStatus = "Checking for updates..."
-    }
-
-    var scriptPath = root.toLocalPath(Qt.resolvedUrl("scripts/check-update.sh"))
-    updateCheckProc.running = false
-    updateCheckProc.command = ["bash", scriptPath]
-    updateCheckProc.running = true
   }
 
   function refreshHealth() {
@@ -693,26 +579,63 @@ Item {
     return str
   }
 
+  function scopeExists(scopes, scopeId) {
+    return scopes.some(function(scope) { return scope.id === scopeId })
+  }
+
+  // Falls back to "all" for a vault or folder scope the new listing lacks.
+  function resetUnknownScopes() {
+    var fixedVaultScopes = ["all", "personal"]
+    var fixedFolderScopes = ["all", "none"]
+    if (fixedVaultScopes.indexOf(root.activeVaultScope) === -1 && !root.scopeExists(root.getAvailableVaultScopes(), root.activeVaultScope)) {
+      root.activeVaultScope = "all"
+    }
+    if (fixedFolderScopes.indexOf(root.activeFolderScope) === -1 && !root.scopeExists(root.getAvailableFolderScopes(), root.activeFolderScope)) {
+      root.activeFolderScope = "all"
+    }
+  }
+
+  // `vault list` prints an array of redacted items; a locked daemon answers
+  // with an error envelope instead, which is not a listing. A listing in
+  // which any item carries a secret value comes from an engine that does not
+  // redact (contracts.md 3.2): it is discarded whole, never stored, and the
+  // user is told to install the hardened engine.
+  function applyVaultListing(listing, rawText) {
+    var handlers = {}
+    handlers[SecretFieldCatalog.LISTING_REDACTED] = root.storeVaultListing
+    handlers[SecretFieldCatalog.LISTING_UNREDACTED] = root.rejectUnredactedListing
+    handlers[SecretFieldCatalog.LISTING_NOT_A_LISTING] = root.rejectVaultReply
+    handlers[SecretFieldCatalog.classifyVaultListing(listing)](listing, rawText)
+  }
+
+  function storeVaultListing(listing, rawText) {
+    root.lastVaultItemsRawText = rawText
+    root.rawVaultItems = listing
+    root.resetUnknownScopes()
+  }
+
+  function discardVaultListing() {
+    root.lastVaultItemsRawText = ""
+    root.rawVaultItems = []
+    root.filteredItems = []
+  }
+
+  function rejectUnredactedListing() {
+    root.discardVaultListing()
+    root.errorMessage = root.strings.t("error.engine_not_redacting", "The installed omawarden engine sent secrets with the vault list, so the list was discarded. Install the hardened omawarden %1 or later and unlock again.").arg(root.minimumEngineVersion)
+    root.logError("omarchy:vault", "Discarded a vault listing that carried secret values: the engine does not redact items (requires omawarden >= " + root.minimumEngineVersion + ")")
+  }
+
+  function rejectVaultReply(listing) {
+    root.discardVaultListing()
+    if (listing && SecretFieldCatalog.errorLocksVault(listing.error_code)) root.markVaultLocked()
+  }
+
   function loadVaultItems() {
     root.logInfo("omarchy:vault", "Loading vault items from local daemon/engine...")
     root.isLoadingVault = true
     vaultListProc.command = [root.helperPath, "vault", "list"]
     vaultListProc.running = true
-  }
-
-  function isAttachmentPreviewable(filename) {
-    if (!filename) return false
-    var dotIdx = filename.lastIndexOf(".")
-    if (dotIdx === -1) return false
-    var ext = filename.slice(dotIdx + 1).toLowerCase()
-    var previewableExts = [
-      "png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "ico",
-      "txt", "md", "markdown", "json", "yaml", "yml", "toml", "csv", "tsv", "log",
-      "sh", "bash", "zsh", "py", "js", "ts", "jsx", "tsx", "html", "htm", "css", "scss", "sass", "less",
-      "xml", "conf", "config", "ini", "env", "pem", "key", "pub", "crt", "cer",
-      "diff", "patch", "sql", "lua", "c", "cpp", "cc", "cxx", "h", "hpp", "rs", "go", "java", "kt", "kts", "rb", "php"
-    ]
-    return previewableExts.indexOf(ext) !== -1
   }
 
   function sanitizeServerUrl(url) {
@@ -818,122 +741,14 @@ Item {
     }
   }
 
-  function isSubsequence(pattern, text) {
-    if (!pattern) return true
-    pattern = pattern.toLowerCase()
-    text = text.toLowerCase()
-    if (text.indexOf(pattern) !== -1) return true
-    var pIdx = 0
-    for (var i = 0; i < text.length; i++) {
-      if (text[i] === pattern[pIdx]) {
-        pIdx++
-        if (pIdx === pattern.length) return true
-      }
-    }
-    return false
-  }
-
   function filterVaultItems(resetSelection) {
     var currentId = (root.selectedItem && !resetSelection) ? root.selectedItem.id : null
-    var q = (root.searchQuery || "").trim().toLowerCase()
-    var cat = root.activeCategory
-    var vs = root.activeVaultScope || "all"
-    var fs = root.activeFolderScope || "all"
-    var items = root.rawVaultItems || []
-
-    var res = []
-    for (var i = 0; i < items.length; i++) {
-      var item = items[i]
-
-      // 1. Vault Scope Filter
-      if (vs === "personal") {
-        if (item.organization_id) continue
-      } else if (vs !== "all") {
-        if (item.organization_id !== vs && item.organization_name !== vs) continue
-      }
-
-      // 2. Folder Scope Filter
-      if (fs === "none") {
-        if (item.folder_id || item.folder_name) continue
-      } else if (fs !== "all") {
-        if (item.folder_id !== fs && item.folder_name !== fs) continue
-      }
-
-      // 3. Category Filter
-      if (cat !== "all" && item.type_name !== cat && !(cat === "ssh_key" && item.category === "ssh_key")) continue
-
-      if (q === "") {
-        res.push({ item: item, score: item.favorite ? 100 : 0 })
-      } else {
-        var words = q.split(/\s+/)
-        var totalScore = item.favorite ? 100 : 0
-        var nameLower = (item.name || "").toLowerCase()
-        var subLower = (item.sub_title || "").toLowerCase()
-        var searchLower = (item.search_text || "").toLowerCase()
-        var notesLower = (item.notes || "").toLowerCase()
-
-        var allWordsMatched = true
-        for (var w = 0; w < words.length; w++) {
-          var word = words[w]
-          if (!word) continue
-          var wordMatched = false
-
-          if (nameLower === word) {
-            totalScore += 2000
-            wordMatched = true
-          } else if (nameLower.indexOf(word) === 0) {
-            totalScore += 1000
-            wordMatched = true
-          } else if (nameLower.indexOf(word) !== -1) {
-            totalScore += 500
-            wordMatched = true
-          } else if (subLower.indexOf(word) === 0) {
-            totalScore += 400
-            wordMatched = true
-          } else if (subLower.indexOf(word) !== -1) {
-            totalScore += 300
-            wordMatched = true
-          } else if (searchLower.indexOf(word) !== -1 || notesLower.indexOf(word) !== -1) {
-            totalScore += 100
-            wordMatched = true
-          } else if (root.isSubsequence(word, nameLower)) {
-            totalScore += 80
-            wordMatched = true
-          }
-
-          if (!wordMatched) {
-            allWordsMatched = false
-            break
-          }
-        }
-
-        if (allWordsMatched) {
-          res.push({ item: item, score: totalScore })
-        }
-      }
-    }
-
-    res.sort(function(a, b) {
-      return b.score - a.score
+    root.filteredItems = VaultSearch.filterItems(root.rawVaultItems, root.searchQuery, {
+      vaultScope: root.activeVaultScope,
+      folderScope: root.activeFolderScope,
+      category: root.activeCategory
     })
-
-    var out = []
-    for (var j = 0; j < res.length; j++) {
-      out.push(res[j].item)
-    }
-
-    root.filteredItems = out
-
-    var targetIndex = 0
-    if (currentId && out.length > 0) {
-      for (var k = 0; k < out.length; k++) {
-        if (out[k].id === currentId) {
-          targetIndex = k
-          break
-        }
-      }
-    }
-    root.selectedIndex = targetIndex
+    root.selectedIndex = VaultSearch.indexOfItem(root.filteredItems, currentId)
     root.handleSelectedItemChanged()
   }
 
@@ -1016,35 +831,29 @@ Item {
   onActiveFolderScopeChanged: filterVaultItems(true)
   onSelectedIndexChanged: root.handleSelectedItemChanged()
 
+  // Selecting an item never releases a secret; the release controller drops
+  // the previous item's revealed values when its id changes.
   function handleSelectedItemChanged() {
-    root.showPasswordRevealed = false
-    root.showPrivateKeyRevealed = false
-    root.showCardNumberRevealed = false
-    root.showCardCodeRevealed = false
-    root.showCustomHiddenRevealed = false
-    root.activeAttachmentPreview = null
-    root.loadingAttachmentId = ""
-    root.updateTotpForSelected()
     root.updateAvailableActions()
   }
 
+  function canToggleReveal() {
+    return root.showPasswordHistoryModal || root.isSelectionReady()
+  }
+
+  // Ctrl+T: hides whatever is revealed, otherwise reveals the item's primary
+  // secret (one release). In the history modal it toggles the entries.
   function toggleItemRevealed() {
     if (root.showPasswordHistoryModal) {
-      if (passwordHistoryModalComponent) {
-        passwordHistoryModalComponent.toggleAllRevealed()
-      }
+      if (passwordHistoryModalComponent) passwordHistoryModalComponent.toggleAllRevealed()
       return
     }
-
-    if (root.effectiveView === "search" && root.selectedItem) {
-      var anyRevealed = root.showPasswordRevealed || root.showPrivateKeyRevealed || root.showCardNumberRevealed || root.showCardCodeRevealed || root.showCustomHiddenRevealed
-      var targetState = !anyRevealed
-      root.showPasswordRevealed = targetState
-      root.showPrivateKeyRevealed = targetState
-      root.showCardNumberRevealed = targetState
-      root.showCardCodeRevealed = targetState
-      root.showCustomHiddenRevealed = targetState
+    if (!root.isSelectionReady()) return
+    if (secretRelease.hasRequestedValues()) {
+      secretRelease.concealAll()
+      return
     }
+    secretRelease.reveal(SecretFieldCatalog.primarySecretField(root.selectedItem))
   }
 
   function updateAvailableActions() {
@@ -1059,16 +868,11 @@ Item {
     }
   }
 
-  onShowSshKeyModalChanged: {
-    if (!root.showSshKeyModal && !root.hasActiveModal) {
-      root.restoreSearchFocus()
-    }
-  }
-
   onShowPasswordHistoryModalChanged: {
-    if (!root.showPasswordHistoryModal && !root.hasActiveModal) {
-      root.restoreSearchFocus()
-    }
+    if (root.showPasswordHistoryModal) return
+    secretRelease.conceal(SecretFieldCatalog.PASSWORD_HISTORY)
+    root.activePasswordHistoryItem = null
+    if (!root.hasActiveModal) root.restoreSearchFocus()
   }
 
   onShowPasswordGeneratorModalChanged: {
@@ -1084,18 +888,6 @@ Item {
   }
 
   onSelectedItemChanged: root.handleSelectedItemChanged()
-
-  function updateTotpForSelected() {
-    var item = root.selectedItem
-    if (item && item.login && (item.login.totp || item.login.has_totp)) {
-      totpGenProc.running = false
-      totpGenProc.secret = ""
-      totpGenProc.command = [root.helperPath, "totp", item.id]
-      totpGenProc.running = true
-    } else {
-      root.currentTotp = ({ code: "", ttl: 30, period: 30 })
-    }
-  }
 
   function cycleCategory(forward) {
     var idx = root.categoryList.indexOf(root.activeCategory)
@@ -1130,45 +922,46 @@ Item {
     root.statusMessage = "Copied " + (label || "value") + " to clipboard" + (isSensitive ? (" (clears in " + ttl + "s)") : "") + "."
   }
 
+  // Secret copies name the field; the daemon writes the value to the
+  // clipboard with the sensitive hint and schedules the auto-clear.
+  function copySecretField(item, field, label) {
+    if (!item || !SecretFieldCatalog.isPresent(item, field)) return false
+    if (root.cliHealth && root.cliHealth.clipboard_available === false) {
+      root.errorMessage = "Wayland clipboard utility 'wl-copy' not found. Please install 'wl-clipboard'."
+      return true
+    }
+    secretRelease.copyField(field, label || SecretFieldCatalog.fieldLabel(item, field))
+    return true
+  }
+
+  function copyPrimaryLoginSecret(item) {
+    if (root.copySecretField(item, SecretFieldCatalog.LOGIN_PASSWORD, "password")) return
+    if (item.login && item.login.username) root.copyToClipboard(item.login.username, false, "username")
+  }
+
+  function copyPrimaryIdentityValue(item) {
+    var identity = item.identity || {}
+    var name = ((identity.firstName || "") + " " + (identity.lastName || "")).trim()
+    if (identity.email) root.copyToClipboard(identity.email, false, "identity email")
+    else if (name) root.copyToClipboard(name, false, "name")
+  }
+
+  function copyPrimaryNoteSecret(item) {
+    var field = SecretFieldCatalog.primarySecretField(item)
+    if (field) root.copySecretField(item, field, "")
+  }
+
+  // Enter: logins copy the password, cards the number, notes the note (or the
+  // first custom field), identities the email or name.
   function executePrimaryAction(item) {
     if (!item) return
-    switch (item.type_name) {
-      case "login":
-        if (item.login && item.login.password) {
-          copyToClipboard(item.login.password, true, "password")
-        } else if (item.login && item.login.username) {
-          copyToClipboard(item.login.username, false, "username")
-        }
-        break
-      case "card":
-        if (item.card && item.card.number) {
-          copyToClipboard(CardFormatter.sanitizeCardNumberForCopy(item.card.number), true, "card number")
-        }
-        break
-      case "ssh_key":
-        if (item.ssh_key && item.ssh_key.private_key) {
-          copyToClipboard(item.ssh_key.private_key, true, "SSH private key")
-        } else if (item.ssh_key && item.ssh_key.public_key) {
-          copyToClipboard(item.ssh_key.public_key, false, "SSH public key")
-        }
-        break
-      case "note":
-        if (item.notes) {
-          copyToClipboard(item.notes, false, "secure note")
-        } else if (item.fields && item.fields.length > 0 && item.fields[0].value) {
-          copyToClipboard(String(item.fields[0].value), item.fields[0].type === 1, item.fields[0].name || "custom field")
-        }
-        break
-      case "identity":
-        if (item.identity && item.identity.email) {
-          copyToClipboard(item.identity.email, false, "identity email")
-        } else if (item.identity && (item.identity.firstName || item.identity.lastName)) {
-          copyToClipboard((item.identity.firstName + " " + item.identity.lastName).trim(), false, "name")
-        }
-        break
-      default:
-        copyToClipboard(item.notes || "", false, "content")
+    var handlers = {
+      "login": root.copyPrimaryLoginSecret,
+      "card": function(target) { root.copySecretField(target, SecretFieldCatalog.CARD_NUMBER, "card number") },
+      "identity": root.copyPrimaryIdentityValue
     }
+    var handler = handlers[item.type_name] || root.copyPrimaryNoteSecret
+    handler(item)
   }
 
   function copyItemUsername(item) {
@@ -1180,9 +973,6 @@ Item {
       uName = item.identity.username || item.identity.email || ""
     } else if (item.type_name === "card" && item.card && item.card.cardholderName) {
       uName = item.card.cardholderName
-    } else if (item.type_name === "ssh_key" && item.ssh_key && item.ssh_key.public_key) {
-      root.copyToClipboard(item.ssh_key.public_key, false, "SSH public key")
-      return
     }
     if (uName) {
       root.copyToClipboard(uName, false, "username")
@@ -1192,524 +982,206 @@ Item {
     }
   }
 
+  // Ctrl+Enter: the daemon copies the current code; nothing is revealed.
   function copyItemTotp(item) {
-    if (!item) return
-    if (root.currentTotp && root.currentTotp.code) {
-      root.copyToClipboard(root.currentTotp.code, true, "TOTP code")
-    }
+    root.copySecretField(item, SecretFieldCatalog.LOGIN_TOTP, "TOTP code")
   }
 
-  function isAppScheme(uri) {
-    if (!uri) return false
-    var str = String(uri).trim()
-    var match = str.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/i)
-    if (match) {
-      var scheme = match[1].toLowerCase()
-      return scheme !== "http" && scheme !== "https"
+  // The only path to Qt.openUrlExternally: http and https URLs only.
+  function openUri(uri) {
+    var url = UriPolicy.openableUrl(uri)
+    if (!url) {
+      root.statusMessage = root.strings.t("status.no_openable_uri", "This item has no http or https link to open.")
+      return false
     }
-    return false
-  }
-
-  function formatSchemeHost(uri) {
-    if (!uri) return ""
-    var str = String(uri).trim()
-    var schemeMatch = str.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(.*)$/i)
-    if (schemeMatch) {
-      var scheme = schemeMatch[1].toLowerCase()
-      var rest = schemeMatch[2]
-      var atIdx = rest.indexOf("@")
-      if (atIdx !== -1) {
-        rest = rest.substring(atIdx + 1)
-      }
-      var endMatch = rest.match(/^([^/?#]+)/)
-      var host = endMatch ? endMatch[1] : rest
-      return scheme + "://" + host
-    }
-    var singleColonMatch = str.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):(.*)$/i)
-    if (singleColonMatch) {
-      var s = singleColonMatch[1].toLowerCase()
-      if (s !== "http" && s !== "https") {
-        var r = singleColonMatch[2]
-        var em = r.match(/^([^/?#]+)/)
-        return s + ":" + (em ? em[1] : r)
-      }
-    }
-    var clean = str.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//i, "")
-    var at = clean.indexOf("@")
-    if (at !== -1) {
-      clean = clean.substring(at + 1)
-    }
-    var m = clean.match(/^([^/?#]+)/)
-    var hostOnly = m ? m[1] : clean
-    return "https://" + hostOnly
-  }
-
-  function getProcessedUris(item) {
-    if (!item || !item.login || !item.login.uris || item.login.uris.length === 0) return []
-
-    var webList = []
-    var appList = []
-
-    for (var i = 0; i < item.login.uris.length; i++) {
-      var uObj = item.login.uris[i]
-      var raw = (typeof uObj === "string") ? uObj : (uObj && uObj.uri ? uObj.uri : "")
-      if (!raw) continue
-      var rawTrimmed = String(raw).trim()
-      if (!rawTrimmed) continue
-
-      var isApp = isAppScheme(rawTrimmed)
-      var formatted = formatSchemeHost(rawTrimmed)
-
-      var entry = {
-        isApp: isApp,
-        label: isApp ? "App Scheme" : "Website",
-        displayUri: formatted,
-        rawUri: rawTrimmed,
-        targetUri: rawTrimmed
-      }
-
-      if (isApp) {
-        appList.push(entry)
-      } else {
-        webList.push(entry)
-      }
-    }
-
-    var resultWeb = []
-    var seenWeb = {}
-    for (var w = 0; w < webList.length; w++) {
-      var keyW = webList[w].displayUri
-      if (!seenWeb[keyW]) {
-        seenWeb[keyW] = true
-        resultWeb.push(webList[w])
-      }
-    }
-
-    var resultApp = []
-    var seenApp = {}
-    for (var a = 0; a < appList.length; a++) {
-      var keyA = appList[a].displayUri
-      if (!seenApp[keyA]) {
-        seenApp[keyA] = true
-        resultApp.push(appList[a])
-      }
-    }
-
-    return resultWeb.concat(resultApp)
+    Qt.openUrlExternally(url)
+    return true
   }
 
   function openFirstWebsite(item) {
     if (!item) return
-    var processed = root.getProcessedUris(item)
-    if (!processed || processed.length === 0) return
-    var targetEntry = null
-    for (var i = 0; i < processed.length; i++) {
-      if (!processed[i].isApp) {
-        targetEntry = processed[i]
-        break
-      }
-    }
-    if (!targetEntry && processed.length > 0) {
-      targetEntry = processed[0]
-    }
-    if (targetEntry && targetEntry.targetUri) {
-      var openUrl = targetEntry.targetUri
-      if (!targetEntry.isApp && !openUrl.match(/^https?:\/\//i)) {
-        openUrl = "https://" + openUrl
-      }
-      Qt.openUrlExternally(openUrl)
-    }
+    var url = UriPolicy.firstOpenableUrl(item)
+    if (url) root.openUri(url)
+    else root.statusMessage = root.strings.t("status.no_openable_uri", "This item has no http or https link to open.")
   }
 
-  function getAvailableActions(item) {
+  function openPasswordHistory(item) {
+    if (!SecretFieldCatalog.isPresent(item, SecretFieldCatalog.PASSWORD_HISTORY)) {
+      root.statusMessage = root.strings.t("status.no_password_history", "No password history is recorded for this item.")
+      return
+    }
+    root.activePasswordHistoryItem = item
+    root.showPasswordHistoryModal = true
+    secretRelease.reveal(SecretFieldCatalog.PASSWORD_HISTORY)
+  }
+
+  function paletteAction(label, icon, shortcut, run) {
+    return { label: label, icon: icon, shortcut: shortcut, action: run }
+  }
+
+  // Copies of public values: entries without a value are left out.
+  function publicCopyActions(entries) {
+    return entries.filter(function(entry) { return Boolean(entry.value) }).map(function(entry) {
+      return root.paletteAction(entry.label, entry.icon, entry.shortcut || "", function() {
+        root.copyToClipboard(String(entry.value), false, entry.copyLabel)
+      })
+    })
+  }
+
+  // Copies of secrets through copy-field: entries whose flag is false are
+  // left out, and no label carries a secret value.
+  function secretCopyActions(item, entries) {
+    return entries.filter(function(entry) { return SecretFieldCatalog.isPresent(item, entry.field) }).map(function(entry) {
+      return root.paletteAction(entry.label, entry.icon, entry.shortcut || "", function() {
+        root.copySecretField(item, entry.field, entry.copyLabel)
+      })
+    })
+  }
+
+  function uriActions(item) {
+    var assignedShortcut = false
+    return UriPolicy.itemUris(item).map(function(entry) {
+      if (!entry.isOpenable) {
+        return root.paletteAction("Copy URI (" + entry.uri + ")", "\uf0c5", "", function() { root.copyToClipboard(entry.uri, false, "URI") })
+      }
+      var shortcut = assignedShortcut ? "" : "Ctrl+O"
+      assignedShortcut = true
+      return root.paletteAction("Open Website (" + entry.uri + ")", "\uf08e", shortcut, function() { root.openUri(entry.uri) })
+    })
+  }
+
+  function passwordHistoryActions(item) {
+    if (!SecretFieldCatalog.isPresent(item, SecretFieldCatalog.PASSWORD_HISTORY)) return []
+    var count = Number(item.login.password_history_count) || 0
+    return [root.paletteAction("Password History (" + count + ")", "\uf1da", "Ctrl+H", function() { root.openPasswordHistory(item) })]
+  }
+
+  function loginActions(item) {
+    var login = item.login || {}
+    return root.secretCopyActions(item, [
+      { label: "Copy Password", icon: "\uf023", shortcut: "↵", field: SecretFieldCatalog.LOGIN_PASSWORD, copyLabel: "password" }
+    ]).concat(root.publicCopyActions([
+      { label: "Copy Username (" + login.username + ")", icon: "\uf007", shortcut: "Ctrl+U", value: login.username, copyLabel: "username" }
+    ])).concat(root.secretCopyActions(item, [
+      { label: "Copy TOTP Code", icon: "\uf017", shortcut: "Ctrl+↵", field: SecretFieldCatalog.LOGIN_TOTP, copyLabel: "TOTP code" }
+    ])).concat(root.uriActions(item)).concat(root.passwordHistoryActions(item))
+  }
+
+  function cardActions(item) {
+    var card = item.card || {}
+    var expiry = (card.expMonth && card.expYear) ? (card.expMonth + "/" + card.expYear) : ""
+    return root.secretCopyActions(item, [
+      { label: "Copy Card Number", icon: "\uf09d", shortcut: "↵", field: SecretFieldCatalog.CARD_NUMBER, copyLabel: "card number" },
+      { label: "Copy Security Code (CVV)", icon: "\uf292", field: SecretFieldCatalog.CARD_CODE, copyLabel: "security code" }
+    ]).concat(root.publicCopyActions([
+      { label: "Copy Cardholder Name", icon: "\uf007", value: card.cardholderName, copyLabel: "cardholder" },
+      { label: "Copy Expiration (" + expiry + ")", icon: "\uf073", value: expiry, copyLabel: "expiration" }
+    ]))
+  }
+
+  function identityActions(item) {
+    var identity = item.identity || {}
+    var fullName = ((identity.firstName || "") + " " + (identity.lastName || "")).trim()
+    var address = [identity.address1, identity.city, identity.state, identity.postalCode, identity.country].filter(Boolean).join(", ")
+    return root.publicCopyActions([
+      { label: "Copy Full Name (" + fullName + ")", icon: "\uf007", value: fullName, copyLabel: "full name" },
+      { label: "Copy Username (" + identity.username + ")", icon: "\uf02b", shortcut: "Ctrl+U", value: identity.username, copyLabel: "username" },
+      { label: "Copy Email (" + identity.email + ")", icon: "\uf0e0", shortcut: "↵", value: identity.email, copyLabel: "email" },
+      { label: "Copy Phone (" + identity.phone + ")", icon: "\uf095", value: identity.phone, copyLabel: "phone" },
+      { label: "Copy Company (" + identity.company + ")", icon: "\uf1ad", value: identity.company, copyLabel: "company" },
+      { label: "Copy Address (" + address + ")", icon: "\uf041", value: address, copyLabel: "address" }
+    ]).concat(root.secretCopyActions(item, [
+      { label: "Copy SSN", icon: "\uf292", field: SecretFieldCatalog.IDENTITY_SSN, copyLabel: "social security number" },
+      { label: "Copy Passport Number", icon: "\uf2c2", field: SecretFieldCatalog.IDENTITY_PASSPORT_NUMBER, copyLabel: "passport number" },
+      { label: "Copy Driver License", icon: "\uf2c2", field: SecretFieldCatalog.IDENTITY_LICENSE_NUMBER, copyLabel: "license number" }
+    ]))
+  }
+
+  function customFieldActions(item) {
+    return SecretFieldCatalog.customFieldsWithValue(item).map(function(field) {
+      var name = field.name ? String(field.name) : "field value"
+      var icon = SecretFieldCatalog.isHiddenCustomField(field) ? "\uf292" : "\uf02b"
+      return root.paletteAction("Copy " + name, icon, "", function() {
+        root.copySecretField(item, SecretFieldCatalog.customFieldIdentifier(field.index), name)
+      })
+    })
+  }
+
+  function typeSpecificActions(item) {
+    var builders = { "login": root.loginActions, "card": root.cardActions, "identity": root.identityActions }
+    var builder = builders[item.type_name]
+    return builder ? builder(item) : []
+  }
+
+  function itemDetailActions(item) {
+    return root.secretCopyActions(item, [
+      { label: "Copy Notes", icon: "\uf0f6", field: SecretFieldCatalog.NOTES, copyLabel: "notes" }
+    ]).concat(root.customFieldActions(item)).concat(root.publicCopyActions([
+      { label: "Copy Folder (" + item.folder_name + ")", icon: "\uf07b", value: item.folder_name, copyLabel: "folder name" },
+      { label: "Copy Organization (" + item.organization_name + ")", icon: "\uf1ad", value: item.organization_name, copyLabel: "organization name" }
+    ])).concat([
+      root.paletteAction("Toggle Field Visibility", "\uf06e", "Ctrl+T", function() { root.toggleItemRevealed() }),
+      root.paletteAction("Copy Item Name (" + item.name + ")", "\uf0c5", "", function() { root.copyToClipboard(item.name, false, "item name") })
+    ])
+  }
+
+  function itemScopeActions(item) {
     var actions = []
-    if (!item) {
-      actions.push({ label: "Generate Password", icon: "\uf084", shortcut: "Ctrl+G", action: function() { root.openPasswordGeneratorModal("password") } })
-      actions.push({ label: "Generate Passphrase", icon: "\uf02d", shortcut: "", action: function() { root.openPasswordGeneratorModal("passphrase") } })
-      actions.push({ label: "Generate SSH Key", icon: "\uf067", shortcut: "", action: function() { root.openSshKeyModal("create", null) } })
-      actions.push({ label: "Import SSH Key", icon: "\uf019", shortcut: "", action: function() { root.openSshKeyModal("import", null) } })
-      actions.push({ label: "Sync Vault Now", icon: "\uf021", shortcut: "Ctrl+R", action: function() { root.syncVault(false, true) } })
-      actions.push({ label: "Lock Vault", icon: "\uf023", shortcut: "Ctrl+L", action: function() { root.doLock() } })
-
-      var vScopesNull = root.getAvailableVaultScopes()
-      for (var vsn = 0; vsn < vScopesNull.length; vsn++) {
-        var vItemNull = vScopesNull[vsn]
-        if (vItemNull.id !== root.activeVaultScope) {
-          (function(s) {
-            actions.push({
-              label: "Filter Vault: " + s.name,
-              icon: s.icon,
-              shortcut: (s.id === "all") ? "Alt+V" : "",
-              action: function() { root.activeVaultScope = s.id }
-            })
-          })(vItemNull)
-        }
-      }
-
-      var fScopesNull = root.getAvailableFolderScopes()
-      for (var fsn = 0; fsn < fScopesNull.length; fsn++) {
-        var fItemNull = fScopesNull[fsn]
-        if (fItemNull.id !== root.activeFolderScope) {
-          (function(f) {
-            actions.push({
-              label: "Filter Folder: " + f.name,
-              icon: f.icon,
-              shortcut: (f.id === "all") ? "Alt+F" : "",
-              action: function() { root.activeFolderScope = f.id }
-            })
-          })(fItemNull)
-        }
-      }
-
-      if (root.activeVaultScope !== "all" || root.activeFolderScope !== "all") {
-        actions.push({
-          label: "Clear Scope Filters",
-          icon: "\uf00d",
-          shortcut: "Esc",
-          action: function() {
-            root.activeVaultScope = "all"
-            root.activeFolderScope = "all"
-          }
-        })
-      }
-
-      return actions
-    }
-
-    if (item.type_name === "login" && item.login) {
-      if (item.login.password) {
-        actions.push({ label: "Copy Password", icon: "\uf023", shortcut: "↵", action: function() { root.copyToClipboard(item.login.password, true, "password") } })
-      }
-      if (item.login.username) {
-        actions.push({ label: "Copy Username (" + item.login.username + ")", icon: "\uf007", shortcut: "Ctrl+U", action: function() { root.copyToClipboard(item.login.username, false, "username") } })
-      }
-      if ((item.login.totp || item.login.has_totp) || (root.currentTotp && root.currentTotp.code)) {
-        var totpLabel = "Copy TOTP Code" + ((root.currentTotp && root.currentTotp.code) ? (" (" + root.currentTotp.code + ")") : "")
-        actions.push({
-          label: totpLabel,
-          icon: "\uf017",
-          shortcut: "Ctrl+↵",
-          action: function() {
-            if (root.currentTotp && root.currentTotp.code) {
-              root.copyToClipboard(root.currentTotp.code, true, "TOTP code")
-            }
-          }
-        })
-      }
-      var processedUris = root.getProcessedUris(item)
-      if (processedUris && processedUris.length > 0) {
-        var hasAssignedUrlShortcut = false
-        for (var u = 0; u < processedUris.length; u++) {
-          var uriEntry = processedUris[u]
-          if (uriEntry && uriEntry.targetUri) {
-            (function(entry, isFirstUri) {
-              var actionLabel = (entry.isApp ? "Open App Scheme (" : "Open Website (") + entry.displayUri + ")"
-              actions.push({
-                label: actionLabel,
-                icon: "\uf08e",
-                shortcut: isFirstUri ? "Ctrl+O" : "",
-                action: function() {
-                  var openUrl = entry.targetUri
-                  if (!entry.isApp && !openUrl.match(/^https?:\/\//i)) openUrl = "https://" + openUrl
-                  Qt.openUrlExternally(openUrl)
-                }
-              })
-            })(uriEntry, !hasAssignedUrlShortcut)
-            hasAssignedUrlShortcut = true
-          }
-        }
-      }
-      if (item.login.password_history && item.login.password_history.length > 0) {
-        actions.push({
-          label: "Password History (" + item.login.password_history.length + ")",
-          icon: "\uf1da",
-          shortcut: "Ctrl+H",
-          action: function() {
-            root.activePasswordHistoryItem = item
-            root.showPasswordHistoryModal = true
-          }
-        })
-      }
-    } else if (item.type_name === "card" && item.card) {
-      if (item.card.number) actions.push({ label: "Copy Card Number", icon: "\uf09d", shortcut: "↵", action: function() { root.copyToClipboard(CardFormatter.sanitizeCardNumberForCopy(item.card.number), true, "card number") } })
-      if (item.card.code) actions.push({ label: "Copy Security Code (CVV)", icon: "\uf292", shortcut: "", action: function() { root.copyToClipboard(item.card.code, true, "CVV") } })
-      if (item.card.cardholderName) actions.push({ label: "Copy Cardholder Name", icon: "\uf007", shortcut: "", action: function() { root.copyToClipboard(item.card.cardholderName, false, "cardholder") } })
-      if (item.card.expMonth && item.card.expYear) {
-        var expStr = item.card.expMonth + "/" + item.card.expYear
-        actions.push({ label: "Copy Expiration (" + expStr + ")", icon: "\uf073", shortcut: "", action: function() { root.copyToClipboard(expStr, false, "expiration") } })
-      }
-    } else if (item.type_name === "ssh_key" && item.ssh_key) {
-      if (item.ssh_key.private_key) actions.push({ label: "Copy Private Key", icon: "\uf084", shortcut: "↵", action: function() { root.copyToClipboard(item.ssh_key.private_key, true, "SSH private key") } })
-      if (item.ssh_key.public_key) actions.push({ label: "Copy Public Key", icon: "\uf084", shortcut: "Ctrl+U", action: function() { root.copyToClipboard(item.ssh_key.public_key, false, "SSH public key") } })
-      if (item.ssh_key.fingerprint) actions.push({ label: "Copy Fingerprint", icon: "\uf084", shortcut: "", action: function() { root.copyToClipboard(item.ssh_key.fingerprint, false, "fingerprint") } })
-      if (item.ssh_key.passphrase) actions.push({ label: "Copy Passphrase", icon: "\uf023", shortcut: "", action: function() { root.copyToClipboard(item.ssh_key.passphrase, true, "passphrase") } })
-      actions.push({
-        label: "Export to ~/.ssh",
-        icon: "\uf093",
-        shortcut: "Ctrl+E",
-        action: function() {
-          root.openSshKeyModal("export", item)
-        }
-      })
-    } else if (item.type_name === "identity" && item.identity) {
-      var idFullName = ((item.identity.firstName || "") + " " + (item.identity.lastName || "")).trim()
-      if (idFullName) actions.push({ label: "Copy Full Name (" + idFullName + ")", icon: "\uf007", shortcut: "", action: function() { root.copyToClipboard(idFullName, false, "full name") } })
-      if (item.identity.username) actions.push({ label: "Copy Username (" + item.identity.username + ")", icon: "\uf02b", shortcut: "Ctrl+U", action: function() { root.copyToClipboard(item.identity.username, false, "username") } })
-      if (item.identity.email) actions.push({ label: "Copy Email (" + item.identity.email + ")", icon: "\uf0e0", shortcut: "↵", action: function() { root.copyToClipboard(item.identity.email, false, "email") } })
-      if (item.identity.phone) actions.push({ label: "Copy Phone (" + item.identity.phone + ")", icon: "\uf095", shortcut: "", action: function() { root.copyToClipboard(item.identity.phone, false, "phone") } })
-      if (item.identity.company) actions.push({ label: "Copy Company (" + item.identity.company + ")", icon: "\uf1ad", shortcut: "", action: function() { root.copyToClipboard(item.identity.company, false, "company") } })
-      var addrStr = [item.identity.address1, item.identity.city, item.identity.state, item.identity.postalCode, item.identity.country].filter(Boolean).join(", ")
-      if (addrStr) actions.push({ label: "Copy Address (" + addrStr + ")", icon: "\uf041", shortcut: "", action: function() { root.copyToClipboard(addrStr, false, "address") } })
-      if (item.identity.ssn) actions.push({ label: "Copy SSN", icon: "\uf292", shortcut: "", action: function() { root.copyToClipboard(item.identity.ssn, true, "SSN") } })
-      if (item.identity.passportNumber) actions.push({ label: "Copy Passport Number", icon: "\uf2c2", shortcut: "", action: function() { root.copyToClipboard(item.identity.passportNumber, true, "passport") } })
-      if (item.identity.licenseNumber) actions.push({ label: "Copy Driver License", icon: "\uf2c2", shortcut: "", action: function() { root.copyToClipboard(item.identity.licenseNumber, true, "driver license") } })
-    }
-
-    if (item.notes) {
-      actions.push({ label: "Copy Notes", icon: "\uf0f6", shortcut: "", action: function() { root.copyToClipboard(item.notes, false, "notes") } })
-    }
-
-    if (item.fields) {
-      for (var f = 0; f < item.fields.length; f++) {
-        var field = item.fields[f]
-        if (field.name && field.value) {
-          var fLower = field.name.toLowerCase()
-          if (fLower === "pin" || fLower.indexOf("pin") !== -1) {
-            (function(pinVal) {
-              actions.push({
-                label: "Copy PIN",
-                icon: "\uf292",
-                shortcut: "",
-                action: function() { root.copyToClipboard(String(pinVal), true, "PIN") }
-              })
-            })(field.value)
-          } else {
-            (function(fld) {
-              actions.push({
-                label: "Copy " + fld.name,
-                icon: "\uf02b",
-                shortcut: "",
-                action: function() { root.copyToClipboard(String(fld.value), true, fld.name) }
-              })
-            })(field)
-          }
-        }
-      }
-    }
-
-    if (item.attachments && item.attachments.length > 0) {
-      for (var a = 0; a < item.attachments.length; a++) {
-        var att = item.attachments[a]
-        if (att && att.fileName) {
-          (function(currAtt) {
-            if (root.isAttachmentPreviewable(currAtt.fileName)) {
-              actions.push({
-                label: "View Attachment: " + currAtt.fileName,
-                icon: "\uf06e",
-                shortcut: "",
-                action: function() { root.viewAttachment(item, currAtt) }
-              })
-            }
-            actions.push({
-              label: "Download Attachment: " + currAtt.fileName,
-              icon: "\uf019",
-              shortcut: "",
-              action: function() { root.downloadAttachment(item, currAtt) }
-            })
-          })(att)
-        }
-      }
-    }
-
-    if (item.folder_name) {
-      actions.push({
-        label: "Copy Folder (" + item.folder_name + ")",
-        icon: "\uf07b",
-        shortcut: "",
-        action: function() { root.copyToClipboard(item.folder_name, false, "folder name") }
-      })
-    }
-
-    if (item.organization_name) {
-      actions.push({
-        label: "Copy Organization (" + item.organization_name + ")",
-        icon: "\uf1ad",
-        shortcut: "",
-        action: function() { root.copyToClipboard(item.organization_name, false, "organization name") }
-      })
-    }
-
-    actions.push({ label: "Toggle Field Visibility", icon: "\uf06e", shortcut: "Ctrl+T", action: function() { root.toggleItemRevealed() } })
-    actions.push({ label: "Copy Item Name (" + item.name + ")", icon: "\uf0c5", shortcut: "", action: function() { root.copyToClipboard(item.name, false, "item name") } })
-
-    // Scope filters in Action Palette
     if (item.organization_id && root.activeVaultScope !== item.organization_id) {
-      actions.push({
-        label: "Filter by this Vault (" + (item.organization_name || "Organization") + ")",
-        icon: "\uf1ad",
-        shortcut: "",
-        action: function() { root.activeVaultScope = item.organization_id }
-      })
+      actions.push(root.paletteAction("Filter by this Vault (" + (item.organization_name || "Organization") + ")", "\uf1ad", "", function() { root.activeVaultScope = item.organization_id }))
     }
     if (item.folder_id && root.activeFolderScope !== item.folder_id) {
-      actions.push({
-        label: "Filter by this Folder (" + (item.folder_name || "Folder") + ")",
-        icon: "\uf07b",
-        shortcut: "",
-        action: function() { root.activeFolderScope = item.folder_id }
-      })
+      actions.push(root.paletteAction("Filter by this Folder (" + (item.folder_name || "Folder") + ")", "\uf07b", "", function() { root.activeFolderScope = item.folder_id }))
     }
-
-    var vScopes = root.getAvailableVaultScopes()
-    for (var vs = 0; vs < vScopes.length; vs++) {
-      var vItem = vScopes[vs]
-      if (vItem.id !== root.activeVaultScope && (!item.organization_id || vItem.id !== item.organization_id)) {
-        (function(s) {
-          actions.push({
-            label: "Filter Vault: " + s.name,
-            icon: s.icon,
-            shortcut: (s.id === "all") ? "Alt+V" : "",
-            action: function() { root.activeVaultScope = s.id }
-          })
-        })(vItem)
-      }
-    }
-
-    var fScopes = root.getAvailableFolderScopes()
-    for (var fs = 0; fs < fScopes.length; fs++) {
-      var fItem = fScopes[fs]
-      if (fItem.id !== root.activeFolderScope && (!item.folder_id || fItem.id !== item.folder_id)) {
-        (function(f) {
-          actions.push({
-            label: "Filter Folder: " + f.name,
-            icon: f.icon,
-            shortcut: (f.id === "all") ? "Alt+F" : "",
-            action: function() { root.activeFolderScope = f.id }
-          })
-        })(fItem)
-      }
-    }
-
-    if (root.activeVaultScope !== "all" || root.activeFolderScope !== "all") {
-      actions.push({
-        label: "Clear Scope Filters",
-        icon: "\uf00d",
-        shortcut: "Esc",
-        action: function() {
-          root.activeVaultScope = "all"
-          root.activeFolderScope = "all"
-        }
-      })
-    }
-
-    actions.push({ label: "Generate Password", icon: "\uf084", shortcut: "Ctrl+G", action: function() { root.openPasswordGeneratorModal("password") } })
-    actions.push({ label: "Generate Passphrase", icon: "\uf02d", shortcut: "", action: function() { root.openPasswordGeneratorModal("passphrase") } })
-    actions.push({ label: "Generate SSH Key", icon: "\uf067", shortcut: "", action: function() { root.openSshKeyModal("create", null) } })
-    actions.push({ label: "Import SSH Key", icon: "\uf019", shortcut: "", action: function() { root.openSshKeyModal("import", null) } })
-    actions.push({ label: "Sync Vault Now", icon: "\uf021", shortcut: "Ctrl+R", action: function() { root.syncVault(false, true) } })
-    actions.push({ label: "Lock Vault", icon: "\uf023", shortcut: "Ctrl+L", action: function() { root.doLock() } })
-
     return actions
   }
 
-  function viewAttachment(item, att) {
-    if (!item || !att) return
-    root.logInfo("omarchy:attachment", "Requesting preview for " + (att.fileName || "attachment"))
-    root.loadingAttachmentId = (att.id || att.fileName || "loading")
-    attachmentProc.activeAttachmentId = att.id || ""
-    attachmentProc.activeItemId = item.id || ""
-    attachmentProc.command = [
-      root.helperPath,
-      "attachment",
-      "download",
-      "--item-id", item.id,
-      "--attachment-id", att.id,
-      "--filename", att.fileName || "attachment",
-      "--preview"
+  function vaultScopeActions(excludedScope) {
+    return root.getAvailableVaultScopes().filter(function(scope) {
+      return scope.id !== root.activeVaultScope && !(excludedScope && scope.id === excludedScope)
+    }).map(function(scope) {
+      return root.paletteAction("Filter Vault: " + scope.name, scope.icon, scope.id === "all" ? "Alt+V" : "", function() { root.activeVaultScope = scope.id })
+    })
+  }
+
+  function folderScopeActions(excludedScope) {
+    return root.getAvailableFolderScopes().filter(function(scope) {
+      return scope.id !== root.activeFolderScope && !(excludedScope && scope.id === excludedScope)
+    }).map(function(scope) {
+      return root.paletteAction("Filter Folder: " + scope.name, scope.icon, scope.id === "all" ? "Alt+F" : "", function() { root.activeFolderScope = scope.id })
+    })
+  }
+
+  function clearScopeActions() {
+    if (root.activeVaultScope === "all" && root.activeFolderScope === "all") return []
+    return [root.paletteAction("Clear Scope Filters", "\uf00d", "Esc", function() {
+      root.activeVaultScope = "all"
+      root.activeFolderScope = "all"
+    })]
+  }
+
+  function scopeFilterActions(item) {
+    var excludedVault = item ? item.organization_id : ""
+    var excludedFolder = item ? item.folder_id : ""
+    return root.vaultScopeActions(excludedVault).concat(root.folderScopeActions(excludedFolder)).concat(root.clearScopeActions())
+  }
+
+  function generalActions() {
+    return [
+      root.paletteAction("Generate Password", "\uf084", "Ctrl+G", function() { root.openPasswordGeneratorModal("password") }),
+      root.paletteAction("Generate Passphrase", "\uf02d", "", function() { root.openPasswordGeneratorModal("passphrase") }),
+      root.paletteAction("Sync Vault Now", "\uf021", "Ctrl+R", function() { root.syncVault(false, true) }),
+      root.paletteAction("Lock Vault", "\uf023", "Ctrl+L", function() { root.doLock() })
     ]
-    attachmentProc.running = true
   }
 
-  function downloadAttachment(item, att) {
-    if (!item || !att) return
-    root.logInfo("omarchy:attachment", "Requesting download for " + (att.fileName || "attachment"))
-    root.statusMessage = "Downloading attachment " + (att.fileName || "") + "..."
-    var cmd = [
-      root.helperPath,
-      "attachment",
-      "download",
-      "--item-id", item.id,
-      "--attachment-id", att.id,
-      "--filename", att.fileName || "attachment"
-    ]
-    if (root.config && root.config.download_dir) {
-      cmd.push("--output-dir", root.config.download_dir)
-    }
-    attachmentProc.command = cmd
-    attachmentProc.running = true
-  }
-
-  function openSshKeyModal(mode, item) {
-    root.sshKeyModalMode = mode || "create"
-    root.sshKeyModalItem = item || null
-    root.showSshKeyModal = true
-  }
-
-  function handleSshKeyCreate(payload) {
-    if (!payload || !payload.name) return
-    root.isBusy = true
-    if (sshKeyModalComponent) sshKeyModalComponent.isBusy = true
-    var cmd = [root.helperPath, "ssh-key", "create", "--name", payload.name, "--algorithm", payload.algorithm || "ed25519"]
-    if (payload.comment) {
-      cmd.push("--comment", payload.comment)
-    }
-    if (payload.notes) {
-      cmd.push("--notes", payload.notes)
-    }
-    if (payload.exportToLocal && payload.outDir) {
-      cmd.push("--out-dir", payload.outDir)
-    }
-    sshKeyActionProc.actionType = "create"
-    sshKeyActionProc.actionName = payload.name
-    sshKeyActionProc.command = cmd
-    sshKeyActionProc.running = true
-  }
-
-  function handleSshKeyImport(payload) {
-    if (!payload || !payload.name || !payload.privateKeyPath) return
-    root.isBusy = true
-    if (sshKeyModalComponent) sshKeyModalComponent.isBusy = true
-    var cmd = [root.helperPath, "ssh-key", "import", "--name", payload.name, "--private-key", payload.privateKeyPath]
-    if (payload.publicKeyPath) {
-      cmd.push("--public-key", payload.publicKeyPath)
-    }
-    if (payload.notes) {
-      cmd.push("--notes", payload.notes)
-    }
-    sshKeyActionProc.actionType = "import"
-    sshKeyActionProc.actionName = payload.name
-    sshKeyActionProc.command = cmd
-    sshKeyActionProc.running = true
-  }
-
-  function handleSshKeyExport(payload) {
-    if (!payload || !payload.item) return
-    root.isBusy = true
-    if (sshKeyModalComponent) sshKeyModalComponent.isBusy = true
-    var cmd = [root.helperPath, "ssh-key", "export", payload.item.id || payload.item.name]
-    if (payload.outDir) {
-      cmd.push("--out-dir", payload.outDir)
-    }
-    if (payload.privateKeyFile) {
-      cmd.push("--private-key-file", payload.privateKeyFile)
-    }
-    if (payload.publicKeyFile) {
-      cmd.push("--public-key-file", payload.publicKeyFile)
-    }
-    sshKeyActionProc.actionType = "export"
-    sshKeyActionProc.actionName = payload.item.name
-    sshKeyActionProc.command = cmd
-    sshKeyActionProc.running = true
+  function getAvailableActions(item) {
+    if (!item) return root.generalActions().concat(root.scopeFilterActions(null))
+    return root.typeSpecificActions(item)
+      .concat(root.itemDetailActions(item))
+      .concat(root.itemScopeActions(item))
+      .concat(root.scopeFilterActions(item))
+      .concat(root.generalActions())
   }
 
   function saveSettings(settings) {
@@ -1722,16 +1194,10 @@ Item {
     if (settings.identity_url !== undefined) cmd.push("--identity-url", settings.identity_url)
     if (settings.client_cert_path !== undefined) cmd.push("--client-cert", settings.client_cert_path)
     if (settings.client_key_path !== undefined) cmd.push("--client-key", settings.client_key_path)
-    if (settings.download_dir !== undefined) cmd.push("--download-dir", settings.download_dir)
     if (settings.auto_lock_minutes !== undefined) cmd.push("--auto-lock", String(settings.auto_lock_minutes))
     if (settings.clipboard_clear_seconds !== undefined) cmd.push("--clipboard-clear", String(settings.clipboard_clear_seconds))
     if (settings.log_level !== undefined) cmd.push("--log-level", settings.log_level)
-    if (settings.show_website_icons !== undefined) cmd.push("--show-website-icons", String(settings.show_website_icons))
-    if (settings.check_updates !== undefined) cmd.push("--check-updates", String(settings.check_updates))
     if (settings.remember_last_search !== undefined) cmd.push("--remember-last-search", String(settings.remember_last_search))
-    if (settings.max_attachment_size_mb !== undefined) cmd.push("--max-attachment-size", String(settings.max_attachment_size_mb))
-    if (settings.ssh_agent_enabled !== undefined) cmd.push("--ssh-agent", String(settings.ssh_agent_enabled))
-    if (settings.ssh_agent_confirm !== undefined) cmd.push("--ssh-agent-confirm", settings.ssh_agent_confirm)
     if (settings.quick_unlock !== undefined) cmd.push("--quick-unlock", String(settings.quick_unlock))
 
     configSetProc.command = cmd
@@ -1746,7 +1212,6 @@ Item {
     var rawIdUrl = (root.config && root.config.identity_url) ? root.config.identity_url : ""
     var idUrl = rawIdUrl ? root.sanitizeServerUrl(rawIdUrl) : "Auto"
     var lLevel = (root.config && root.config.log_level) ? root.config.log_level : "error"
-    var maxAttMb = (root.config && root.config.max_attachment_size_mb) ? root.config.max_attachment_size_mb : 500
     var vStatus = (root.authState ? root.authState.status : "unknown")
 
     var report = "### Omarchy Bitwarden Diagnostics Report\n\n"
@@ -1757,7 +1222,6 @@ Item {
     var hasCert = Boolean(root.config && root.config.client_cert_path)
     report += "- **mTLS Configured**: " + (hasCert ? "Yes" : "No") + "\n"
     report += "- **Configured Log Level**: " + lLevel + "\n"
-    report += "- **Max Attachment Size**: " + maxAttMb + " MB\n"
     report += "- **Vault Status**: " + vStatus + "\n"
     report += "- **Engine Ready**: " + (root.cliHealth && root.cliHealth.installed ? "Yes" : "No") + "\n"
     var engineSourceStr = root.engineSource ? root.engineSource.toUpperCase() : "AUR"
@@ -1808,8 +1272,8 @@ Item {
     authUnlockProc.running = true
   }
 
-  function doLock() {
-    root.logInfo("omarchy:auth", "Locking vault...")
+  // Drops all vault state and shows the unlock view (the session is kept).
+  function markVaultLocked() {
     root.clearSensitiveState()
     root.authState = ({
       status: "locked",
@@ -1817,6 +1281,32 @@ Item {
       user_email: (root.authState && root.authState.user_email) || "",
       has_session: Boolean(root.authState && root.authState.has_session)
     })
+    root.currentView = "auto"
+  }
+
+  // A refused release. release_limit_exceeded and vault_locked mean the
+  // daemon is locked now, so the overlay returns to the unlock view.
+  function handleReleaseRefusal(errorCode, message) {
+    root.errorMessage = message
+    root.logWarn("omarchy:secrets", "Secret release refused (" + (errorCode || "no error code") + ")")
+    if (!SecretFieldCatalog.errorLocksVault(errorCode)) return
+    root.markVaultLocked()
+    root.refreshAuthStatus()
+  }
+
+  function confirmSecretCopy(label, clearSeconds) {
+    var seconds = clearSeconds > 0 ? clearSeconds : root.clipboardClearSeconds()
+    root.statusMessage = root.strings.t("status.secret_copied", "Copied %1 to the clipboard (clears in %2 s).").arg(label).arg(seconds)
+  }
+
+  function clipboardClearSeconds() {
+    var configured = root.config ? Number(root.config.clipboard_clear_seconds) : 0
+    return configured > 0 ? configured : root.defaultClipboardClearSeconds
+  }
+
+  function doLock() {
+    root.logInfo("omarchy:auth", "Locking vault...")
+    root.markVaultLocked()
     root.isBusy = true
     root.statusMessage = "Locking vault..."
     authLockProc.command = [root.helperPath, "auth", "lock"]
@@ -1940,24 +1430,159 @@ Item {
   }
 
   Timer {
-    interval: 1000
-    running: Boolean(root.opened && root.effectiveView === "search" && root.selectedItem && root.selectedItem.login && (root.selectedItem.login.totp || root.selectedItem.login.has_totp))
-    repeat: true
-    onTriggered: {
-      if (root.currentTotp && root.currentTotp.code && root.currentTotp.ttl > 1) {
-        root.currentTotp = ({ code: root.currentTotp.code, ttl: root.currentTotp.ttl - 1, period: root.currentTotp.period })
-      } else if (!totpGenProc.running) {
-        root.updateTotpForSelected()
-      }
-    }
-  }
-
-  Timer {
     id: lockSyncTimer
     interval: 3000
     running: Boolean(root.opened && root.authState && root.authState.status === "unlocked")
     repeat: true
     onTriggered: root.refreshAuthStatus()
+  }
+
+  // ---- Keyboard dispatch (the Shortcut elements above cover most chords
+  // while the search field has focus; this handles the rest) ----
+
+  function isSearchReady() {
+    return root.effectiveView === "search" && !root.hasActiveModal
+  }
+
+  function isSelectionReady() {
+    return root.isSearchReady() && root.selectedItem !== null
+  }
+
+  function canSyncNow() {
+    var status = root.authState ? root.authState.status : ""
+    var hasSession = Boolean(root.authState && root.authState.has_session)
+    return (status === "unlocked" || (status === "locked" && hasSession)) && !root.isBusy && !root.hasActiveModal
+  }
+
+  function isUnlockedWithoutModal() {
+    return Boolean(root.authState && root.authState.status === "unlocked") && !root.hasActiveModal
+  }
+
+  function isRevealShortcut(event) {
+    var isLetterT = event.key === Qt.Key_T || (Boolean(event.text) && event.text.toLowerCase() === "t")
+    return Boolean(event.modifiers & Qt.ControlModifier) && isLetterT
+  }
+
+  function openActionPalette() {
+    root.actionPaletteIndex = 0
+    root.showActionPalette = true
+  }
+
+  function toggleSettingsView() {
+    root.currentView = (root.effectiveView === "settings") ? "auto" : "settings"
+  }
+
+  // Esc outside modals: leave settings, close a scope dropdown, clear the
+  // query, clear the scope filters, then hide the overlay.
+  function handleEscape() {
+    if (root.effectiveView === "settings") {
+      root.currentView = "auto"
+    } else if (searchHeader && (searchHeader.isVaultScopeOpen || searchHeader.isFolderScopeOpen)) {
+      searchHeader.closeScopeDropdowns()
+    } else if (root.searchQuery && root.searchQuery.length > 0) {
+      root.searchQuery = ""
+      if (searchHeader) searchHeader.clearSearchRequested()
+    } else if (root.activeVaultScope !== "all" || root.activeFolderScope !== "all") {
+      root.activeVaultScope = "all"
+      root.activeFolderScope = "all"
+    } else {
+      root.dismiss()
+    }
+    return true
+  }
+
+  // Modals take only Esc here; every other key is left to them.
+  function handleModalKey(event) {
+    if (event.key !== Qt.Key_Escape) return false
+    if (root.showActionPalette) root.showActionPalette = false
+    else if (root.showPasswordHistoryModal) root.showPasswordHistoryModal = false
+    else root.showPasswordGeneratorModal = false
+    return true
+  }
+
+  function handleScopeKey(event) {
+    var openers = {}
+    openers[Qt.Key_V] = function() { searchHeader.openVaultScope() }
+    openers[Qt.Key_F] = function() { searchHeader.openFolderScope() }
+    var opener = openers[event.key]
+    if (!opener || !searchHeader || !root.isSearchReady()) return false
+    opener()
+    return true
+  }
+
+  // Enter copies the primary secret, Ctrl+Enter the TOTP code. A held key
+  // repeats; only the first press copies, so auto-repeat cannot drain the
+  // release budget.
+  function handlePrimaryKey(event) {
+    if (root.effectiveView !== "search" || !root.selectedItem) return false
+    if (event.isAutoRepeat) return true
+    if (event.modifiers & Qt.ControlModifier) root.copyItemTotp(root.selectedItem)
+    else root.executePrimaryAction(root.selectedItem)
+    return true
+  }
+
+  function moveSelection(step) {
+    var count = root.filteredItems.length
+    if (count > 0) root.selectedIndex = (root.selectedIndex + step + count) % count
+    return true
+  }
+
+  function handleNavigationKey(event) {
+    if (root.effectiveView !== "search") return false
+    var steps = {}
+    steps[Qt.Key_Tab] = function() { root.cycleCategory(true); return true }
+    steps[Qt.Key_Backtab] = function() { root.cycleCategory(false); return true }
+    steps[Qt.Key_Down] = function() { return root.moveSelection(1) }
+    steps[Qt.Key_Up] = function() { return root.moveSelection(-1) }
+    var step = steps[event.key]
+    return step ? step() : false
+  }
+
+  // Ctrl+<key> -> [precondition, action].
+  function controlKeyAction(key) {
+    var actions = {}
+    actions[Qt.Key_U] = [root.isSelectionReady, function() { root.copyItemUsername(root.selectedItem) }]
+    actions[Qt.Key_K] = [root.isSearchReady, root.openActionPalette]
+    actions[Qt.Key_G] = [root.isSearchReady, function() { root.openPasswordGeneratorModal("password") }]
+    actions[Qt.Key_O] = [root.isSelectionReady, function() { root.openFirstWebsite(root.selectedItem) }]
+    actions[Qt.Key_H] = [root.isSelectionReady, function() { root.openPasswordHistory(root.selectedItem) }]
+    actions[Qt.Key_L] = [root.isUnlockedWithoutModal, root.doLock]
+    actions[Qt.Key_R] = [root.canSyncNow, function() { root.syncVault(false, true) }]
+    actions[Qt.Key_Comma] = [function() { return !root.hasActiveModal }, root.toggleSettingsView]
+    return actions[key] || null
+  }
+
+  // A held chord repeats. Each Ctrl action (opening a website, copying,
+  // opening a view, locking, syncing) acts once per press; repeats are
+  // accepted and ignored, so a held Ctrl+O opens one browser tab.
+  function handleControlKey(event) {
+    var entry = root.controlKeyAction(event.key)
+    if (!entry || !entry[0]()) return false
+    if (!event.isAutoRepeat) entry[1]()
+    return true
+  }
+
+  function handleUnmodalKey(event) {
+    var keyHandlers = {}
+    keyHandlers[Qt.Key_Escape] = root.handleEscape
+    keyHandlers[Qt.Key_Return] = root.handlePrimaryKey
+    keyHandlers[Qt.Key_Enter] = root.handlePrimaryKey
+    var handler = keyHandlers[event.key]
+    if (handler) return handler(event)
+    if (root.handleNavigationKey(event)) return true
+    return Boolean(event.modifiers & Qt.ControlModifier) && root.handleControlKey(event)
+  }
+
+  // Returns true when the key was handled. A held Ctrl+T would alternate
+  // reveal and conceal, one release per repeat, so repeats are ignored.
+  function handleOverlayKey(event) {
+    if (root.isRevealShortcut(event) && root.canToggleReveal()) {
+      if (!event.isAutoRepeat) root.toggleItemRevealed()
+      return true
+    }
+    if ((event.modifiers & Qt.AltModifier) && root.handleScopeKey(event)) return true
+    if (root.hasActiveModal) return root.handleModalKey(event)
+    return root.handleUnmodalKey(event)
   }
 
   function restoreSearchFocus(cursorAtEnd) {
@@ -1993,9 +1618,8 @@ Item {
         }
       } else if (root.opened) {
         // The compositor closed the window (close shortcut, titlebar) behind
-        // our back. Without this, `opened` stays true: open() becomes a no-op,
-        // so the SSH agent's unlock and approval summons do nothing and the
-        // next toggle only hides a window that isn't there.
+        // our back. Without this, `opened` stays true and the next toggle
+        // only hides a window that isn't there.
         root.dismiss()
       }
     }
@@ -2024,6 +1648,8 @@ Item {
 
       Shortcut {
         sequences: ["Ctrl+Return", "Ctrl+Enter"]
+        // Each activation is a budgeted release; a held chord must not repeat it.
+        autoRepeat: false
         enabled: root.opened && root.effectiveView === "search" && root.selectedItem !== null && !root.hasActiveModal
         onActivated: root.copyItemTotp(root.selectedItem)
       }
@@ -2036,22 +1662,17 @@ Item {
 
       Shortcut {
         sequence: "Ctrl+T"
+        autoRepeat: false
         enabled: root.opened && (root.showPasswordHistoryModal || (root.effectiveView === "search" && root.selectedItem !== null && !root.hasActiveModal))
         onActivated: root.toggleItemRevealed()
       }
 
       Shortcut {
         sequence: "Ctrl+O"
+        // Each activation opens a browser tab; a held chord must not repeat it.
+        autoRepeat: false
         enabled: root.opened && root.effectiveView === "search" && root.selectedItem !== null && !root.hasActiveModal
         onActivated: root.openFirstWebsite(root.selectedItem)
-      }
-
-      Shortcut {
-        sequence: "Ctrl+E"
-        enabled: root.opened && root.effectiveView === "search" && root.selectedItem !== null && root.selectedItem.type_name === "ssh_key" && !root.hasActiveModal
-        onActivated: {
-          root.openSshKeyModal("export", root.selectedItem)
-        }
       }
 
       Shortcut {
@@ -2069,12 +1690,7 @@ Item {
       Shortcut {
         sequence: "Ctrl+,"
         enabled: root.opened && !root.hasActiveModal
-        onActivated: {
-          if (settingsView.showReleaseNotes) {
-            settingsView.showReleaseNotes = false
-          }
-          root.currentView = (root.effectiveView === "settings") ? "auto" : "settings"
-        }
+        onActivated: root.currentView = (root.effectiveView === "settings") ? "auto" : "settings"
       }
 
       Shortcut {
@@ -2101,14 +1717,8 @@ Item {
             root.showPasswordGeneratorModal = false
           } else if (root.showPasswordHistoryModal) {
             root.showPasswordHistoryModal = false
-          } else if (root.showSshKeyModal) {
-            root.showSshKeyModal = false
           } else if (root.showActionPalette) {
             root.showActionPalette = false
-          } else if (root.activeAttachmentPreview !== null) {
-            root.activeAttachmentPreview = null
-          } else if (settingsView.visible && settingsView.showReleaseNotes) {
-            settingsView.showReleaseNotes = false
           } else if (root.effectiveView === "settings") {
             root.currentView = "auto"
           } else if (searchHeader && (searchHeader.isVaultScopeOpen || searchHeader.isFolderScopeOpen)) {
@@ -2127,140 +1737,7 @@ Item {
 
       Keys.priority: Keys.BeforeItem
       Keys.onPressed: function(event) {
-        if (event.modifiers & Qt.ControlModifier && (event.key === Qt.Key_T || (event.text && event.text.toLowerCase() === "t"))) {
-          if (root.showPasswordHistoryModal || (root.effectiveView === "search" && root.selectedItem !== null && !root.hasActiveModal)) {
-            root.toggleItemRevealed()
-            event.accepted = true
-            return
-          }
-        }
-
-        if (event.modifiers & Qt.AltModifier && root.effectiveView === "search" && !root.hasActiveModal) {
-          if (event.key === Qt.Key_V) {
-            if (searchHeader) searchHeader.openVaultScope()
-            event.accepted = true
-            return
-          } else if (event.key === Qt.Key_F) {
-            if (searchHeader) searchHeader.openFolderScope()
-            event.accepted = true
-            return
-          }
-        }
-
-        if (root.showSshKeyModal) {
-          if (event.key === Qt.Key_Escape) {
-            root.showSshKeyModal = false
-            event.accepted = true
-          }
-          return
-        }
-
-        if (root.showActionPalette) {
-          if (event.key === Qt.Key_Escape) {
-            root.showActionPalette = false
-            event.accepted = true
-          }
-          return
-        }
-
-        if (root.showPasswordHistoryModal) {
-          if (event.key === Qt.Key_Escape) {
-            root.showPasswordHistoryModal = false
-            event.accepted = true
-          }
-          return
-        }
-
-        if (root.showPasswordGeneratorModal) {
-          if (event.key === Qt.Key_Escape) {
-            root.showPasswordGeneratorModal = false
-            event.accepted = true
-          }
-          return
-        }
-
-        if (event.key === Qt.Key_Escape) {
-          if (root.activeAttachmentPreview !== null) {
-            root.activeAttachmentPreview = null
-          } else if (settingsView.visible && settingsView.showReleaseNotes) {
-            settingsView.showReleaseNotes = false
-          } else if (root.effectiveView === "settings") {
-            root.currentView = "auto"
-          } else if (searchHeader && (searchHeader.isVaultScopeOpen || searchHeader.isFolderScopeOpen)) {
-            searchHeader.closeScopeDropdowns()
-          } else if (root.searchQuery && root.searchQuery.length > 0) {
-            root.searchQuery = ""
-            if (searchHeader) searchHeader.clearSearchRequested()
-          } else if (root.activeVaultScope !== "all" || root.activeFolderScope !== "all") {
-            root.activeVaultScope = "all"
-            root.activeFolderScope = "all"
-          } else {
-            root.dismiss()
-          }
-          event.accepted = true
-        } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-          if (root.effectiveView === "search" && root.selectedItem) {
-            root.executePrimaryAction(root.selectedItem)
-            event.accepted = true
-          }
-        } else if (event.key === Qt.Key_Tab && root.effectiveView === "search") {
-          root.cycleCategory(true)
-          event.accepted = true
-        } else if (event.key === Qt.Key_Backtab && root.effectiveView === "search") {
-          root.cycleCategory(false)
-          event.accepted = true
-        } else if (event.key === Qt.Key_Down && root.effectiveView === "search") {
-          if (root.filteredItems.length > 0) {
-            root.selectedIndex = (root.selectedIndex + 1) % root.filteredItems.length
-          }
-          event.accepted = true
-        } else if (event.key === Qt.Key_Up && root.effectiveView === "search") {
-          if (root.filteredItems.length > 0) {
-            root.selectedIndex = (root.selectedIndex - 1 + root.filteredItems.length) % root.filteredItems.length
-          }
-          event.accepted = true
-        } else if (event.modifiers & Qt.ControlModifier) {
-          if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && root.effectiveView === "search" && root.selectedItem !== null && !root.hasActiveModal) {
-            root.copyItemTotp(root.selectedItem)
-            event.accepted = true
-          } else if (event.key === Qt.Key_U && root.effectiveView === "search" && root.selectedItem !== null && !root.hasActiveModal) {
-            root.copyItemUsername(root.selectedItem)
-            event.accepted = true
-          } else if (event.key === Qt.Key_K && root.effectiveView === "search" && !root.hasActiveModal) {
-            root.actionPaletteIndex = 0
-            root.showActionPalette = true
-            event.accepted = true
-          } else if (event.key === Qt.Key_G && root.effectiveView === "search" && !root.hasActiveModal) {
-            root.openPasswordGeneratorModal("password")
-            event.accepted = true
-          } else if (event.key === Qt.Key_T && root.effectiveView === "search" && root.selectedItem !== null && !root.hasActiveModal) {
-            root.toggleItemRevealed()
-            event.accepted = true
-          } else if (event.key === Qt.Key_O && root.effectiveView === "search" && root.selectedItem !== null && !root.hasActiveModal) {
-            root.openFirstWebsite(root.selectedItem)
-            event.accepted = true
-          } else if (event.key === Qt.Key_E && root.effectiveView === "search" && root.selectedItem !== null && root.selectedItem.type_name === "ssh_key" && !root.hasActiveModal) {
-            root.openSshKeyModal("export", root.selectedItem)
-            event.accepted = true
-          } else if (event.key === Qt.Key_H && root.effectiveView === "search" && root.selectedItem !== null && !root.hasActiveModal) {
-            if (root.selectedItem.login && root.selectedItem.login.password_history && root.selectedItem.login.password_history.length > 0) {
-              root.activePasswordHistoryItem = root.selectedItem
-              root.showPasswordHistoryModal = true
-            } else {
-              root.statusMessage = "No password history recorded for this item."
-            }
-            event.accepted = true
-          } else if (event.key === Qt.Key_L && root.authState.status === "unlocked" && !root.hasActiveModal) {
-            root.doLock()
-            event.accepted = true
-          } else if (event.key === Qt.Key_R && (root.authState.status === "unlocked" || (root.authState.status === "locked" && root.authState.has_session)) && !root.isBusy && !root.hasActiveModal) {
-            root.syncVault(false, true)
-            event.accepted = true
-          } else if (event.key === Qt.Key_Comma && !root.hasActiveModal) {
-            root.currentView = (root.effectiveView === "settings") ? "auto" : "settings"
-            event.accepted = true
-          }
-        }
+        if (root.handleOverlayKey(event)) event.accepted = true
       }
 
       ColumnLayout {
@@ -2293,8 +1770,6 @@ Item {
           onCategorySelected: function(cat) { root.activeCategory = cat }
           onVaultScopeSelected: function(scope) { root.activeVaultScope = scope }
           onFolderScopeSelected: function(scope) { root.activeFolderScope = scope }
-          onCreateSshKeyRequested: { root.openSshKeyModal("create", null) }
-          onImportSshKeyRequested: { root.openSshKeyModal("import", null) }
           onClearSearchRequested: {
             root.searchQuery = ""
             root.filterVaultItems()
@@ -2318,11 +1793,6 @@ Item {
             root.actionPaletteIndex = 0
             root.showActionPalette = true
           }
-          onExportSshKeyRequested: {
-            if (root.selectedItem && root.selectedItem.type_name === "ssh_key") {
-              root.openSshKeyModal("export", root.selectedItem)
-            }
-          }
         }
 
         // 2. Main Content Center View
@@ -2339,8 +1809,6 @@ Item {
             // Left Column: Items List
             VaultItemList {
               id: vaultItemList
-              serverUrl: root.effectiveServerUrl
-              showWebsiteIcons: root.showWebsiteIcons
               Layout.fillHeight: true
               Layout.preferredWidth: 320
               Layout.minimumWidth: 260
@@ -2379,44 +1847,22 @@ Item {
               // Item Inspector View
               ItemInspector {
                 anchors.fill: parent
-                serverUrl: root.effectiveServerUrl
-                showWebsiteIcons: root.showWebsiteIcons
                 visible: root.selectedItem !== null
                 item: root.selectedItem
-                currentTotp: root.currentTotp
-                showPasswordRevealed: root.showPasswordRevealed
-                showPrivateKeyRevealed: root.showPrivateKeyRevealed
-                showCardNumberRevealed: root.showCardNumberRevealed
-                showCardCodeRevealed: root.showCardCodeRevealed
-                showCustomHiddenRevealed: root.showCustomHiddenRevealed
-                activeAttachmentPreview: root.activeAttachmentPreview
-                loadingAttachmentId: root.loadingAttachmentId
+                revealedValues: secretRelease.revealedValues
+                requestedFields: secretRelease.requestedFields
+                totpSecondsRemaining: secretRelease.totpSecondsRemaining
+                totpPeriod: secretRelease.totpPeriod
                 fontFamily: root.fontFamily
                 foreground: root.foreground
                 accent: root.accent
                 muted: root.muted
                 borderColor: root.borderColor
                 onCopyRequested: function(text, isSensitive, label) { root.copyToClipboard(text, isSensitive, label) }
-                onViewAttachmentRequested: function(item, att) { root.viewAttachment(item, att) }
-                onDownloadAttachmentRequested: function(item, att) { root.downloadAttachment(item, att) }
-                onExportSshKeyRequested: function(item) { root.openSshKeyModal("export", item) }
-                onClosePreviewRequested: {
-                  var prevItem = root.activeAttachmentPreview ? (root.activeAttachmentPreview.item_id || "") : ""
-                  root.activeAttachmentPreview = null
-                  if (prevItem) {
-                    cleanAttachmentProc.command = [root.helperPath, "attachment", "clean", "--item-id", prevItem]
-                    cleanAttachmentProc.running = true
-                  }
-                }
-                onTogglePasswordRevealed: { root.showPasswordRevealed = !root.showPasswordRevealed }
-                onTogglePrivateKeyRevealed: { root.showPrivateKeyRevealed = !root.showPrivateKeyRevealed }
-                onToggleCardNumberRevealed: { root.showCardNumberRevealed = !root.showCardNumberRevealed }
-                onToggleCardCodeRevealed: { root.showCardCodeRevealed = !root.showCardCodeRevealed }
-                onToggleCustomHiddenRevealed: { root.showCustomHiddenRevealed = !root.showCustomHiddenRevealed }
-                onPasswordHistoryRequested: function(item) {
-                  root.activePasswordHistoryItem = item
-                  root.showPasswordHistoryModal = true
-                }
+                onSecretCopyRequested: function(field, label) { root.copySecretField(root.selectedItem, field, label) }
+                onRevealToggleRequested: function(field) { secretRelease.toggleReveal(field) }
+                onOpenUriRequested: function(uri) { root.openUri(uri) }
+                onPasswordHistoryRequested: function(item) { root.openPasswordHistory(item) }
               }
 
               // Empty Selection State View
@@ -2450,7 +1896,6 @@ Item {
             twoFactorProvider: root.twoFactorProvider
             availableTwoFactorProviders: root.availableTwoFactorProviders
             fido2Status: root.fido2Status
-            isInstalling: root.isInstallingDependencies
             fontFamily: root.fontFamily
             foreground: root.foreground
             accent: root.accent
@@ -2473,7 +1918,6 @@ Item {
             onLoginApiKeyRequested: function(cId, cSec) { root.doLoginApiKey(cId, cSec) }
             onSendTwoFactorEmailRequested: function(email, pwd) { root.doSendTwoFactorEmail(email, pwd) }
             onCheckFido2StatusRequested: { root.doCheckFido2Status() }
-            onInstallPackageRequested: function(pkg) { root.installPackage(pkg) }
             onLogoutRequested: { root.doLogout() }
             onSettingsRequested: { root.currentView = "settings" }
             onServerConfigSaved: function(sUrl, cCert, cKey) {
@@ -2495,15 +1939,7 @@ Item {
             engineSource: root.engineSource
             enginePackage: root.enginePackage
             logBuffer: root.logBuffer
-            isInstallingDependencies: root.isInstallingDependencies
             isBusy: root.isBusy
-            updateAvailable: root.updateAvailable
-            latestVersion: root.latestVersion
-            latestReleaseNotes: root.latestReleaseNotes
-            latestReleaseUrl: root.latestReleaseUrl
-            latestReleaseTitle: root.latestReleaseTitle
-            isCheckingUpdate: root.isCheckingUpdate
-            updateCheckStatus: root.updateCheckStatus
             fontFamily: root.fontFamily
             foreground: root.foreground
             accent: root.accent
@@ -2514,8 +1950,6 @@ Item {
             onRefreshHealthRequested: {
               root.checkDependencies()
             }
-            onCheckUpdateRequested: { root.checkUpdates(true) }
-            onInstallPackageRequested: function(pkg) { root.installPackage(pkg) }
             onCopyDiagnosticsRequested: { root.copyDiagnostics() }
             onClearLogsRequested: { root.logBuffer = [] }
           }
@@ -2526,14 +1960,12 @@ Item {
             anchors.fill: parent
             visible: root.effectiveView === "dependency_check"
             isChecking: root.isCheckingDependencies
-            isInstalling: root.isInstallingDependencies
             fontFamily: root.fontFamily
             foreground: root.foreground
             accent: root.accent
             muted: root.muted
             borderColor: root.borderColor
             onRecheckRequested: { root.checkDependencies() }
-            onInstallRequested: { root.installMissingDependencies() }
           }
         }
 
@@ -2544,9 +1976,6 @@ Item {
           overlayVersion: (root.manifest && root.manifest.version) ? (root.manifest.version) : ""
           backendVersion: (root.cliHealth && root.cliHealth.version) || ""
           isEngineInstalled: !root.dependenciesMissing && Boolean(root.cliHealth && root.cliHealth.installed)
-          isInstallingDependencies: root.isInstallingDependencies
-          updateAvailable: root.updateAvailable
-          latestVersion: root.latestVersion
           background: root.background
           fontFamily: root.fontFamily
           foreground: root.foreground
@@ -2560,13 +1989,7 @@ Item {
           onGeneratePasswordTriggered: { root.openPasswordGeneratorModal("password") }
           onSyncTriggered: { root.syncVault(false, true) }
           onLockTriggered: { root.doLock() }
-          onSettingsTriggered: {
-            if (settingsView.showReleaseNotes) {
-              settingsView.showReleaseNotes = false
-            }
-            root.currentView = (root.effectiveView === "settings") ? "auto" : "settings"
-          }
-          onInstallCliTriggered: { root.installMissingDependencies() }
+          onSettingsTriggered: root.currentView = (root.effectiveView === "settings") ? "auto" : "settings"
         }
       }
 
@@ -2607,54 +2030,22 @@ Item {
         onCloseRequested: { root.showActionPalette = false }
       }
 
-      // 6. SSH Key Management Modal Overlay (Create, Import, Export)
-      SshKeyModal {
-        id: sshKeyModalComponent
-        active: root.showSshKeyModal
-        mode: root.sshKeyModalMode
-        item: root.sshKeyModalItem
-        fontFamily: root.fontFamily
-        foreground: root.foreground
-        accent: root.accent
-        muted: root.muted
-        cardBackground: Commons.Color.popups.background
-        borderColor: Commons.Color.popups.border
-        onCreateRequested: function(payload) { root.handleSshKeyCreate(payload) }
-        onImportRequested: function(payload) { root.handleSshKeyImport(payload) }
-        onExportRequested: function(payload) { root.handleSshKeyExport(payload) }
-        onCloseRequested: { root.showSshKeyModal = false }
-      }
-
-      // 7. Password History Modal Overlay
-      SshApprovalModal {
-        id: sshApprovalModalComponent
-        active: root.opened
-        prompt: root.sshApprovalPrompt
-        remaining: root.sshApprovalRemaining
-        fontFamily: root.fontFamily
-        foreground: root.foreground
-        accent: root.accent
-        muted: root.muted
-        cardBackground: Commons.Color.popups.background
-        borderColor: Commons.Color.popups.border
-        onReplyRequested: function(approve) { root.replySshApproval(approve) }
-      }
-
+      // 6. Password History Modal Overlay
       PasswordHistoryModal {
         id: passwordHistoryModalComponent
         active: root.showPasswordHistoryModal
         item: root.activePasswordHistoryItem
+        historyEntries: secretRelease.passwordHistory
         fontFamily: root.fontFamily
         foreground: root.foreground
         accent: root.accent
         muted: root.muted
         cardBackground: Commons.Color.popups.background
         borderColor: Commons.Color.popups.border
-        onCopyRequested: function(text, isSensitive, label) { root.copyToClipboard(text, isSensitive, label) }
         onCloseRequested: { root.showPasswordHistoryModal = false }
       }
 
-      // 8. Password & Passphrase Generator Modal Overlay
+      // 7. Password & Passphrase Generator Modal Overlay
       PasswordGeneratorModal {
         id: passwordGeneratorModalComponent
         active: root.showPasswordGeneratorModal
@@ -2670,10 +2061,6 @@ Item {
         borderColor: Commons.Color.popups.border
         onGenerateRequested: function(opts) { root.generatePasswordOrPassphrase(opts) }
         onCopyRequested: function(text, isSensitive, label) { root.copyToClipboard(text, isSensitive, label) }
-        onUpgradeRequested: {
-          root.showPasswordGeneratorModal = false
-          root.installPackage(root.enginePackage || "omawarden")
-        }
         onCloseRequested: {
           root.showPasswordGeneratorModal = false
           if (passwordGenProc.running) {
@@ -2785,109 +2172,6 @@ Item {
   }
 
   Process {
-    id: sshKeyActionProc
-    property string actionType: "create"
-    property string actionName: ""
-    command: []
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        root.isBusy = false
-        if (sshKeyModalComponent) sshKeyModalComponent.isBusy = false
-        if (!root.authState || root.authState.status !== "unlocked") {
-          root.showSshKeyModal = false
-          root.sshKeyModalItem = null
-          return
-        }
-        var raw = text.trim()
-        var jsonRes = null
-        try {
-          if (raw) jsonRes = JSON.parse(raw)
-        } catch (e) {}
-
-        if (jsonRes && jsonRes.ok) {
-          root.showSshKeyModal = false
-          if (sshKeyActionProc.actionType === "create") {
-            root.statusMessage = "SSH key '" + sshKeyActionProc.actionName + "' generated successfully."
-            root.loadVaultItems()
-          } else if (sshKeyActionProc.actionType === "import") {
-            root.statusMessage = "SSH key '" + sshKeyActionProc.actionName + "' imported successfully."
-            root.loadVaultItems()
-          } else if (sshKeyActionProc.actionType === "export") {
-            root.statusMessage = "SSH key '" + sshKeyActionProc.actionName + "' exported to local directory."
-          }
-        } else {
-          var errMsg = (jsonRes && jsonRes.error) ? jsonRes.error : "SSH key operation failed."
-          if (sshKeyModalComponent && root.showSshKeyModal) {
-            sshKeyModalComponent.errorMessage = errMsg
-          } else {
-            root.errorMessage = errMsg
-          }
-        }
-      }
-    }
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.handleProcessStderr(text, "omawarden:ssh")
-    }
-    onExited: function(exitCode) {
-      root.isBusy = false
-      if (sshKeyModalComponent) sshKeyModalComponent.isBusy = false
-      if (exitCode !== 0 && (!sshKeyModalComponent || !sshKeyModalComponent.errorMessage)) {
-        if (sshKeyModalComponent && root.showSshKeyModal) {
-          sshKeyModalComponent.errorMessage = "Process exited with error code " + exitCode
-        } else {
-          root.errorMessage = "Process exited with error code " + exitCode
-        }
-      }
-    }
-  }
-  Process {
-    id: sshPendingProc
-    command: []
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var prompts = []
-        try {
-          var data = JSON.parse((text || "").trim() || "{}")
-          prompts = Array.isArray(data.prompts) ? data.prompts : []
-        } catch (e) {
-          root.logError("omarchy:ssh-agent", "Failed to parse pending prompts: " + e)
-        }
-        var next = prompts.length > 0 ? prompts[0] : null
-        // The daemon gives each prompt 60 seconds; count down from first sight.
-        if (next && (!root.sshApprovalPrompt || root.sshApprovalPrompt.id !== next.id)) root.sshApprovalRemaining = 60
-        root.sshApprovalPrompt = next
-        if (root.sshDenyingOnClose) {
-          if (next) root.replySshApproval(false)
-          else root.sshDenyingOnClose = false
-          return
-        }
-        if (next) Qt.callLater(function() { sshApprovalModalComponent.forceActiveFocus() })
-        if (!next && root.sshApprovalOnly && root.opened) root.close()
-      }
-    }
-  }
-
-  Process {
-    id: sshReplyProc
-    command: []
-    onExited: root.refreshSshApprovals()
-  }
-
-  // While a prompt is showing, notice when it times out or is answered elsewhere.
-  Timer {
-    interval: 1000
-    repeat: true
-    running: root.opened && root.sshApprovalPrompt !== null
-    onTriggered: {
-      if (root.sshApprovalRemaining > 0) root.sshApprovalRemaining--
-      root.refreshSshApprovals()
-    }
-  }
-
-  Process {
     id: configGetProc
     property int seq: 0
     command: []
@@ -2903,15 +2187,7 @@ Item {
           if (data.remember_email !== undefined) {
             root.rememberEmailChecked = (data.remember_email !== false)
           }
-          root.showWebsiteIcons = IconPolicy.resolve(true, data.show_website_icons)
-          root.checkUpdatesEnabled = (data.check_updates !== false)
-          if (root.checkUpdatesEnabled && root.pendingUpdateCheck) {
-            root.pendingUpdateCheck = false
-            root.checkUpdates(false)
-          }
         } catch (e) {
-          root.showWebsiteIcons = false
-          root.checkUpdatesEnabled = false
           root.logError("omarchy:ui", "Failed to parse config: " + e)
         }
       }
@@ -2934,13 +2210,10 @@ Item {
           if (cleanSetText.length === 0) return
           var data = JSON.parse(cleanSetText)
           root.config = data
-          root.showWebsiteIcons = IconPolicy.resolve(true, data.show_website_icons)
-          root.checkUpdatesEnabled = (data.check_updates !== false)
           root.statusMessage = "Configuration saved successfully."
           root.refreshHealth()
           root.refreshAuthStatus()
         } catch (e) {
-          root.showWebsiteIcons = false
           root.statusMessage = "Failed to update config."
           root.logError("omarchy:ui", "Failed to parse updated config: " + e)
         }
@@ -3017,53 +2290,6 @@ Item {
     }
   }
 
-
-  Process {
-    id: updateCheckProc
-    command: []
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        root.isCheckingUpdate = false
-        try {
-          var cleanText = (text || "").trim()
-          var data = JSON.parse(cleanText)
-          if (data && data.ok && data.tag) {
-            var rawTag = data.tag
-            var cleanTag = String(rawTag).replace(/^omawarden-|^v/i, "").trim()
-            root.latestVersion = cleanTag
-            root.latestReleaseNotes = data.body || ""
-            // Only accept release URLs hosted on github.com under an
-            // omarchy-bitwarden project; anything else from the update feed
-            // falls back to the constructed upstream tag URL.
-            var releaseUrl = data.url || ""
-            if (!/^https:\/\/github\.com\/[^\/]+\/omarchy-bitwarden\//.test(releaseUrl)) {
-              releaseUrl = rawTag ? ("https://github.com/icyleaf/omarchy-bitwarden/releases/tag/" + rawTag) : ""
-            }
-            root.latestReleaseUrl = releaseUrl
-            root.latestReleaseTitle = data.name || (cleanTag ? ("omawarden v" + cleanTag) : "")
-            var currentVer = (root.cliHealth && root.cliHealth.version) ? root.cliHealth.version : ""
-            if (currentVer && root.compareSemVer(cleanTag, currentVer) > 0) {
-              root.updateCheckStatus = "Update available: v" + cleanTag
-            } else {
-              root.updateCheckStatus = "Up to date (v" + (currentVer || cleanTag) + ")"
-            }
-          } else {
-            root.updateCheckStatus = (data && data.error) ? data.error : "Update check failed"
-          }
-        } catch (e) {
-          root.updateCheckStatus = "Update check failed"
-        }
-      }
-    }
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.handleProcessStderr(text, "omarchy:update")
-    }
-    onExited: function(code) {
-      root.isCheckingUpdate = false
-    }
-  }
 
   Process {
     id: quickUnlockCheckProc
@@ -3531,25 +2757,7 @@ Item {
             })
             return
           }
-          root.lastVaultItemsRawText = cleanText
-          var items = JSON.parse(cleanText)
-          root.rawVaultItems = items || []
-          if (root.activeVaultScope !== "all" && root.activeVaultScope !== "personal") {
-            var vScopes = root.getAvailableVaultScopes()
-            var vFound = false
-            for (var vi = 0; vi < vScopes.length; vi++) {
-              if (vScopes[vi].id === root.activeVaultScope) { vFound = true; break }
-            }
-            if (!vFound) root.activeVaultScope = "all"
-          }
-          if (root.activeFolderScope !== "all" && root.activeFolderScope !== "none") {
-            var fScopes = root.getAvailableFolderScopes()
-            var fFound = false
-            for (var fi = 0; fi < fScopes.length; fi++) {
-              if (fScopes[fi].id === root.activeFolderScope) { fFound = true; break }
-            }
-            if (!fFound) root.activeFolderScope = "all"
-          }
+          root.applyVaultListing(JSON.parse(cleanText), cleanText)
           root.filterVaultItems(false)
           Qt.callLater(function() {
             if (root.opened && root.effectiveView === "search" && searchHeader && searchHeader.searchField && !root.hasActiveModal) {
@@ -3584,92 +2792,48 @@ Item {
     }
   }
 
-  Process {
-    id: totpGenProc
-    property string secret: ""
-    stdinEnabled: true
-    onStarted: {
-      if (secret) {
-        write(secret + "\n")
-        secret = ""
-      }
+  // Per-field secret release (contracts.md section 3). Active only while the
+  // overlay shows the unlocked vault; inactive drops every revealed value.
+  SecretReleaseController {
+    id: secretRelease
+    helperPath: root.helperPath
+    active: root.opened && Boolean(root.authState && root.authState.status === "unlocked") && root.effectiveView === "search"
+    itemId: root.selectedItem ? String(root.selectedItem.id || "") : ""
+    clipboardClearSeconds: root.clipboardClearSeconds()
+    // Requested only after the previous release process has exited.
+    onCommandRequested: function(argv) {
+      secretFieldProc.command = argv
+      secretFieldProc.running = true
     }
+    onCommandStopRequested: function(forceful) { root.stopSecretFieldProcess(forceful) }
+    onCopyConfirmed: function(label, clearSeconds) { root.confirmSecretCopy(label, clearSeconds) }
+    onReleaseRefused: function(errorCode, message) { root.handleReleaseRefusal(errorCode, message) }
+    onPasswordHistoryConcealed: root.showPasswordHistoryModal = false
+  }
+
+  readonly property int forcefulStopSignal: 9 // SIGKILL
+
+  // A release that timed out: stopping the process (SIGTERM) comes first; a
+  // process that still has not exited is killed.
+  function stopSecretFieldProcess(forceful) {
+    if (forceful) secretFieldProc.signal(root.forcefulStopSignal)
+    else secretFieldProc.running = false
+  }
+
+  // Runs `vault reveal` / `vault copy-field`. argv holds only the item id and
+  // the field identifier; stdout carries the JSON envelope and is handed to
+  // the controller without being logged.
+  Process {
+    id: secretFieldProc
     command: []
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: {
-        if (!root.authState || root.authState.status !== "unlocked") {
-          root.currentTotp = ({ code: "", ttl: 30, period: 30 })
-          return
-        }
-        var cleanText = (text || "").trim()
-        if (!cleanText) return
-        try {
-          var res = JSON.parse(cleanText)
-          if (res && res.code) {
-            root.currentTotp = res
-          } else {
-            root.currentTotp = ({ code: "Invalid Secret", ttl: 0, period: 30 })
-          }
-        } catch (e) {
-          root.currentTotp = ({ code: "Invalid Secret", ttl: 0, period: 30 })
-          root.logError("omarchy:totp", "Failed to parse TOTP response: " + e)
-        }
-      }
+      onStreamFinished: secretRelease.handleCommandOutput(text)
     }
     stderr: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.handleProcessStderr(text, "omawarden:totp")
+      onStreamFinished: root.handleProcessStderr(text, "omawarden:secrets")
     }
-  }
-
-  Process {
-    id: cleanAttachmentProc
-    command: []
-  }
-
-  Process {
-    id: attachmentProc
-    property string activeAttachmentId: ""
-    property string activeItemId: ""
-    command: []
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        root.loadingAttachmentId = ""
-        if (!root.authState || root.authState.status !== "unlocked") {
-          root.activeAttachmentPreview = null
-          return
-        }
-        try {
-          var data = JSON.parse(text)
-          if (data.ok) {
-            if (data.action === "preview") {
-              data.attachment_id = attachmentProc.activeAttachmentId
-              data.item_id = attachmentProc.activeItemId
-              root.activeAttachmentPreview = data
-            } else if (data.action === "view") {
-              root.statusMessage = "Opened " + (data.filename || "attachment") + "."
-            } else {
-              root.statusMessage = "Saved " + (data.filename || "attachment") + " to " + (data.path || "Downloads")
-            }
-          } else {
-            root.errorMessage = data.error || "Failed to process attachment."
-            root.logError("omarchy:attachment", root.errorMessage)
-          }
-        } catch (e) {
-          root.errorMessage = "Failed to parse attachment response."
-          root.logError("omarchy:attachment", root.errorMessage + ": " + e)
-        }
-      }
-    }
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.handleProcessStderr(text, "omawarden:attachment")
-    }
-    onExited: function(code) {
-      root.loadingAttachmentId = ""
-      if (code !== 0 && !root.errorMessage) root.errorMessage = "Attachment command failed."
-    }
+    onExited: function(exitCode) { secretRelease.handleCommandExit(exitCode) }
   }
 }

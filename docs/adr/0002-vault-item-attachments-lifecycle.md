@@ -1,5 +1,7 @@
 # ADR 0002: Vault Item Attachments Lifecycle and Native Decryption Architecture
 
+> **Removed in this fork.** koechian/omarchy-bitwarden no longer includes vault item attachments (download, preview, cleanup and the size limit setting). This record is kept for history only.
+
 ## Status
 Accepted
 
