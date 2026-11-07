@@ -157,8 +157,13 @@ Item {
     quickAccess.submitUnlock()
     Assert.check(unlocks.length === 1, "an empty field does not unlock")
     passwordField.text = "typed but not sent"
+    quickAccess.query = "kept while the card fades"
+    quickAccess.clearSecretInput()
+    Assert.check(passwordField.text === "", "starting to close clears a typed password at once")
+    Assert.check(quickAccess.query === "kept while the card fades", "starting to close keeps what the fading card shows")
+    passwordField.text = "typed but not sent"
     quickAccess.reset()
-    Assert.check(passwordField.text === "", "closing the dropdown clears a typed password")
+    Assert.check(passwordField.text === "", "the reset after the fade also clears a typed password")
 
     // 9. Query filters the list.
     quickAccess.view = QuickAccessModel.VIEW_UNLOCKED
@@ -177,7 +182,10 @@ Item {
     Assert.check(sequenceButton !== null && sequenceButton.visible, "the paste sequence is offered for an item with a password and a code")
     quickAccess.openDetails(quickAccess.vaultItems[1])
     Assert.check(!sequenceButton.visible, "the paste sequence is not offered without a code")
+    quickAccess.closeDetails()
     quickAccess.reset()
+    Assert.check(quickAccess.listOpacity === 1 && quickAccess.listOffset === 0
+      && quickAccess.detailOpacity === 1 && quickAccess.detailOffset === 0, "reset stops a page change and leaves both pages at rest")
 
     // List rows are built when the view is laid out, after this handler.
     layoutWait.start()

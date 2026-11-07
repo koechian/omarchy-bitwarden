@@ -43,6 +43,17 @@ FocusScope {
   readonly property int sectionSpacing: 10
   readonly property string maskedValue: "••••••••••"
 
+  // Page change between the list and the details page: the page that
+  // appears fades in while travelling a short way in the reading direction
+  // (the details page from the trailing side, the list back from the
+  // leading side). Instant when animations are off (Style.duration is 0).
+  readonly property int pageTravel: LayoutMirroring.enabled ? -8 : 8
+  readonly property int pageChangeDuration: 150
+  property real listOpacity: 1
+  property real listOffset: 0
+  property real detailOpacity: 1
+  property real detailOffset: 0
+
   // closeAfter: true for the quick copies of the list, false on the details page.
   signal copyRequested(var item, string kind, bool closeAfter)
   signal sequenceRequested(var item)
@@ -67,15 +78,34 @@ FocusScope {
   onVaultItemsChanged: if (detailItem !== null) detailItem = findItem(detailItem.id)
   onActiveFocusChanged: if (activeFocus) focusInput()
 
-  // Clears what the user typed and returns to the list. Called when the
-  // dropdown closes, so a master password never outlives the dropdown it
-  // was typed into.
+  // Clears the master password field. Called the moment the dropdown
+  // starts to close, so a master password never outlives the dropdown it
+  // was typed into; it changes nothing the closing card shows.
+  function clearSecretInput() {
+    passwordInput.text = ""
+  }
+
+  // Clears what the user typed and returns to the list. Called once the
+  // closed dropdown has faded out.
   function reset() {
+    clearSecretInput()
+    pageEntrance.stop()
     query = ""
     searchInput.text = ""
-    passwordInput.text = ""
     selectedIndex = 0
     detailItem = null
+    listOpacity = 1
+    listOffset = 0
+    detailOpacity = 1
+    detailOffset = 0
+  }
+
+  function playPageEntrance(opacityProperty, offsetProperty, travel) {
+    pageEntrance.stop()
+    entranceOpacity.property = opacityProperty
+    entranceOffset.property = offsetProperty
+    entranceOffset.from = travel
+    pageEntrance.start()
   }
 
   function focusInput() {
@@ -95,13 +125,37 @@ FocusScope {
 
   function openDetails(item) {
     if (!item) return
+    var entering = detailItem === null
     detailItem = item
+    if (entering) playPageEntrance("detailOpacity", "detailOffset", pageTravel)
     Qt.callLater(focusInput)
   }
 
   function closeDetails() {
     detailItem = null
+    playPageEntrance("listOpacity", "listOffset", -pageTravel)
     Qt.callLater(focusInput)
+  }
+
+  ParallelAnimation {
+    id: pageEntrance
+    NumberAnimation {
+      id: entranceOpacity
+      target: quickAccessRoot
+      from: 0
+      to: 1
+      duration: Style.duration(quickAccessRoot.pageChangeDuration)
+      easing.type: Easing.Bezier
+      easing.bezierCurve: Style.easeOut
+    }
+    NumberAnimation {
+      id: entranceOffset
+      target: quickAccessRoot
+      to: 0
+      duration: Style.duration(quickAccessRoot.pageChangeDuration)
+      easing.type: Easing.Bezier
+      easing.bezierCurve: Style.easeOut
+    }
   }
 
   function moveSelection(step) {
@@ -239,6 +293,8 @@ FocusScope {
     Rectangle {
       id: searchBox
       visible: quickAccessRoot.showingList
+      opacity: quickAccessRoot.listOpacity
+      transform: Translate { x: quickAccessRoot.listOffset }
       width: parent.width
       height: 34
       radius: Style.cornerRadius
@@ -290,6 +346,8 @@ FocusScope {
     ListView {
       id: itemList
       visible: quickAccessRoot.showingList && quickAccessRoot.rankedItems.length > 0
+      opacity: quickAccessRoot.listOpacity
+      transform: Translate { x: quickAccessRoot.listOffset }
       width: parent.width
       height: Math.min(quickAccessRoot.rankedItems.length, quickAccessRoot.visibleRowLimit) * quickAccessRoot.rowHeight
       clip: true
@@ -390,6 +448,8 @@ FocusScope {
     FocusScope {
       id: detailPage
       visible: quickAccessRoot.showingDetails
+      opacity: quickAccessRoot.detailOpacity
+      transform: Translate { x: quickAccessRoot.detailOffset }
       width: parent.width
       height: visible ? detailColumn.implicitHeight : 0
       Keys.onPressed: function(event) { event.accepted = quickAccessRoot.handleDetailKey(event) }
