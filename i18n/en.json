@@ -51,5 +51,7 @@
   "quickAccess.verificationCodeHidden": "••• •••",
   "quickAccess.sequenceAction": "Copy password, then code",
   "quickAccess.sequenceHint": "First paste: password · next paste: code",
-  "quickAccess.sequenceUnsupported": "The paste sequence needs omawarden 0.13.0 or later. Rebuild the engine (see the README)."
+  "quickAccess.sequenceUnsupported": "The paste sequence needs omawarden 0.13.0 or later. Rebuild the engine (see the README).",
+  "quickAccess.recentSection": "Recent",
+  "quickAccess.allSection": "All logins"
 }

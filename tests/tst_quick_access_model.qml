@@ -76,7 +76,24 @@ Item {
     Assert.check(QuickAccessModel.redactedListing('{"ok":false,"error_code":"vault_locked"}') === null, "an error envelope is not a listing")
     Assert.check(QuickAccessModel.redactedListing("") === null, "an empty reply is not a listing")
 
-    // 6. Selection bounds.
+    // 6. Recent section.
+    var used = [
+      { id: "r1", name: "Zed", type_name: "login", favorite: false, usage_score: 3, login: { username: "z", has_password: true } },
+      { id: "r2", name: "Mid", type_name: "login", favorite: false, usage_score: 9, login: { username: "m", has_password: true } },
+      { id: "n1", name: "Apple", type_name: "login", favorite: false, usage_score: 0, login: { username: "a", has_password: true } },
+      { id: "n2", name: "Banana", type_name: "login", favorite: true, usage_score: 0.01, login: { username: "b", has_password: true } }
+    ]
+    var ranked = QuickAccessModel.rankItems(used, "")
+    Assert.check(ids(ranked) === "r2,r1,n2,n1", "recent logins come first, most used first, then the others with favourites first")
+    Assert.check(QuickAccessModel.recentCount(ranked, "") === 2, "the recent section counts the leading recent logins")
+    Assert.check(QuickAccessModel.recentCount(QuickAccessModel.rankItems(used, "a"), "a") === 0, "no recent section while a query is typed")
+    var many = []
+    for (var i = 0; i < 7; i++) many.push({ id: "m" + i, name: "Item " + i, type_name: "login", favorite: false, usage_score: 1 + i, login: { username: "u", has_password: true } })
+    var rankedMany = QuickAccessModel.rankItems(many, "")
+    Assert.check(QuickAccessModel.recentCount(rankedMany, "") === QuickAccessModel.RECENT_LIMIT, "the recent section holds at most RECENT_LIMIT logins")
+    Assert.check(rankedMany.length === 7 && rankedMany[0].id === "m6", "the logins past the limit stay in the list")
+
+    // 7. Selection bounds.
     Assert.check(QuickAccessModel.clampIndex(5, 3) === 2 && QuickAccessModel.clampIndex(-1, 3) === 0, "selection stays inside the list")
     Assert.check(QuickAccessModel.clampIndex(0, 0) === -1, "an empty list has no selection")
 

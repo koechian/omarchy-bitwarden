@@ -920,6 +920,12 @@ fn run_vault_sync(cfg: &omawarden::config::Config) -> ExitCode {
         VaultManager::with_identity_url(&cfg.server_url, cfg.identity_url.as_deref(), None, None);
     match vault_mgr.sync_with_client(client_ctx.as_ref()) {
         Ok(_) => {
+            if let Ok(storage) = vault_mgr.storage.read() {
+                omawarden::item_usage::retain_vault_items_on_disk(
+                    &vault_mgr.storage_mgr.file_path,
+                    &storage,
+                );
+            }
             print_pretty(&json!({ "ok": true }));
             ExitCode::SUCCESS
         }

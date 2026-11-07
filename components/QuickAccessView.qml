@@ -39,6 +39,8 @@ FocusScope {
   readonly property var rankedItems: QuickAccessModel.rankItems(vaultItems, query)
   readonly property var selectedItem: (selectedIndex >= 0 && selectedIndex < rankedItems.length) ? rankedItems[selectedIndex] : null
   readonly property int rowHeight: 46
+  readonly property int sectionHeaderHeight: 22
+  readonly property int recentCount: QuickAccessModel.recentCount(rankedItems, query)
   readonly property int fieldRowHeight: 44
   readonly property int sectionSpacing: 10
   readonly property string maskedValue: "••••••••••"
@@ -156,6 +158,25 @@ FocusScope {
       easing.type: Easing.Bezier
       easing.bezierCurve: Style.easeOut
     }
+  }
+
+  // Section label above a row of the list: "Recent" above the first recent
+  // login and "All logins" above the first of the others, while the list
+  // has a recent section (no query typed).
+  function sectionTitleAt(index) {
+    if (recentCount === 0) return ""
+    if (index === 0) return strings.t("quickAccess.recentSection", "Recent")
+    if (index === recentCount) return strings.t("quickAccess.allSection", "All logins")
+    return ""
+  }
+
+  // Height of the visible rows, with the section labels among them.
+  function listHeight() {
+    var rows = Math.min(rankedItems.length, visibleRowLimit)
+    var labels = 0
+    if (recentCount > 0) labels = 1
+    if (recentCount > 0 && recentCount < rows) labels = 2
+    return rows * rowHeight + labels * sectionHeaderHeight
   }
 
   function moveSelection(step) {
@@ -349,26 +370,49 @@ FocusScope {
       opacity: quickAccessRoot.listOpacity
       transform: Translate { x: quickAccessRoot.listOffset }
       width: parent.width
-      height: Math.min(quickAccessRoot.rankedItems.length, quickAccessRoot.visibleRowLimit) * quickAccessRoot.rowHeight
+      height: quickAccessRoot.listHeight()
       clip: true
       boundsBehavior: Flickable.StopAtBounds
       model: quickAccessRoot.rankedItems
       currentIndex: quickAccessRoot.selectedIndex
       ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
-      delegate: Rectangle {
+      delegate: Item {
         id: row
         required property var modelData
         required property int index
         readonly property bool selected: index === quickAccessRoot.selectedIndex
+        readonly property string sectionTitle: quickAccessRoot.sectionTitleAt(index)
         width: itemList.width
-        height: quickAccessRoot.rowHeight
-        radius: Style.cornerRadius
-        color: (selected || rowMouse.containsMouse) ? quickAccessRoot.selectedBackground : "transparent"
+        height: quickAccessRoot.rowHeight + (sectionTitle !== "" ? quickAccessRoot.sectionHeaderHeight : 0)
+
+        Text {
+          textFormat: Text.PlainText
+          visible: row.sectionTitle !== ""
+          anchors.left: parent.left
+          anchors.leftMargin: 10
+          anchors.bottom: rowArea.top
+          anchors.bottomMargin: 4
+          text: row.sectionTitle
+          color: quickAccessRoot.muted
+          font.family: quickAccessRoot.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+        }
+
+        Rectangle {
+          id: rowArea
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.bottom: parent.bottom
+          height: quickAccessRoot.rowHeight
+          radius: Style.cornerRadius
+          color: (row.selected || rowMouse.containsMouse) ? quickAccessRoot.selectedBackground : "transparent"
+        }
 
         MouseArea {
           id: rowMouse
-          anchors.fill: parent
+          anchors.fill: rowArea
           hoverEnabled: true
           cursorShape: Qt.PointingHandCursor
           onEntered: quickAccessRoot.selectedIndex = row.index
@@ -380,7 +424,7 @@ FocusScope {
           anchors.leftMargin: 10
           anchors.right: actions.left
           anchors.rightMargin: 8
-          anchors.verticalCenter: parent.verticalCenter
+          anchors.verticalCenter: rowArea.verticalCenter
           spacing: 2
 
           Text {
@@ -410,7 +454,7 @@ FocusScope {
           id: actions
           anchors.right: parent.right
           anchors.rightMargin: 6
-          anchors.verticalCenter: parent.verticalCenter
+          anchors.verticalCenter: rowArea.verticalCenter
           spacing: 2
 
           GhostIconButton {

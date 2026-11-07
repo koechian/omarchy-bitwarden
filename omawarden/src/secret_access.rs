@@ -583,6 +583,7 @@ fn copy(state: &DaemonState, request: &Value) -> Result<Value, ReleaseError> {
             "Failed to copy to clipboard.",
         ));
     }
+    state.record_item_use(&request.item_id);
     Ok(json!({
         "ok": true,
         "id": request.item_id,
@@ -844,6 +845,58 @@ mod tests {
         );
         assert_eq!(response["error_code"], error_code::CLIPBOARD_FAILED);
         assert_eq!(state.release_budget.lock().unwrap().recorded(), 0);
+    }
+
+    fn recorded_uses(state: &DaemonState, item_id: &str) -> usize {
+        state.item_usage.lock().unwrap().table().uses(item_id).len()
+    }
+
+    #[test]
+    fn test_copy_field_success_records_one_use_of_the_item() {
+        let (dir, state) = unlocked_state(all_fixture_items());
+        let (program, _clip) = mock_clipboard(dir.path());
+        let mut state = Arc::try_unwrap(state).ok().unwrap();
+        state.clipboard_program = program.to_string_lossy().to_string();
+        let response = handle_copy_field(
+            &state,
+            &json!({ "id": "login-1", "field": "login.password" }),
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(recorded_uses(&state, "login-1"), 1);
+        assert_eq!(recorded_uses(&state, "card-1"), 0);
+
+        let saved =
+            std::fs::read_to_string(dir.path().join(crate::item_usage::USAGE_FILENAME)).unwrap();
+        assert!(saved.contains("login-1"));
+        for secret in [fixtures::LOGIN_PASSWORD, "fixture-user", "example.com"] {
+            assert!(!saved.contains(secret), "usage file leaks {secret}");
+        }
+    }
+
+    #[test]
+    fn test_failed_or_refunded_copy_and_reveal_record_no_use() {
+        let (dir, state) = unlocked_state(all_fixture_items());
+        let mut state = Arc::try_unwrap(state).ok().unwrap();
+        state.clipboard_program = dir
+            .path()
+            .join("missing-clipboard-program")
+            .to_string_lossy()
+            .to_string();
+        let refunded = handle_copy_field(
+            &state,
+            &json!({ "id": "login-1", "field": "login.password" }),
+        );
+        assert_eq!(refunded["error_code"], error_code::CLIPBOARD_FAILED);
+        let refused = handle_copy_field(
+            &state,
+            &json!({ "id": "login-1", "field": "password_history" }),
+        );
+        assert_eq!(refused["error_code"], error_code::FIELD_NOT_COPYABLE);
+        let revealed = handle_reveal_field(&state, &json!({ "id": "login-1", "field": "notes" }));
+        assert_eq!(revealed["ok"], true, "{revealed}");
+
+        assert_eq!(recorded_uses(&state, "login-1"), 0);
+        assert!(!dir.path().join(crate::item_usage::USAGE_FILENAME).exists());
     }
 
     #[test]

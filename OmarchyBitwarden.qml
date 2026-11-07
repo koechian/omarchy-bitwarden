@@ -263,7 +263,7 @@ Item {
   property var rawVaultItems: []
   property var filteredItems: []
   property string searchQuery: ""
-  property var categoryList: ["all", "login", "card", "identity", "note"]
+  property var categoryList: ["all", "recent", "login", "card", "identity", "note"]
   property string activeCategory: "all"
   property string activeVaultScope: "all"
   property string activeFolderScope: "all"

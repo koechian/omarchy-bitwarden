@@ -8,7 +8,7 @@ import "./VaultSearch.js" as VaultSearch
 RowLayout {
   id: tabRoot
 
-  property var categoryList: ["all", "login", "card", "identity", "note"]
+  property var categoryList: ["all", "recent", "login", "card", "identity", "note"]
   property string activeCategory: "all"
   property var rawVaultItems: []
   property color foreground: Commons.Color.foreground
@@ -26,6 +26,7 @@ RowLayout {
   function getCategoryLabel(cat) {
     switch (cat) {
       case "all": return "All"
+      case "recent": return "Recent"
       case "login": return "Logins"
       case "card": return "Cards"
       case "identity": return "Identities"

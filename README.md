@@ -116,6 +116,12 @@ The plugin adds a lock icon to the bar (right section by default). Move it with
   one after the other, such as `tsh login`. The engine serves the clipboard itself for this: it ignores
   the reads that clipboard watchers make the moment a value is copied, treats the next read as your
   paste, and swaps in the code. Copying something else in between cancels the sequence.
+- **Recent**: with nothing typed, the dropdown lists up to five logins you use most, above the rest;
+  the full window has a *Recent* tab, and while you search, logins you use often rank first among
+  equally good matches. The engine counts each password or code copy (a "password, then code" copy
+  counts once) and lets each one lose half its weight every 7 days, so habits from last week outrank a
+  one-off from this morning and old ones fade. Only item ids and times are kept, for 90 days, in a
+  file readable only by you; signing out clears it.
 - **Right click** opens the full vault window (cards, identities, notes, generator, settings, sign-in).
 
 ### 3. Bind hotkeys (optional, in `~/.config/hypr/bindings.lua`)
@@ -162,7 +168,7 @@ rm ~/.local/bin/omawarden
 | <kbd>Ctrl</kbd> + <kbd>L</kbd> | Lock the vault |
 | <kbd>Ctrl</kbd> + <kbd>R</kbd> | Sync with the server |
 | <kbd>↓</kbd> / <kbd>↑</kbd> | Move through items or actions |
-| <kbd>Tab</kbd> | Switch category (All, Logins, Cards, Identities, Secure Note) |
+| <kbd>Tab</kbd> | Switch category (All, Recent, Logins, Cards, Identities, Secure Note) |
 | <kbd>Alt</kbd> + <kbd>V</kbd> | Cycle the vault or organization filter |
 | <kbd>Alt</kbd> + <kbd>F</kbd> | Cycle the folder filter |
 | <kbd>Esc</kbd> | Close a dialog, or hide the overlay |
