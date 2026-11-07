@@ -198,6 +198,20 @@ Item {
       // 11. Markup in a name is shown as plain text.
       var nameText = testRunner.findByText(quickAccess, "Zeta <img src=\"https://example.invalid/x\">")
       Assert.check(nameText !== null && nameText.textFormat === Text.PlainText, "item names are plain text")
+
+      // 12. Section labels while recent logins lead the list.
+      quickAccess.vaultItems = [
+        { id: "r", name: "Teleport", type_name: "login", favorite: false, usage_score: 4,
+          login: { username: "me", has_password: true, has_totp: true } },
+        { id: "o", name: "Amazon", type_name: "login", favorite: false, usage_score: 0,
+          login: { username: "shopper", has_password: true } }
+      ]
+      Assert.check(quickAccess.recentCount === 1, "one recent login")
+      Assert.check(quickAccess.sectionTitleAt(0) === "Recent" && quickAccess.sectionTitleAt(1) === "All logins", "section labels head the recent and the other logins")
+      Assert.check(quickAccess.listHeight() === 2 * quickAccess.rowHeight + 2 * quickAccess.sectionHeaderHeight, "the list makes room for both labels")
+      quickAccess.query = "tele"
+      Assert.check(quickAccess.recentCount === 0 && quickAccess.sectionTitleAt(0) === "", "no section labels while a query is typed")
+      quickAccess.reset()
       Qt.exit(Assert.exitCode())
     }
   }

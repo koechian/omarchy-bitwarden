@@ -14,6 +14,7 @@ use zeroize::Zeroizing;
 
 use crate::daemon_actions::ActionOutcome;
 use crate::daemon_requests::{ConnectionLimiter, RESPONSE_WRITE_TIMEOUT};
+use crate::item_usage::ItemUsage;
 use crate::secret_access::ReleaseBudget;
 use crate::secret_memory::{serialize_zeroizing, zeroize_json_value};
 use crate::session_supervision::{SessionBinding, SleepInhibitor, SupervisionPrograms};
@@ -402,6 +403,9 @@ pub struct DaemonState {
     pub sleep_pending: AtomicBool,
     /// The login session this daemon ends with.
     pub session_binding: SessionBinding,
+    /// ADR 0029: recent uses of vault items, saved in `usage.json` next to
+    /// the vault cache. Kept by every lock; cleared by logout.
+    pub item_usage: Mutex<ItemUsage>,
     /// (device, inode) of the socket this daemon bound, so it only ever
     /// removes its own socket file on exit.
     pub bound_socket: Mutex<Option<(PathBuf, u64, u64)>>,
@@ -472,6 +476,10 @@ pub fn initial_auto_lock_duration(minutes: u64) -> Duration {
 
 impl DaemonState {
     pub fn new(storage_mgr: StorageManager, auto_lock_minutes: u64) -> Self {
+        let item_usage = ItemUsage::load(
+            crate::item_usage::usage_file_path(&storage_mgr.file_path),
+            crate::item_usage::current_unix_seconds(),
+        );
         let vault_mgr = Arc::new(VaultManager::new("", Some(storage_mgr), None));
         let polkit_binary = resolve_pkcheck().unwrap_or_default();
         let config = crate::config::ConfigManager::default().load();
@@ -503,6 +511,7 @@ impl DaemonState {
             sleep_generation: AtomicU64::new(0),
             sleep_pending: AtomicBool::new(false),
             session_binding: SessionBinding::from_environment(runtime_dir.as_deref()),
+            item_usage: Mutex::new(item_usage),
             bound_socket: Mutex::new(None),
         }
     }
@@ -965,7 +974,54 @@ impl DaemonState {
         &self,
         client_context: Option<&crate::api::ClientContext>,
     ) -> Result<usize, String> {
-        self.vault_mgr.sync_with_client(client_context)
+        let count = self.vault_mgr.sync_with_client(client_context)?;
+        self.retain_usage_of_vault_items();
+        Ok(count)
+    }
+
+    /// The usage table, recovered when a holder panicked: usage is
+    /// advisory and never blocks a request.
+    fn item_usage(&self) -> std::sync::MutexGuard<'_, ItemUsage> {
+        self.item_usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Records one use of `item_id` (ADR 0029). Called only after a
+    /// release was delivered; a failed save is logged, never returned.
+    pub fn record_item_use(&self, item_id: &str) {
+        let now = crate::item_usage::current_unix_seconds();
+        self.item_usage().record_use(item_id, now);
+    }
+
+    /// Adds `usage_score` and `last_used_at` to every redacted item of
+    /// `listing`.
+    pub fn annotate_item_usage(&self, listing: &mut Value) {
+        let now = crate::item_usage::current_unix_seconds();
+        self.item_usage().table().annotate_items(listing, now);
+    }
+
+    /// Adds `usage_score` and `last_used_at` to one redacted item.
+    pub fn annotate_single_item_usage(&self, view: &mut Value) {
+        let now = crate::item_usage::current_unix_seconds();
+        self.item_usage().table().annotate_item(view, now);
+    }
+
+    /// Forgets every recorded use and deletes the usage file (logout).
+    pub fn clear_item_usage(&self) {
+        self.item_usage().clear();
+    }
+
+    /// After a successful sync: drops the usage of items no longer in the
+    /// vault. Skipped when the vault cache cannot be read.
+    fn retain_usage_of_vault_items(&self) {
+        let Ok(storage) = self.vault_mgr.storage.read() else {
+            return;
+        };
+        let present = crate::item_usage::vault_item_ids(&storage);
+        drop(storage);
+        let now = crate::item_usage::current_unix_seconds();
+        self.item_usage().retain_items(&present, now);
     }
 
     /// Auto-clear for `copy_field`: the configured value when positive,
@@ -1723,6 +1779,81 @@ mod tests {
 
         let category = send_request(&state, json!({ "action": "list", "category": "card" }));
         assert_eq!(category.as_array().unwrap().len(), 1);
+    }
+
+    fn recorded_uses(state: &DaemonState, item_id: &str) -> usize {
+        state.item_usage().table().uses(item_id).len()
+    }
+
+    #[test]
+    fn test_list_search_and_get_item_carry_usage_fields() {
+        let (dir, state) = state_with_fixture_items();
+        state.record_item_use("login-1");
+        let listing = send_request(&state, json!({ "action": "list" }));
+        for view in listing.as_array().unwrap() {
+            assert!(view["usage_score"].is_number(), "{view}");
+            assert!(view.get("last_used_at").is_some(), "{view}");
+        }
+        let login = listing
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["id"] == "login-1")
+            .unwrap();
+        assert_eq!(login["usage_score"], json!(1.0));
+        let last_used = login["last_used_at"].as_str().unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(last_used).is_ok());
+        let card = listing
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["id"] == "card-1")
+            .unwrap();
+        assert_eq!(card["usage_score"], json!(0.0));
+        assert_eq!(card["last_used_at"], Value::Null);
+
+        let search = send_request(&state, json!({ "action": "search", "query": "" }));
+        assert!(search[0]["usage_score"].is_number(), "{search}");
+        let item = send_request(&state, json!({ "action": "get_item", "query": "login-1" }));
+        assert_eq!(item["item"]["usage_score"], json!(1.0), "{item}");
+        assert!(dir.path().join(crate::item_usage::USAGE_FILENAME).exists());
+    }
+
+    #[test]
+    fn test_lock_keeps_item_usage_and_clear_item_usage_forgets_it() {
+        let (dir, state) = state_with_fixture_items();
+        let usage_file = dir.path().join(crate::item_usage::USAGE_FILENAME);
+        state.record_item_use("login-1");
+        state.lock();
+        state.soft_lock();
+        assert_eq!(recorded_uses(&state, "login-1"), 1, "locking keeps usage");
+        assert!(usage_file.exists());
+
+        let response = send_request(&state, json!({ "action": "clear_item_usage" }));
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(recorded_uses(&state, "login-1"), 0);
+        assert!(!usage_file.exists(), "logout deletes the usage file");
+    }
+
+    #[test]
+    fn test_usage_is_loaded_from_the_data_directory_at_start() {
+        let dir = tempdir().unwrap();
+        let storage = StorageManager::new(dir.path().join("data.json"));
+        DaemonState::new(storage.clone(), 15).record_item_use("item-1");
+        let restarted = DaemonState::new(storage, 15);
+        assert_eq!(recorded_uses(&restarted, "item-1"), 1);
+    }
+
+    #[test]
+    fn test_sync_prunes_usage_of_items_no_longer_in_the_vault() {
+        let (_dir, state) = state_with_fixture_items();
+        state.record_item_use("login-1");
+        state.record_item_use("deleted-item");
+        state.vault_mgr.storage.write().unwrap().ciphers =
+            vec![json!({ "id": "login-1" }), json!({ "id": "card-1" })];
+        state.retain_usage_of_vault_items();
+        assert_eq!(recorded_uses(&state, "login-1"), 1);
+        assert_eq!(recorded_uses(&state, "deleted-item"), 0);
     }
 
     #[test]

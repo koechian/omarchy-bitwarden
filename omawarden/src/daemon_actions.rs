@@ -72,6 +72,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     action("copy", false, false, handle_copy_text),
     action("generate_password", false, false, handle_generate_password),
     action("set_auto_lock", false, false, handle_set_auto_lock),
+    action("clear_item_usage", false, false, handle_clear_item_usage),
 ];
 
 /// Shortest accepted idle auto-lock interval.
@@ -213,14 +214,34 @@ fn handle_sync(state: &DaemonState, request: &Value) -> ActionOutcome {
 fn handle_list(state: &DaemonState, request: &Value) -> ActionOutcome {
     let category = text_argument(request, "category");
     let items = state.vault_mgr.search_items("", category);
-    respond(crate::item_redaction::redact_items(&items))
+    respond(redacted_listing(state, &items))
 }
 
 fn handle_search(state: &DaemonState, request: &Value) -> ActionOutcome {
     let query = text_argument(request, "query").unwrap_or("");
     let category = text_argument(request, "category");
     let items = state.vault_mgr.search_items(query, category);
-    respond(crate::item_redaction::redact_items(&items))
+    respond(redacted_listing(state, &items))
+}
+
+/// The redacted items, each with its `usage_score` and `last_used_at`.
+fn redacted_listing(state: &DaemonState, items: &[crate::vault::VaultItem]) -> Value {
+    let mut listing = crate::item_redaction::redact_items(items);
+    state.annotate_item_usage(&mut listing);
+    listing
+}
+
+fn redacted_item(state: &DaemonState, item: &crate::vault::VaultItem) -> Value {
+    let mut view = crate::item_redaction::redact_item(item);
+    state.annotate_single_item_usage(&mut view);
+    view
+}
+
+/// Logout (ADR 0029): forgets every recorded item use and deletes the
+/// usage file. Works while locked; locking alone keeps the record.
+fn handle_clear_item_usage(state: &DaemonState, _request: &Value) -> ActionOutcome {
+    state.clear_item_usage();
+    respond(json!({ "ok": true }))
 }
 
 fn handle_get_item(state: &DaemonState, request: &Value) -> ActionOutcome {
@@ -229,7 +250,7 @@ fn handle_get_item(state: &DaemonState, request: &Value) -> ActionOutcome {
     match state.vault_mgr.find_item(query, category) {
         Some(item) => respond(json!({
             "ok": true,
-            "item": crate::item_redaction::redact_item(&item),
+            "item": redacted_item(state, &item),
         })),
         None => respond(json!({
             "ok": false,
@@ -422,6 +443,7 @@ mod tests {
             "sync",
             "totp",
             "set_auto_lock",
+            "clear_item_usage",
             "unknown",
             "",
         ] {
@@ -442,6 +464,12 @@ mod tests {
         ] {
             assert!(find_action(name).unwrap().requires_unlocked, "{name}");
         }
+    }
+
+    #[test]
+    fn test_clear_item_usage_works_while_locked() {
+        let spec = find_action("clear_item_usage").unwrap();
+        assert!(!spec.requires_unlocked, "logout may happen while locked");
     }
 
     #[test]

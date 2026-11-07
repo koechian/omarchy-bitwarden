@@ -39,6 +39,26 @@ Item {
     var searchText = VaultSearch.buildSearchText(items[2])
     Assert.check(searchText.indexOf("pin") !== -1 && searchText.indexOf("undefined") === -1, "hidden custom fields contribute their name only")
     Assert.check(VaultSearch.indexOfItem(items, "3") === 2 && VaultSearch.indexOfItem(items, "missing") === 0, "selection index lookup")
+    // Recent use.
+    var used = [
+      { id: "a", name: "Alpha", type_name: "login", favorite: false, usage_score: 0, login: { username: "a" } },
+      { id: "b", name: "Alpine", type_name: "login", favorite: false, usage_score: 2.5, login: { username: "b" } },
+      { id: "c", name: "Alps", type_name: "login", favorite: false, usage_score: 0.05, login: { username: "c" } },
+      { id: "d", name: "Beta", type_name: "login", favorite: false, usage_score: 4, login: { username: "d" } },
+      { id: "e", name: "Gamma", type_name: "login", favorite: false, usage_score: "junk", login: { username: "e" } }
+    ]
+    var recent = { vaultScope: "all", folderScope: "all", category: "recent" }
+    Assert.check(ids(VaultSearch.filterItems(used, "", recent)) === "d,b", "the recent category lists items from the minimum score, most used first")
+    Assert.check(ids(VaultSearch.filterItems(used, "alp", recent)) === "b", "a query inside the recent category keeps to recent items")
+    Assert.check(ids(VaultSearch.filterItems(used, "alp", all)) === "b,c,a", "recent use orders matches of the same strength")
+    Assert.check(ids(VaultSearch.filterItems(used, "alpha", all))[0] === "a", "recent use never outranks a stronger match")
+    var favouriteAndUsed = [
+      { id: "u", name: "Used", type_name: "login", favorite: false, usage_score: 5 },
+      { id: "f", name: "Favourite", type_name: "login", favorite: true, usage_score: 0 }
+    ]
+    Assert.check(ids(VaultSearch.filterItems(favouriteAndUsed, "", all)) === "f,u", "without a query recent use does not outrank a favourite")
+    Assert.check(VaultSearch.usageScore(used[4]) === 0 && VaultSearch.usageScore(null) === 0, "a missing or malformed score counts as never used")
+    Assert.check(VaultSearch.usageBoost({ usage_score: 100 }) === 300, "the boost is capped")
     Qt.exit(Assert.exitCode())
   }
 }

@@ -103,6 +103,8 @@ The daemon never hands out the decrypted vault in bulk. `list`, `search` and `ge
   "organization_id": "…", "organization_name": "Acme", // optional
   "collection_ids": ["…"],                    // optional
   "has_notes": true,                // notes are secret: reveal with field "notes"
+  "usage_score": 1.906,             // recent use (section 3.7): number, 3 decimals; 0 when never used
+  "last_used_at": "2026-11-07T09:12:44Z", // latest recorded use, RFC 3339 UTC; null when never used
 
   // Only on type 1:
   "login": {
@@ -147,6 +149,8 @@ The daemon never hands out the decrypted vault in bulk. `list`, `search` and `ge
 ```
 
 Never present in a redacted item: `notes`, `login.password`, `login.totp`, `login.password_history`, `card.number`, `card.code`, `identity.ssn`, `identity.passportNumber`, `identity.licenseNumber`, hidden custom field values (and values of any custom field type other than 0 and 2), and the internal `search_text`. `search` matches names, subtitles, usernames, URIs, card brand / holder / last four digits, identity name / email / phone / company / address, folder and organization names, custom field names and text/boolean values; it never matches secret content.
+
+`usage_score` and `last_used_at` are on every redacted item from `list`, `search` and `get_item` (engine 0.14.0 and later). They are not secret: they say how often and how lately the user copied something from the item, never what.
 
 ### 3.3 Field identifiers
 
@@ -207,10 +211,18 @@ Errors carry a machine-readable `error_code` next to `error`:
 ### 3.5 Release budget, idle timer and auto-lock
 
 - **Budget**: successful releases (`reveal_field`, `copy_field` and `copy_sequence` together; a sequence counts one per field) are limited in two sliding windows: at most **30** in any **60 seconds** and at most **120** in any **hour**. Each release costs one, except `password_history`, which costs one per history entry (at least one). A request whose cost would exceed either limit is refused with `release_limit_exceeded`, the vault is hard-locked (keys and decrypted items zeroized, retained quick-unlock key wiped) and a warning is logged; a password history with more than 30 entries can never be released. Failed requests are not counted. A hard lock resets both windows. The overlay should fetch a TOTP code once and count `seconds_remaining` down locally (one release per period), and should reveal on explicit user action only.
-- **Idle timer**: reset only by `search`, `get_item` and a successful `unlock` / `quick_unlock`. Not reset by `reveal_field`, `copy_field`, `copy_sequence` (so releasing secrets at a steady pace cannot keep the vault unlocked), `copy`, `generate_password`, `totp` (these work while locked), `ping`, `status`, `list`, `sync`, `lock`, `set_auto_lock`. There is no client override: a `"touch"` field is ignored. A user who only copies or reveals, without searching, is idle-locked after the configured interval.
+- **Idle timer**: reset only by `search`, `get_item` and a successful `unlock` / `quick_unlock`. Not reset by `reveal_field`, `copy_field`, `copy_sequence` (so releasing secrets at a steady pace cannot keep the vault unlocked), `copy`, `generate_password`, `totp` (these work while locked), `ping`, `status`, `list`, `sync`, `lock`, `set_auto_lock`, `clear_item_usage`. There is no client override: a `"touch"` field is ignored. A user who only copies or reveals, without searching, is idle-locked after the configured interval.
 - **`set_auto_lock`**: `{"action": "set_auto_lock", "auto_lock_seconds": n}` or `{"auto_lock_minutes": n}`; n must give 60 seconds to 12 hours (43200 s). Zero is refused: `{"ok": false, "error": "Auto-lock must be between 60 and 43200 seconds (1 minute to 12 hours); disabling it is not supported."}`. `omawarden config set --auto-lock` validates the same range (1 to 720 minutes). A configured value outside the range starts the daemon with 15 minutes and a warning. The 12-hour session ceiling is unchanged.
 - **Other locks**: suspend and the end of the login session hard-lock (the latter also stops the daemon). An `unlock` still deriving its key when the system prepares to sleep fails with `{"ok": false, "status": "locked", "error": "The system went to sleep during unlock. Unlock again."}` and leaves the vault locked; the same error is returned for an unlock attempted between `PrepareForSleep(true)` and the resume. Quick unlock (`quick_unlock` config, default `false`) is the only way a key survives a screen or idle lock.
 - **Clipboard on lock**: no lock clears the clipboard. Every lock withdraws the clipboard offers the daemon still serves (from `copy_field`, from `copy` with `sensitive: true` and a non-zero timeout, and an active `copy_sequence`); an offer another application has replaced has already ended, and that application's content is left alone. Non-sensitive copies without an auto-clear are not withdrawn.
+
+### 3.7 Recent use (ADR 0029)
+
+- **What counts as a use**: a successful `copy_field` of any field of the item (one use), and a successful `copy_sequence` (one use per sequence, not per field). Recorded only after the clipboard write succeeded or the sequence started. `reveal_field`, `copy` (caller-supplied text), refused or failed requests and refunded releases never count. `omawarden copy <id-or-name>` counts because it releases through `copy_field`.
+- **Score**: `usage_score = Σ 0.5 ^ ((now − t) / 7 days)` over the item's kept use timestamps `t`, rounded to 3 decimals. A use counts 1.0 when it happens, 0.5 a week later, 0.25 after two weeks. Sorting by `usage_score` descending ranks items copied often and lately first. A timestamp in the future (clock moved back) counts 1.0.
+- **Kept uses**: at most the **20** most recent per item; uses older than **90 days** are dropped on every write and when the daemon starts.
+- **Storage**: `usage.json` in the directory of the vault cache (`data.json`), mode `0600`, directory `0700`, written atomically. Content: `{"version": 1, "items": {"<item id>": [<Unix seconds>, …]}}`, ascending per item. Item ids and timestamps only; never names, URIs or secret values. A file that cannot be read or parsed is treated as empty; a failed write is logged as a warning and never fails the copy.
+- **Lifecycle**: a successful `sync` removes the entries of items no longer in the vault. Locking (hard, soft, idle, suspend, budget) keeps the record. Logout (`omawarden auth logout`) and a server change delete it: logout sends `{"action": "clear_item_usage"}` (accepted while locked; response `{"ok": true}`) so the daemon forgets its in-memory table and deletes the file, and removes the file itself when no daemon answers.
 
 ### 3.6 CLI commands for the overlay
 

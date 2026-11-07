@@ -83,6 +83,10 @@ Item {
     Assert.check(tabBar.getCategoryCount("all") === 0, "an empty vault counts zero")
     tabBar.rawVaultItems = null
     Assert.check(tabBar.getCategoryCount("login") === 0, "a missing listing counts zero")
+    Assert.check(tabBar.categoryList.indexOf("recent") === 1 && tabBar.getCategoryLabel("recent") === "Recent", "the Recent tab follows All")
+    tabBar.rawVaultItems = [{ id: "u", type_name: "login", usage_score: 2 }, { id: "n", type_name: "login", usage_score: 0 }]
+    Assert.check(tabBar.getCategoryCount("recent") === 1, "the Recent tab counts recently used items")
+    tabBar.rawVaultItems = testRunner.items
     Qt.exit(Assert.exitCode())
   }
 }

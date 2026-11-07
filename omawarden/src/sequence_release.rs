@@ -101,6 +101,7 @@ fn copy_sequence(state: &DaemonState, request: &Value) -> Result<Value, ReleaseE
             format!("Failed to stage the paste sequence: {message}"),
         ));
     }
+    state.record_item_use(&request.item_id);
     let identifiers: Vec<String> = request.fields.iter().map(SecretField::identifier).collect();
     Ok(json!({
         "ok": true,
@@ -198,6 +199,35 @@ mod tests {
         assert_eq!(stages[1], expected_code.as_bytes());
         assert_eq!(recorded_releases(&state), 2, "one release per stage");
         assert!(state.clipboard_offers.paste_sequence_active());
+    }
+
+    fn recorded_uses(state: &DaemonState, item_id: &str) -> usize {
+        state.item_usage.lock().unwrap().table().uses(item_id).len()
+    }
+
+    #[test]
+    fn test_copy_sequence_records_exactly_one_use() {
+        let (_dir, state, _record) = recording_state();
+        let response = handle_copy_sequence(
+            &state,
+            &json!({ "id": "login-1", "fields": ["login.password", "login.totp", "notes"] }),
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(recorded_releases(&state), 3, "one release per stage");
+        assert_eq!(recorded_uses(&state, "login-1"), 1, "one use per sequence");
+    }
+
+    #[test]
+    fn test_a_sequence_that_cannot_start_records_no_use() {
+        let (_dir, state) = state_with_launcher(Arc::new(|_, _| {
+            Err("The compositor offers no clipboard data-control protocol.".to_string())
+        }));
+        let response = handle_copy_sequence(
+            &state,
+            &json!({ "id": "login-1", "fields": ["login.password", "login.totp"] }),
+        );
+        assert_eq!(response["error_code"], error_code::CLIPBOARD_FAILED);
+        assert_eq!(recorded_uses(&state, "login-1"), 0);
     }
 
     #[test]
