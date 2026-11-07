@@ -41,7 +41,11 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  onOpenedChanged: opened ? refresh() : forgetInput()
+  // Closing clears the master password field at once; the rest of what the
+  // dropdown shows (query, details page, messages) is kept until the card
+  // has faded out, so the exit shows the dropdown as it was instead of a
+  // card that changes size and content in its first frame.
+  onOpenedChanged: opened ? refresh() : forgetSecretInput()
 
   // --- full window ---------------------------------------------------------
 
@@ -61,6 +65,10 @@ Panel {
     root.errorText = ""
     if (root.vaultItems.length === 0) root.view = QuickAccessModel.VIEW_LOADING
     statusCommand.run(["auth", "status"], "")
+  }
+
+  function forgetSecretInput() {
+    if (panel.loadedContent) panel.loadedContent.clearSecretInput()
   }
 
   function forgetInput() {
@@ -212,6 +220,33 @@ Panel {
     onTriggered: root.showCopied = false
   }
 
+  // The glyph swap (lock to check mark and back) settles in rather than
+  // flipping, so the confirmation reads as intended after the dropdown has
+  // closed. Subtle, because copies happen many times a day.
+  onShowCopiedChanged: glyphSettle.restart()
+
+  ParallelAnimation {
+    id: glyphSettle
+    NumberAnimation {
+      target: button
+      property: "scale"
+      from: 0.9
+      to: 1
+      duration: Style.duration(120)
+      easing.type: Easing.Bezier
+      easing.bezierCurve: Style.easeOut
+    }
+    NumberAnimation {
+      target: button
+      property: "opacity"
+      from: 0.5
+      to: 1
+      duration: Style.duration(120)
+      easing.type: Easing.Bezier
+      easing.bezierCurve: Style.easeOut
+    }
+  }
+
   // --- engine commands -----------------------------------------------------
 
   // One omawarden invocation. Quickshell reports the end of stdout and the
@@ -344,6 +379,8 @@ Panel {
     focusTarget: panel.loadedContent
     contentWidth: panel.fittedContentWidth(380)
     contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, 560)
+    // `visible` stays true through the fade-out and drops when it ends.
+    onVisibleChanged: if (!visible && !root.opened) root.forgetInput()
 
     content: Components.QuickAccessView {
       anchors.fill: parent

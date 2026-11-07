@@ -157,8 +157,13 @@ Item {
     quickAccess.submitUnlock()
     Assert.check(unlocks.length === 1, "an empty field does not unlock")
     passwordField.text = "typed but not sent"
+    quickAccess.query = "kept while the card fades"
+    quickAccess.clearSecretInput()
+    Assert.check(passwordField.text === "", "starting to close clears a typed password at once")
+    Assert.check(quickAccess.query === "kept while the card fades", "starting to close keeps what the fading card shows")
+    passwordField.text = "typed but not sent"
     quickAccess.reset()
-    Assert.check(passwordField.text === "", "closing the dropdown clears a typed password")
+    Assert.check(passwordField.text === "", "the reset after the fade also clears a typed password")
 
     // 9. Query filters the list.
     quickAccess.view = QuickAccessModel.VIEW_UNLOCKED
@@ -177,7 +182,10 @@ Item {
     Assert.check(sequenceButton !== null && sequenceButton.visible, "the paste sequence is offered for an item with a password and a code")
     quickAccess.openDetails(quickAccess.vaultItems[1])
     Assert.check(!sequenceButton.visible, "the paste sequence is not offered without a code")
+    quickAccess.closeDetails()
     quickAccess.reset()
+    Assert.check(quickAccess.listOpacity === 1 && quickAccess.listOffset === 0
+      && quickAccess.detailOpacity === 1 && quickAccess.detailOffset === 0, "reset stops a page change and leaves both pages at rest")
 
     // List rows are built when the view is laid out, after this handler.
     layoutWait.start()
@@ -190,6 +198,20 @@ Item {
       // 11. Markup in a name is shown as plain text.
       var nameText = testRunner.findByText(quickAccess, "Zeta <img src=\"https://example.invalid/x\">")
       Assert.check(nameText !== null && nameText.textFormat === Text.PlainText, "item names are plain text")
+
+      // 12. Section labels while recent logins lead the list.
+      quickAccess.vaultItems = [
+        { id: "r", name: "Teleport", type_name: "login", favorite: false, usage_score: 4,
+          login: { username: "me", has_password: true, has_totp: true } },
+        { id: "o", name: "Amazon", type_name: "login", favorite: false, usage_score: 0,
+          login: { username: "shopper", has_password: true } }
+      ]
+      Assert.check(quickAccess.recentCount === 1, "one recent login")
+      Assert.check(quickAccess.sectionTitleAt(0) === "Recent" && quickAccess.sectionTitleAt(1) === "All logins", "section labels head the recent and the other logins")
+      Assert.check(quickAccess.listHeight() === 2 * quickAccess.rowHeight + 2 * quickAccess.sectionHeaderHeight, "the list makes room for both labels")
+      quickAccess.query = "tele"
+      Assert.check(quickAccess.recentCount === 0 && quickAccess.sectionTitleAt(0) === "", "no section labels while a query is typed")
+      quickAccess.reset()
       Qt.exit(Assert.exitCode())
     }
   }

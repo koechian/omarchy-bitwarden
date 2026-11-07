@@ -9,6 +9,17 @@
 var FAVORITE_SCORE = 100
 var NO_MATCH = -1
 
+// Recent use (`usage_score` of a redacted item, contracts.md 3.2: the sum of
+// the item's recorded copies, each halving in weight every 7 days). An item
+// is recent from RECENT_MINIMUM_SCORE, which one copy falls below after
+// about 23 days. While a query is typed, recent use adds up to
+// USAGE_SCORE_CEILING * USAGE_BOOST_PER_SCORE points: enough to order
+// matches of the same strength, never enough to outrank a stronger match.
+var RECENT_CATEGORY = "recent"
+var RECENT_MINIMUM_SCORE = 0.1
+var USAGE_SCORE_CEILING = 5
+var USAGE_BOOST_PER_SCORE = 60
+
 // Ranked matchers for one query word, strongest first.
 var WORD_MATCHERS = [
   { score: 2000, matches: function(word, text) { return text.name === word } },
@@ -84,7 +95,21 @@ function matchFolderScope(item, scope) {
   return item.folder_id === scope || item.folder_name === scope
 }
 
+function usageScore(item) {
+  var score = Number(item && item.usage_score)
+  return isFinite(score) && score > 0 ? score : 0
+}
+
+function isRecent(item) {
+  return usageScore(item) >= RECENT_MINIMUM_SCORE
+}
+
+function usageBoost(item) {
+  return Math.round(Math.min(usageScore(item), USAGE_SCORE_CEILING) * USAGE_BOOST_PER_SCORE)
+}
+
 function matchCategory(item, category) {
+  if (category === RECENT_CATEGORY) return isRecent(item)
   return category === "all" || item.type_name === category
 }
 
@@ -109,13 +134,18 @@ function scoreItem(item, words) {
     subtitle: lower(item.sub_title),
     searchable: item.local_search_text !== undefined ? item.local_search_text : buildSearchText(item)
   }
-  var total = item.favorite ? FAVORITE_SCORE : 0
+  var total = (item.favorite ? FAVORITE_SCORE : 0) + (words.length > 0 ? usageBoost(item) : 0)
   for (var i = 0; i < words.length; i++) {
     var score = wordScore(words[i], text)
     if (score === NO_MATCH) return NO_MATCH
     total += score
   }
   return total
+}
+
+// Most used first; the recent category lists this way while no query is typed.
+function compareByUsage(a, b) {
+  return usageScore(b) - usageScore(a)
 }
 
 // Items passing the scope and category filters, ranked for the query.
@@ -128,7 +158,9 @@ function filterItems(items, query, filters) {
     if (score !== NO_MATCH) scored.push({ item: item, score: score })
   })
   scored.sort(function(a, b) { return b.score - a.score })
-  return scored.map(function(entry) { return entry.item })
+  var ranked = scored.map(function(entry) { return entry.item })
+  if (filters.category === RECENT_CATEGORY && words.length === 0) ranked.sort(compareByUsage)
+  return ranked
 }
 
 function indexOfItem(items, itemId) {

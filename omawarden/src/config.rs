@@ -271,6 +271,10 @@ impl ConfigManager {
             if storage_mgr.file_path.exists() {
                 let _ = fs::remove_file(&storage_mgr.file_path);
             }
+            // ADR 0029: the recent-use record belongs to the old account.
+            crate::item_usage::remove_usage_file(&crate::item_usage::usage_file_path(
+                &storage_mgr.file_path,
+            ));
 
             keyring_mgr.clear_all();
             keyring_mgr.clear_session(&cfg.server_url);

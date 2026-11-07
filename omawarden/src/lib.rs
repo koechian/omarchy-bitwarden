@@ -11,6 +11,7 @@ pub mod generator;
 pub mod health;
 pub mod hook;
 pub mod item_redaction;
+pub mod item_usage;
 pub mod keyring;
 pub mod locked;
 pub mod logging;

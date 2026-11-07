@@ -947,6 +947,15 @@ impl AuthManager {
         let _ = crate::daemon::send_daemon_request(&serde_json::json!({
             "action": "lock"
         }));
+        // ADR 0029: logout forgets the recent-use record. The daemon clears
+        // its table and the file; the file is also removed here for the
+        // case where no daemon answers.
+        let _ = crate::daemon::send_daemon_request(&serde_json::json!({
+            "action": "clear_item_usage"
+        }));
+        crate::item_usage::remove_usage_file(&crate::item_usage::usage_file_path(
+            &self.storage_mgr.file_path,
+        ));
         crate::log_info!(
             "omawarden:auth",
             "Account logged out and all keyring credentials cleared."
@@ -1271,10 +1280,15 @@ mod tests {
         assert!(lock_res.ok);
         assert_eq!(lock_res.status.as_deref(), Some("locked"));
 
-        // Logout
+        // Logout removes the recent-use record next to the vault cache.
+        let usage_path = crate::item_usage::usage_file_path(&storage_mgr.file_path);
+        let mut usage = crate::item_usage::ItemUsage::load(usage_path.clone(), 1_800_000_000);
+        usage.record_use("item-1", 1_800_000_000);
+        assert!(usage_path.exists());
         let logout_res = auth_mgr.logout();
         assert!(logout_res.ok);
         assert_eq!(logout_res.status.as_deref(), Some("unauthenticated"));
+        assert!(!usage_path.exists(), "logout deletes the usage record");
     }
 
     #[test]
