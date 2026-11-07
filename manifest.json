@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "icyleaf.bitwarden",
   "name": "Omarchy Bitwarden",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "author": "icyleaf",
   "license": "MIT",
   "description": "Fast Bitwarden vault search, credential copy, and security manager for Omarchy.",
@@ -18,7 +18,7 @@
   },
   "barWidget": {
     "displayName": "Bitwarden",
-    "description": "A lock icon that opens the Bitwarden vault overlay.",
+    "description": "A lock icon with a dropdown to search logins and copy usernames, passwords and verification codes; right-click opens the full vault window.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right"

@@ -76,7 +76,7 @@ Every QML `Process` calling `omawarden` MUST implement the complete error-handli
 
 ## 3. Daemon Item Access Contract (ADR 0027)
 
-The daemon never hands out the decrypted vault in bulk. `list`, `search` and `get_item` return **redacted items**; a secret leaves the daemon only through `reveal_field` (value in the response) or `copy_field` (the daemon writes it to the clipboard), one field of one item per request, and every such release is counted against a **release budget**. Field and flag names below are exact.
+The daemon never hands out the decrypted vault in bulk. `list`, `search` and `get_item` return **redacted items**; a secret leaves the daemon only through `reveal_field` (value in the response), `copy_field` (the daemon writes it to the clipboard) or `copy_sequence` (the daemon stages several fields of one item on the clipboard, one per paste; ADR 0028), and every such release is counted against a **release budget**. Field and flag names below are exact.
 
 ### 3.1 Transport and caller rules
 
@@ -163,16 +163,19 @@ Never present in a redacted item: `notes`, `login.password`, `login.totp`, `logi
 | `custom.<index>` | the value of `fields[<index>]` (any type with a value; `index` is a decimal integer) |
 | `password_history` | array of `{ "password": "…", "last_used_date": "…" \| null }` in the order Bitwarden stores them; `reveal_field` only |
 
-### 3.4 `reveal_field` and `copy_field`
+### 3.4 `reveal_field`, `copy_field` and `copy_sequence`
 
 Requests (`id` is the exact item id from a redacted item, not a name):
 
 ```json
 { "action": "reveal_field", "id": "2f6c…", "field": "login.password" }
 { "action": "copy_field",   "id": "2f6c…", "field": "login.password", "clear_after_seconds": 30 }
+{ "action": "copy_sequence", "id": "2f6c…", "fields": ["login.password", "login.totp"], "clear_after_seconds": 30 }
 ```
 
 `clear_after_seconds` is optional, an integer from 1 to 3600; the default is the configured `clipboard_clear_seconds`, or 30 when that is not in range. `copy_field` always uses `wl-copy --sensitive` and always schedules the auto-clear.
+
+`copy_sequence` (ADR 0028) stages `fields` (1 to 8 identifiers from 3.3, in paste order; duplicates allowed; `password_history` refused) so that the first paste in any application yields the first field, the second paste the second field, and so on. The daemon serves the selection itself through the Wayland data-control protocol (`ext-data-control-v1`, else `wlr-data-control-unstable-v1`), offering `text/plain;charset=utf-8`, `text/plain`, `UTF8_STRING`, `TEXT`, `STRING` and `x-kde-passwordManagerHint` (`secret`). Reads within 400 ms of a stage becoming the selection are clipboard watchers and do not count; the first text read after that is the paste, reads within 300 ms after it get the same value, then the next field becomes the selection. A `login.totp` stage serves the code current at each read. After the last paste, or `clear_after_seconds` after the start, the selection is withdrawn if the sequence still owns it; when the user copies something else, the sequence ends and leaves the new content alone. Every lock, the end of the session, daemon exit and any new `copy`, `copy_field` or `copy_sequence` withdraw an active sequence; only one runs at a time. Every field is validated before anything is charged; the sequence costs one release per field, refunded in full when it cannot start. The response comes back as soon as the first field is the selection.
 
 Responses:
 
@@ -181,20 +184,21 @@ Responses:
 { "ok": true, "id": "2f6c…", "field": "login.totp", "value": "123456", "seconds_remaining": 17, "period": 30 }
 { "ok": true, "id": "2f6c…", "field": "password_history", "value": [{ "password": "…", "last_used_date": "2023-12-01T00:00:00Z" }] }
 { "ok": true, "id": "2f6c…", "field": "card.code", "copied": true, "clear_after_seconds": 30 }
+{ "ok": true, "id": "2f6c…", "fields": ["login.password", "login.totp"], "clear_after_seconds": 30 }
 ```
 
 Errors carry a machine-readable `error_code` next to `error`:
 
 | `error_code` | When |
 |--------------|------|
-| `invalid_request` | `id` or `field` missing, or `clear_after_seconds` out of range |
+| `invalid_request` | `id` or `field` missing, `fields` not an array of 1 to 8 strings, or `clear_after_seconds` out of range |
 | `vault_locked` | the vault is locked (also returned by `list`, `search`, `get_item`, `sync`) |
 | `item_not_found` | no item has that id (also `get_item` with no match) |
 | `unknown_field` | the identifier is not in 3.3; the message lists the supported identifiers |
-| `field_empty` | the item has no value for that field (including a field of another item type) |
-| `field_not_copyable` | `copy_field` with `password_history` |
+| `field_empty` | the item has no value for that field (including a field of another item type); for `copy_sequence`, any of its fields |
+| `field_not_copyable` | `copy_field` or `copy_sequence` with `password_history` |
 | `release_limit_exceeded` | the release budget is exhausted; the vault has just been hard-locked |
-| `clipboard_failed` | `wl-copy` failed, or no trusted `wl-copy` is installed (only `/usr/bin/wl-copy` or `/usr/local/bin/wl-copy`, owned by root and not group- or world-writable, is used; `PATH` is never searched) |
+| `clipboard_failed` | `wl-copy` failed, or no trusted `wl-copy` is installed (only `/usr/bin/wl-copy` or `/usr/local/bin/wl-copy`, owned by root and not group- or world-writable, is used; `PATH` is never searched); for `copy_sequence`, the daemon could not reach the compositor, the compositor offers no data-control protocol or seat, or it did not accept the selection (the message says which) |
 
 ```json
 { "ok": false, "error": "Unknown field 'login.secret'. Supported fields: login.password, …, custom.<index>.", "error_code": "unknown_field" }
@@ -202,11 +206,11 @@ Errors carry a machine-readable `error_code` next to `error`:
 
 ### 3.5 Release budget, idle timer and auto-lock
 
-- **Budget**: successful releases (`reveal_field` and `copy_field` together) are limited in two sliding windows: at most **30** in any **60 seconds** and at most **120** in any **hour**. Each release costs one, except `password_history`, which costs one per history entry (at least one). A request whose cost would exceed either limit is refused with `release_limit_exceeded`, the vault is hard-locked (keys and decrypted items zeroized, retained quick-unlock key wiped) and a warning is logged; a password history with more than 30 entries can never be released. Failed requests are not counted. A hard lock resets both windows. The overlay should fetch a TOTP code once and count `seconds_remaining` down locally (one release per period), and should reveal on explicit user action only.
-- **Idle timer**: reset only by `search`, `get_item` and a successful `unlock` / `quick_unlock`. Not reset by `reveal_field`, `copy_field` (so releasing secrets at a steady pace cannot keep the vault unlocked), `copy`, `generate_password`, `totp` (these work while locked), `ping`, `status`, `list`, `sync`, `lock`, `set_auto_lock`. There is no client override: a `"touch"` field is ignored. A user who only copies or reveals, without searching, is idle-locked after the configured interval.
+- **Budget**: successful releases (`reveal_field`, `copy_field` and `copy_sequence` together; a sequence counts one per field) are limited in two sliding windows: at most **30** in any **60 seconds** and at most **120** in any **hour**. Each release costs one, except `password_history`, which costs one per history entry (at least one). A request whose cost would exceed either limit is refused with `release_limit_exceeded`, the vault is hard-locked (keys and decrypted items zeroized, retained quick-unlock key wiped) and a warning is logged; a password history with more than 30 entries can never be released. Failed requests are not counted. A hard lock resets both windows. The overlay should fetch a TOTP code once and count `seconds_remaining` down locally (one release per period), and should reveal on explicit user action only.
+- **Idle timer**: reset only by `search`, `get_item` and a successful `unlock` / `quick_unlock`. Not reset by `reveal_field`, `copy_field`, `copy_sequence` (so releasing secrets at a steady pace cannot keep the vault unlocked), `copy`, `generate_password`, `totp` (these work while locked), `ping`, `status`, `list`, `sync`, `lock`, `set_auto_lock`. There is no client override: a `"touch"` field is ignored. A user who only copies or reveals, without searching, is idle-locked after the configured interval.
 - **`set_auto_lock`**: `{"action": "set_auto_lock", "auto_lock_seconds": n}` or `{"auto_lock_minutes": n}`; n must give 60 seconds to 12 hours (43200 s). Zero is refused: `{"ok": false, "error": "Auto-lock must be between 60 and 43200 seconds (1 minute to 12 hours); disabling it is not supported."}`. `omawarden config set --auto-lock` validates the same range (1 to 720 minutes). A configured value outside the range starts the daemon with 15 minutes and a warning. The 12-hour session ceiling is unchanged.
 - **Other locks**: suspend and the end of the login session hard-lock (the latter also stops the daemon). An `unlock` still deriving its key when the system prepares to sleep fails with `{"ok": false, "status": "locked", "error": "The system went to sleep during unlock. Unlock again."}` and leaves the vault locked; the same error is returned for an unlock attempted between `PrepareForSleep(true)` and the resume. Quick unlock (`quick_unlock` config, default `false`) is the only way a key survives a screen or idle lock.
-- **Clipboard on lock**: no lock clears the clipboard. Every lock withdraws the clipboard offers the daemon still serves (from `copy_field`, and from `copy` with `sensitive: true` and a non-zero timeout); an offer another application has replaced has already ended, and that application's content is left alone. Non-sensitive copies without an auto-clear are not withdrawn.
+- **Clipboard on lock**: no lock clears the clipboard. Every lock withdraws the clipboard offers the daemon still serves (from `copy_field`, from `copy` with `sensitive: true` and a non-zero timeout, and an active `copy_sequence`); an offer another application has replaced has already ended, and that application's content is left alone. Non-sensitive copies without an auto-clear are not withdrawn.
 
 ### 3.6 CLI commands for the overlay
 
@@ -218,8 +222,9 @@ All print JSON on stdout and exit non-zero when `ok` is false.
 | `omawarden vault search --query <q> [--filter <type_name>]` | array of redacted items, best match first |
 | `omawarden vault reveal --id <id> --field <identifier>` | the `reveal_field` response, unchanged |
 | `omawarden vault copy-field --id <id> --field <identifier> [--clear-after <s>]` | the `copy_field` response, unchanged |
+| `omawarden vault copy-sequence --id <id> --fields <identifier>,<identifier>[,…] [--clear-after <s>]` | the `copy_sequence` response, unchanged; returns once the first field is on the clipboard |
 | `omawarden totp <id>` | `{"ok": true, "code", "ttl", "period", "id", "name"}` (a budgeted `login.totp` release) |
 | `omawarden copy --stdin [--sensitive] [--timeout <s>]` with `{"text": "…"}` on stdin | for **non-secret** text only: usernames, URIs, and generated passwords (always with `--sensitive`) |
 | `omawarden copy <id-or-name> [--password\|--totp\|--notes\|--public-key\|--private-key]` | `{"ok": true, "name", "copied", "timeout"}`; secrets are copied by the daemon (`copy_field`) |
 
-`vault reveal` and `vault copy-field` never read stdin. `copy <query>` and `totp <query>` read a master password from stdin only when the daemon is locked, and then unlock the daemon rather than decrypting locally.
+`vault reveal`, `vault copy-field` and `vault copy-sequence` never read stdin. `copy <query>` and `totp <query>` read a master password from stdin only when the daemon is locked, and then unlock the daemon rather than decrypting locally.

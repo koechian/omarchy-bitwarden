@@ -344,6 +344,26 @@ enum VaultAction {
         #[arg(long, help = "Seconds until the clipboard is cleared (1-3600)")]
         clear_after: Option<u64>,
     },
+    #[command(
+        about = "Stage several secret fields of one item on the clipboard from the daemon, one per paste, in order (counted against the release budget, one release per field)"
+    )]
+    CopySequence {
+        #[arg(long, help = "Vault item ID")]
+        id: String,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            num_args = 1..,
+            required = true,
+            help = "Comma-separated field identifiers in paste order, as for 'vault copy-field' (for example login.password,login.totp)"
+        )]
+        fields: Vec<String>,
+        #[arg(
+            long,
+            help = "Seconds until any stage not yet pasted is withdrawn from the clipboard (1-3600)"
+        )]
+        clear_after: Option<u64>,
+    },
 }
 
 fn read_secret_stdin() -> String {
@@ -912,8 +932,22 @@ fn run_vault_sync(cfg: &omawarden::config::Config) -> ExitCode {
 /// that leaves stdin open is not blocked; a locked vault is reported as the
 /// daemon's `vault_locked` error.
 fn run_field_release(action: &str, id: &str, field: &str, clear_after: Option<u64>) -> ExitCode {
+    let request = json!({ "action": action, "id": id, "field": field });
+    run_release_request(request, clear_after)
+}
+
+/// `vault copy-sequence`: prints the daemon's response to `copy_sequence`
+/// unchanged. The daemon answers once the first field is on the clipboard;
+/// the later fields are staged by the daemon as the user pastes.
+fn run_sequence_release(id: &str, fields: &[String], clear_after: Option<u64>) -> ExitCode {
+    let request = json!({ "action": "copy_sequence", "id": id, "fields": fields });
+    run_release_request(request, clear_after)
+}
+
+/// Sends a release request with the optional `clear_after_seconds` and
+/// prints the daemon's response unchanged.
+fn run_release_request(mut request: Value, clear_after: Option<u64>) -> ExitCode {
     omawarden::daemon::ensure_daemon_running();
-    let mut request = json!({ "action": action, "id": id, "field": field });
     if let Some(seconds) = clear_after {
         request["clear_after_seconds"] = json!(seconds);
     }
@@ -944,6 +978,11 @@ fn run_vault_command(action: VaultAction, cfg: &omawarden::config::Config) -> Ex
             field,
             clear_after,
         } => run_field_release("copy_field", &id, &field, clear_after),
+        VaultAction::CopySequence {
+            id,
+            fields,
+            clear_after,
+        } => run_sequence_release(&id, &fields, clear_after),
     }
 }
 
@@ -1783,6 +1822,38 @@ mod tests {
             }
             _ => panic!("Expected vault copy-field"),
         }
+    }
+
+    #[test]
+    fn test_cli_vault_copy_sequence_parsing() {
+        let cli = Cli::try_parse_from([
+            "omawarden",
+            "vault",
+            "copy-sequence",
+            "--id=item-1",
+            "--fields=login.password,login.totp",
+            "--clear-after=40",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Vault {
+                action:
+                    VaultAction::CopySequence {
+                        id,
+                        fields,
+                        clear_after,
+                    },
+            } => {
+                assert_eq!(id, "item-1");
+                assert_eq!(fields, vec!["login.password", "login.totp"]);
+                assert_eq!(clear_after, Some(40));
+            }
+            _ => panic!("Expected vault copy-sequence"),
+        }
+        assert!(
+            Cli::try_parse_from(["omawarden", "vault", "copy-sequence", "--id=item-1"]).is_err(),
+            "--fields is required"
+        );
     }
 
     #[test]

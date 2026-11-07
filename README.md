@@ -102,13 +102,27 @@ The overlay finds the engine with `command -v omawarden`, so `~/.local/bin` must
 omarchy plugin add https://github.com/koechian/omarchy-bitwarden.git --enable
 ```
 
-The plugin adds a lock icon to the bar (right section by default) that opens the overlay. Move it with
+The plugin adds a lock icon to the bar (right section by default). Move it with
 `omarchy bar move icyleaf.bitwarden --section <section>`.
 
-### 3. Bind a hotkey (optional, in `~/.config/hypr/bindings.lua`)
+- **Left click** opens a dropdown under the icon: type to search your logins. Each row has quick copy
+  buttons for the username, password and verification code; a quick copy closes the dropdown so you can
+  paste straight away, and the icon shows a check mark for a moment. Click a row (or press
+  <kbd>Enter</kbd>) for its details page, where you can copy each value in turn without the dropdown
+  closing. While the vault is locked the dropdown asks for the master password.
+- **Password, then code**: for a login with both a password and a verification code, *Copy password,
+  then code* (or <kbd>Shift</kbd> + <kbd>Enter</kbd>) stages both. Your first paste gives the password
+  and the next paste gives the code, computed when you paste it. This suits sign-in prompts that ask for
+  one after the other, such as `tsh login`. The engine serves the clipboard itself for this: it ignores
+  the reads that clipboard watchers make the moment a value is copied, treats the next read as your
+  paste, and swaps in the code. Copying something else in between cancels the sequence.
+- **Right click** opens the full vault window (cards, identities, notes, generator, settings, sign-in).
+
+### 3. Bind hotkeys (optional, in `~/.config/hypr/bindings.lua`)
 
 ```lua
-o.bind("SUPER + B", "Omarchy Bitwarden", "omarchy-shell shell toggle icyleaf.bitwarden")
+o.bind("SUPER + B", "Bitwarden dropdown", "omarchy-shell icyleaf.bitwarden.quickaccess toggle")
+o.bind("SUPER + SHIFT + B", "Bitwarden window", "omarchy-shell shell toggle icyleaf.bitwarden")
 ```
 
 ### Quick unlock (optional)
@@ -154,6 +168,18 @@ rm ~/.local/bin/omawarden
 | <kbd>Esc</kbd> | Close a dialog, or hide the overlay |
 
 Held keys act once, so holding a chord cannot spend the release budget.
+
+In the bar dropdown:
+
+| Shortcut | List | Details page |
+| :-- | :-- | :-- |
+| <kbd>Enter</kbd> | Open the details page | Copy the password |
+| <kbd>Shift</kbd> + <kbd>Enter</kbd> | Password, then code | Password, then code |
+| <kbd>Ctrl</kbd> + <kbd>Enter</kbd> | Copy the code and close | Copy the code |
+| <kbd>Ctrl</kbd> + <kbd>U</kbd> | Copy the username and close | Copy the username |
+| <kbd>↓</kbd> / <kbd>↑</kbd> | Move through the list | |
+| <kbd>Esc</kbd> | Close the dropdown | Back to the list |
+| <kbd>Ctrl</kbd> + <kbd>L</kbd> / <kbd>Ctrl</kbd> + <kbd>O</kbd> | Lock / open the full window | Lock / open the full window |
 
 ---
 
