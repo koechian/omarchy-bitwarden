@@ -35,6 +35,8 @@ use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
+use crate::selection_source::{SequenceControl, WITHDRAWAL_WAIT_TIMEOUT};
+
 /// How long a foreground `wl-copy` is given to fail at start-up (no Wayland
 /// display, unsupported option) before its offer is treated as served.
 pub const FOREGROUND_STARTUP_GRACE: Duration = Duration::from_millis(150);
@@ -66,10 +68,12 @@ pub struct ClipboardManager {
 }
 
 /// Supervised offers this process is serving: one entry per foreground
-/// `wl-copy` from its start until it exits or is withdrawn.
+/// `wl-copy` from its start until it exits or is withdrawn, and at most one
+/// paste sequence (`selection_source`), which serves its own selection.
 #[derive(Debug, Default)]
 pub struct OfferRegistry {
     offers: Mutex<Vec<OfferOwner>>,
+    paste_sequence: Mutex<Option<Arc<SequenceControl>>>,
 }
 
 impl OfferRegistry {
@@ -90,20 +94,60 @@ impl OfferRegistry {
         self.offers.lock().map_or(0, |offers| offers.len())
     }
 
-    /// Withdraws every offer whose `wl-copy` is still running (same PID and
-    /// start time). An offer another client already replaced has ended by
-    /// itself and is left alone, as is the selection that replaced it.
-    /// Returns how many offers were withdrawn.
+    /// Ends the active paste sequence, if any, and starts the one `start`
+    /// returns in its place. The previous sequence has withdrawn its
+    /// selection (or timed out doing so) before `start` runs, so the two
+    /// never contend for the clipboard. Only one sequence runs at a time.
+    pub fn replace_paste_sequence(
+        &self,
+        start: impl FnOnce() -> Result<Arc<SequenceControl>, String>,
+    ) -> Result<(), String> {
+        let mut slot = self
+            .paste_sequence
+            .lock()
+            .map_err(|_| "The paste sequence registry is unavailable.".to_string())?;
+        if let Some(previous) = slot.take() {
+            previous.withdraw_and_wait(WITHDRAWAL_WAIT_TIMEOUT);
+        }
+        *slot = Some(start()?);
+        Ok(())
+    }
+
+    /// Withdraws the active paste sequence and waits briefly for it to clear
+    /// the selection it still owns. True when a running sequence was ended.
+    pub fn withdraw_paste_sequence(&self) -> bool {
+        let active = self
+            .paste_sequence
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        active.is_some_and(|control| control.withdraw_and_wait(WITHDRAWAL_WAIT_TIMEOUT))
+    }
+
+    /// Whether a paste sequence is still running.
+    pub fn paste_sequence_active(&self) -> bool {
+        self.paste_sequence
+            .lock()
+            .ok()
+            .is_some_and(|slot| slot.as_ref().is_some_and(|control| !control.is_finished()))
+    }
+
+    /// Withdraws the active paste sequence and every offer whose `wl-copy`
+    /// is still running (same PID and start time). An offer another client
+    /// already replaced has ended by itself and is left alone, as is the
+    /// selection that replaced it. Returns how many offers were withdrawn.
     pub fn withdraw_all(&self) -> usize {
+        let sequence_withdrawn = usize::from(self.withdraw_paste_sequence());
         let owners = self
             .offers
             .lock()
             .map(|offers| offers.clone())
             .unwrap_or_default();
-        let withdrawn = owners
-            .into_iter()
-            .filter(|owner| withdraw_offer_if_still_owned(*owner))
-            .count();
+        let withdrawn = sequence_withdrawn
+            + owners
+                .into_iter()
+                .filter(|owner| withdraw_offer_if_still_owned(*owner))
+                .count();
         if withdrawn > 0 {
             crate::log_info!(
                 "omawarden:clipboard",
@@ -189,6 +233,10 @@ impl ClipboardManager {
                 TRUSTED_WL_COPY_LOCATIONS.join(" or ")
             );
             return false;
+        }
+        // A new copy replaces any paste sequence still staged.
+        if let Some(registry) = &self.offer_registry {
+            registry.withdraw_paste_sequence();
         }
         let success = if sensitive && !timeout.is_zero() {
             self.copy_with_supervised_offer(text, timeout)
@@ -758,6 +806,52 @@ exit 0
         );
         let args = fs::read_to_string(&args_file).unwrap();
         assert!(!args.lines().any(|line| line == "--clear"), "{args}");
+    }
+
+    #[test]
+    fn test_registry_runs_one_paste_sequence_and_withdraws_it() {
+        let registry = OfferRegistry::default();
+        let first = SequenceControl::unattended();
+        let installed = Arc::clone(&first);
+        registry
+            .replace_paste_sequence(move || Ok(installed))
+            .unwrap();
+        assert!(registry.paste_sequence_active());
+
+        let second = SequenceControl::unattended();
+        let installed = Arc::clone(&second);
+        registry
+            .replace_paste_sequence(move || Ok(installed))
+            .unwrap();
+        assert!(first.is_finished(), "a new sequence ends the previous one");
+        assert!(registry.paste_sequence_active());
+
+        assert_eq!(registry.withdraw_all(), 1, "a lock withdraws the sequence");
+        assert!(second.is_finished());
+        assert!(!registry.paste_sequence_active());
+        assert_eq!(registry.withdraw_all(), 0);
+
+        let failed = registry.replace_paste_sequence(|| Err("no compositor".to_string()));
+        assert_eq!(failed, Err("no compositor".to_string()));
+        assert!(!registry.paste_sequence_active());
+    }
+
+    #[test]
+    fn test_new_copy_withdraws_an_active_paste_sequence() {
+        let dir = tempdir().unwrap();
+        let (program, clip_file, _args_file) = mock_wl_copy(dir.path());
+        let registry = Arc::new(OfferRegistry::default());
+        let mgr = manager(&program).with_offer_registry(Arc::clone(&registry));
+        let sequence = SequenceControl::unattended();
+        let installed = Arc::clone(&sequence);
+        registry
+            .replace_paste_sequence(move || Ok(installed))
+            .unwrap();
+
+        assert!(mgr.copy("public_username", false, 0));
+        assert!(sequence.is_finished());
+        assert!(!registry.paste_sequence_active());
+        assert_eq!(fs::read_to_string(&clip_file).unwrap(), "public_username");
     }
 
     #[test]

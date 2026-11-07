@@ -26,7 +26,8 @@ pub struct ActionSpec {
     /// Resets the idle auto-lock timer. Only browsing the unlocked vault
     /// (`search`, `get_item`) and a successful unlock count as activity.
     /// Polling (`ping`, `status`), loading (`list`), background work
-    /// (`sync`), secret releases (`reveal_field`, `copy_field`) and actions
+    /// (`sync`), secret releases (`reveal_field`, `copy_field`,
+    /// `copy_sequence`) and actions
     /// that also work while locked (`copy`, `generate_password`, `totp`)
     /// never do: otherwise a caller could keep the vault unlocked by
     /// releasing secrets at a steady pace, or by periodic calls that need no
@@ -66,6 +67,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     action("get_item", true, true, handle_get_item),
     action("reveal_field", true, false, handle_reveal_field),
     action("copy_field", true, false, handle_copy_field),
+    action("copy_sequence", true, false, handle_copy_sequence),
     action("totp", false, false, handle_totp_from_secret),
     action("copy", false, false, handle_copy_text),
     action("generate_password", false, false, handle_generate_password),
@@ -245,6 +247,12 @@ fn handle_copy_field(state: &DaemonState, request: &Value) -> ActionOutcome {
     respond(crate::secret_access::handle_copy_field(state, request))
 }
 
+fn handle_copy_sequence(state: &DaemonState, request: &Value) -> ActionOutcome {
+    respond(crate::sequence_release::handle_copy_sequence(
+        state, request,
+    ))
+}
+
 /// Generates a code from a seed the caller supplies. Codes for vault items
 /// are released through `reveal_field` with `login.totp`, which is counted
 /// against the release budget.
@@ -403,6 +411,7 @@ mod tests {
         for name in [
             "reveal_field",
             "copy_field",
+            "copy_sequence",
             "copy",
             "generate_password",
             "ping",
@@ -428,6 +437,7 @@ mod tests {
             "get_item",
             "reveal_field",
             "copy_field",
+            "copy_sequence",
             "sync",
         ] {
             assert!(find_action(name).unwrap().requires_unlocked, "{name}");

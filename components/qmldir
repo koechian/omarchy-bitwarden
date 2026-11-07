@@ -16,3 +16,4 @@ SecretReleaseController 1.0 SecretReleaseController.qml
 SettingsModal 1.0 SettingsModal.qml
 ToastAlert 1.0 ToastAlert.qml
 VaultItemList 1.0 VaultItemList.qml
+QuickAccessView 1.0 QuickAccessView.qml

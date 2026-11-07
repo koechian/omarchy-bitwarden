@@ -376,9 +376,13 @@ pub struct DaemonState {
     /// Clipboard program used by `copy` and `copy_field`, resolved from
     /// trusted root-owned locations (empty when none); injectable for tests.
     pub clipboard_program: String,
-    /// Clipboard offers served by `copy` and `copy_field`; withdrawn by
-    /// every lock.
+    /// Clipboard offers served by `copy` and `copy_field`, and the active
+    /// paste sequence of `copy_sequence`; withdrawn by every lock.
     pub clipboard_offers: Arc<crate::clipboard::OfferRegistry>,
+    /// Starts a paste sequence (`copy_sequence`): the native Wayland
+    /// data-control source. Test builds refuse, so unit tests never touch
+    /// the real clipboard unless they inject a launcher.
+    pub paste_sequence_launcher: Arc<crate::selection_source::PasteSequenceLauncher>,
     /// `clipboard_clear_seconds` from the configuration at startup.
     pub clipboard_clear_seconds: i64,
     /// Normalized path of this executable, compared against every client.
@@ -440,6 +444,15 @@ fn resolve_clipboard_program() -> String {
         .unwrap_or_default()
 }
 
+/// The launcher of paste sequences: the compositor of `WAYLAND_DISPLAY`,
+/// except in test builds, which have none.
+fn default_paste_sequence_launcher() -> Arc<crate::selection_source::PasteSequenceLauncher> {
+    if cfg!(test) {
+        return Arc::new(|_, _| Err("No Wayland data-control source in test builds.".to_string()));
+    }
+    Arc::new(crate::selection_source::start_paste_sequence)
+}
+
 /// The idle auto-lock for a daemon started with `minutes`. A value outside
 /// the accepted range (including the legacy 0 = never) falls back to the
 /// default with a warning instead of disabling the idle lock.
@@ -481,6 +494,7 @@ impl DaemonState {
             release_budget: Mutex::new(ReleaseBudget::default()),
             clipboard_program: resolve_clipboard_program(),
             clipboard_offers: Arc::default(),
+            paste_sequence_launcher: default_paste_sequence_launcher(),
             clipboard_clear_seconds: config.clipboard_clear_seconds,
             own_executable: crate::peer_identity::own_executable().unwrap_or_default(),
             supervision_programs: SupervisionPrograms::resolve(),
@@ -883,6 +897,18 @@ impl DaemonState {
         crate::clipboard::ClipboardManager::new(&self.clipboard_program)
             .without_detached_worker()
             .with_offer_registry(Arc::clone(&self.clipboard_offers))
+    }
+
+    /// Starts a paste sequence of `stages` that ends no later than
+    /// `lifetime`, replacing any sequence still running.
+    pub fn start_paste_sequence(
+        &self,
+        stages: Vec<crate::paste_sequence::StageValue>,
+        lifetime: Duration,
+    ) -> Result<(), String> {
+        let launcher = Arc::clone(&self.paste_sequence_launcher);
+        self.clipboard_offers
+            .replace_paste_sequence(move || launcher(stages, lifetime))
     }
 
     /// Master-password unlock. The key derivation can take seconds; a

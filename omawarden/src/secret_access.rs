@@ -183,7 +183,7 @@ pub struct ReleaseError {
 }
 
 impl ReleaseError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -293,22 +293,30 @@ struct SecretRequest {
     field: SecretField,
 }
 
-fn parse_secret_request(request: &Value) -> Result<SecretRequest, ReleaseError> {
-    let item_id = request
+/// The non-blank item `id` of a release request.
+pub(crate) fn requested_item_id(request: &Value) -> Result<String, ReleaseError> {
+    request
         .get("id")
         .and_then(Value::as_str)
         .filter(|id| !id.trim().is_empty())
-        .ok_or_else(|| ReleaseError::new(error_code::INVALID_REQUEST, "Missing item 'id'."))?;
+        .map(str::to_string)
+        .ok_or_else(|| ReleaseError::new(error_code::INVALID_REQUEST, "Missing item 'id'."))
+}
+
+/// Parses a field identifier, reporting an unknown one as `unknown_field`.
+pub(crate) fn parse_field(identifier: &str) -> Result<SecretField, ReleaseError> {
+    SecretField::parse(identifier)
+        .map_err(|message| ReleaseError::new(error_code::UNKNOWN_FIELD, message))
+}
+
+fn parse_secret_request(request: &Value) -> Result<SecretRequest, ReleaseError> {
+    let item_id = requested_item_id(request)?;
     let identifier = request
         .get("field")
         .and_then(Value::as_str)
         .ok_or_else(|| ReleaseError::new(error_code::INVALID_REQUEST, "Missing 'field'."))?;
-    let field = SecretField::parse(identifier)
-        .map_err(|message| ReleaseError::new(error_code::UNKNOWN_FIELD, message))?;
-    Ok(SecretRequest {
-        item_id: item_id.to_string(),
-        field,
-    })
+    let field = parse_field(identifier)?;
+    Ok(SecretRequest { item_id, field })
 }
 
 fn field_empty(field: &SecretField) -> ReleaseError {
@@ -341,15 +349,26 @@ fn section_value<'a>(item: &'a VaultItem, section: &str) -> Option<&'a Value> {
     }
 }
 
-fn extract_text(item: &VaultItem, field: &SecretField) -> Result<ReleasedSecret, ReleaseError> {
+/// The non-empty text of a text secret (every field except `login.totp`
+/// and `password_history`).
+pub(crate) fn text_secret(
+    item: &VaultItem,
+    field: &SecretField,
+) -> Result<Zeroizing<String>, ReleaseError> {
     let location = field.text_location().ok_or_else(|| field_empty(field))?;
     located_text(item, &location)
         .filter(|text| !text.is_empty())
-        .map(|text| ReleasedSecret::Text(Zeroizing::new(text.to_string())))
+        .map(|text| Zeroizing::new(text.to_string()))
         .ok_or_else(|| field_empty(field))
 }
 
-fn extract_totp_code(item: &VaultItem) -> Result<ReleasedSecret, ReleaseError> {
+fn extract_text(item: &VaultItem, field: &SecretField) -> Result<ReleasedSecret, ReleaseError> {
+    text_secret(item, field).map(ReleasedSecret::Text)
+}
+
+/// The item's TOTP seed (or `otpauth://` URI), refused as `field_empty`
+/// when it is missing or yields no code. Never leaves the daemon.
+pub(crate) fn totp_seed(item: &VaultItem) -> Result<Zeroizing<String>, ReleaseError> {
     let seed = item
         .login
         .as_ref()
@@ -357,12 +376,23 @@ fn extract_totp_code(item: &VaultItem) -> Result<ReleasedSecret, ReleaseError> {
         .and_then(Value::as_str)
         .filter(|seed| !seed.is_empty())
         .ok_or_else(|| field_empty(&SecretField::LoginTotp))?;
-    let generated = crate::totp::generate_totp(seed, None, 6, 30).ok_or_else(|| {
-        ReleaseError::new(
-            error_code::FIELD_EMPTY,
-            "Field 'login.totp' does not hold a valid TOTP configuration.",
-        )
-    })?;
+    if crate::totp::generate_totp(seed, None, 6, 30).is_none() {
+        return Err(invalid_totp_configuration());
+    }
+    Ok(Zeroizing::new(seed.to_string()))
+}
+
+fn invalid_totp_configuration() -> ReleaseError {
+    ReleaseError::new(
+        error_code::FIELD_EMPTY,
+        "Field 'login.totp' does not hold a valid TOTP configuration.",
+    )
+}
+
+fn extract_totp_code(item: &VaultItem) -> Result<ReleasedSecret, ReleaseError> {
+    let seed = totp_seed(item)?;
+    let generated =
+        crate::totp::generate_totp(&seed, None, 6, 30).ok_or_else(invalid_totp_configuration)?;
     Ok(ReleasedSecret::TotpCode {
         code: Zeroizing::new(generated.code),
         seconds_remaining: generated.ttl,
@@ -391,10 +421,12 @@ pub fn extract_secret(
     }
 }
 
-fn locate_and_extract(
+/// Runs `extract` on the unlocked item `item_id`.
+pub(crate) fn with_unlocked_item<T>(
     state: &DaemonState,
-    request: &SecretRequest,
-) -> Result<ReleasedSecret, ReleaseError> {
+    item_id: &str,
+    extract: impl FnOnce(&VaultItem) -> Result<T, ReleaseError>,
+) -> Result<T, ReleaseError> {
     if !state.vault_mgr.is_unlocked() {
         return Err(ReleaseError::new(
             error_code::VAULT_LOCKED,
@@ -407,14 +439,23 @@ fn locate_and_extract(
         })?;
     let item = items
         .iter()
-        .find(|item| item.id == request.item_id)
+        .find(|item| item.id == item_id)
         .ok_or_else(|| {
             ReleaseError::new(
                 error_code::ITEM_NOT_FOUND,
-                format!("Item '{}' not found in vault.", request.item_id),
+                format!("Item '{}' not found in vault.", item_id),
             )
         })?;
-    extract_secret(item, &request.field)
+    extract(item)
+}
+
+fn locate_and_extract(
+    state: &DaemonState,
+    request: &SecretRequest,
+) -> Result<ReleasedSecret, ReleaseError> {
+    with_unlocked_item(state, &request.item_id, |item| {
+        extract_secret(item, &request.field)
+    })
 }
 
 /// Charges `cost` releases to the budget, hard-locking the vault when they
@@ -447,7 +488,7 @@ pub fn charge_release(state: &DaemonState, cost: usize) -> Result<(), ReleaseErr
 
 /// Withdraws a charge whose secret was never delivered, so failed requests
 /// do not count toward the budget (contracts §3).
-fn refund_release(state: &DaemonState, cost: usize) {
+pub(crate) fn refund_release(state: &DaemonState, cost: usize) {
     if let Ok(mut budget) = state.release_budget.lock() {
         budget.refund_latest(cost);
     }
@@ -494,14 +535,22 @@ fn copyable_text(secret: &ReleasedSecret) -> Result<&str, ReleaseError> {
     match secret {
         ReleasedSecret::Text(text) => Ok(text.as_str()),
         ReleasedSecret::TotpCode { code, .. } => Ok(code.as_str()),
-        ReleasedSecret::PasswordHistory(_) => Err(ReleaseError::new(
-            error_code::FIELD_NOT_COPYABLE,
-            "Field 'password_history' cannot be copied; use reveal_field.",
-        )),
+        ReleasedSecret::PasswordHistory(_) => Err(password_history_not_copyable()),
     }
 }
 
-fn requested_clear_seconds(state: &DaemonState, request: &Value) -> Result<u64, ReleaseError> {
+/// `password_history` is released only through `reveal_field`.
+pub(crate) fn password_history_not_copyable() -> ReleaseError {
+    ReleaseError::new(
+        error_code::FIELD_NOT_COPYABLE,
+        "Field 'password_history' cannot be copied; use reveal_field.",
+    )
+}
+
+pub(crate) fn requested_clear_seconds(
+    state: &DaemonState,
+    request: &Value,
+) -> Result<u64, ReleaseError> {
     let Some(raw) = request.get("clear_after_seconds") else {
         return Ok(state.copy_clear_seconds());
     };
